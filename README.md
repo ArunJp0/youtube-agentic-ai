@@ -41,11 +41,16 @@ ruff format .
 
 ## MVP Scope
 
-The first development phase implements only the **Research workflow**:
+The first development phase implements the **Research** and **Script** workflows:
 
 ```
-Topic Input → Research Agent → Structured Research Output
+Topic Input → Research Agent → Structured Research Output → Script Agent → Structured Script Output
 ```
+
+- **Research Agent**: researches a topic (real Wikipedia search + Gemini LLM, with mock providers for offline dev) and produces a structured `ResearchResult` (summary, key points, sourced facts, source URLs).
+- **Script Agent**: converts a `ResearchResult` into a structured `ScriptResult` (title, hook, introduction, narrated sections, conclusion, call to action, estimated duration, source references) - natural spoken-style narration for YouTube, grounded only in the research, ready for a future Voice/Visual Agent to consume.
+
+Voice, Visual/Video, QC, and YouTube upload agents are not implemented yet.
 
 ## Project Structure
 
