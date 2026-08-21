@@ -12,7 +12,15 @@
 - Automated tests created
 - All 44 tests passing
 - Mock end-to-end Research Agent successfully validated
+- Real Wikipedia provider integrated successfully
+- Real Gemini provider integrated successfully
+- Retry/backoff handling added for transient Gemini errors
+- Optional fallback Gemini model support added
+- Live Research Agent demo succeeded
+- Final structured ResearchResult produced from real sources
+- 92/92 tests passing
+- Research Agent MVP marked complete
 
 ## Current Next Milestone
 
-Replace mock providers with real free/low-cost LLM and search providers and validate the Research Agent using real data.
+Build the Script Agent using ResearchResult as input.
