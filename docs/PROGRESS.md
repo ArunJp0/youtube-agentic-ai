@@ -54,7 +54,13 @@
 - Final regenerated narration kept 5/5 distinct sections
 - Manual audio review confirmed no repeated narration
 - 188/188 tests passing
+- Research → Script → Voice LangGraph pipeline completed
+- Real Wikipedia + Gemini + Edge TTS validated in one run
+- VoiceResult stored in pipeline state
+- Failure short-circuit behavior tested
+- Real MP3 generated successfully
+- 190/190 tests passing
 
 ## Current Next Milestone
 
-Integrate VoiceService into the main Research → Script LangGraph pipeline.
+Visual/Media generation service.
