@@ -23,6 +23,10 @@ class Settings:
     # Search Provider: "mock" or "wikipedia"
     search_provider: str = field(default_factory=lambda: os.environ.get("SEARCH_PROVIDER", "mock"))
 
+    # Voice Provider: "mock" or "edge"
+    voice_provider: str = field(default_factory=lambda: os.environ.get("VOICE_PROVIDER", "mock"))
+    voice_name: str = field(default_factory=lambda: os.environ.get("VOICE_NAME", "en-US-AriaNeural"))
+
     # Gemini
     gemini_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY") or None)
     gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"))

@@ -44,3 +44,17 @@ class TestSettings:
         assert Settings().llm_provider == "mock"
         monkeypatch.setenv("LLM_PROVIDER", "gemini")
         assert Settings().llm_provider == "gemini"
+
+    def test_voice_defaults_to_mock_with_default_voice_name(self, monkeypatch) -> None:
+        monkeypatch.delenv("VOICE_PROVIDER", raising=False)
+        monkeypatch.delenv("VOICE_NAME", raising=False)
+        settings = Settings()
+        assert settings.voice_provider == "mock"
+        assert settings.voice_name == "en-US-AriaNeural"
+
+    def test_voice_env_vars_select_real_provider(self, monkeypatch) -> None:
+        monkeypatch.setenv("VOICE_PROVIDER", "edge")
+        monkeypatch.setenv("VOICE_NAME", "en-US-GuyNeural")
+        settings = Settings()
+        assert settings.voice_provider == "edge"
+        assert settings.voice_name == "en-US-GuyNeural"

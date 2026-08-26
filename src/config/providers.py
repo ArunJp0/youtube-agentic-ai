@@ -7,6 +7,7 @@ from src.config.settings import Settings
 from src.llm.provider import LLMProvider
 from src.llm.mock import MockLLMProvider
 from src.tools.search_provider import SearchProvider, MockSearchProvider
+from src.tools.voice_provider import VoiceProvider, MockVoiceProvider
 
 
 class ProviderConfigError(Exception):
@@ -60,4 +61,29 @@ def get_search_provider(settings: Optional[Settings] = None) -> SearchProvider:
 
     raise ProviderConfigError(
         f"Unknown SEARCH_PROVIDER: '{settings.search_provider}'. Expected 'mock' or 'wikipedia'."
+    )
+
+
+def get_voice_provider(settings: Optional[Settings] = None) -> VoiceProvider:
+    """Build the configured VoiceProvider.
+
+    Edge-tts-specific imports are done lazily so the mock path never depends
+    on it, and so VoiceService never has to know which concrete TTS engine
+    is in use.
+
+    Raises:
+        ProviderConfigError: If VOICE_PROVIDER is not a recognized value.
+    """
+    settings = settings or Settings()
+    provider_name = (settings.voice_provider or "mock").strip().lower()
+
+    if provider_name == "mock":
+        return MockVoiceProvider()
+    if provider_name == "edge":
+        from src.tools.edge_voice_provider import EdgeVoiceProvider
+
+        return EdgeVoiceProvider()
+
+    raise ProviderConfigError(
+        f"Unknown VOICE_PROVIDER: '{settings.voice_provider}'. Expected 'mock' or 'edge'."
     )

@@ -26,12 +26,35 @@ class ExplodingLLMProvider(LLMProvider):
         raise RuntimeError("simulated LLM outage")
 
 
+class ResearchMockWithVariedSections(LLMProvider):
+    """Delegates to MockLLMProvider for Research Agent prompts (unchanged,
+    realistic behavior), but returns genuinely distinct, non-boilerplate
+    content for ScriptAgent's per-section prompts.
+
+    The pipeline shares one LLMProvider between both agents. Plain
+    MockLLMProvider's generic fallback embeds only ~50 characters of the
+    prompt into ~300 characters of fixed boilerplate, so it can't tell two
+    different section points apart enough to clear ScriptAgent's near-
+    duplicate threshold - unsuitable for testing a full pipeline with real
+    section-distinctness requirements.
+    """
+
+    def __init__(self) -> None:
+        self._mock = MockLLMProvider()
+
+    def generate_text(self, prompt: str) -> str:
+        if "Point to expand on: '" in prompt:
+            point = prompt.split("Point to expand on: '", 1)[1].split("'.", 1)[0]
+            return f"{point}. A distinct detail worth covering on its own."
+        return self._mock.generate_text(prompt)
+
+
 class TestPipelineWorkflow:
     """Tests for the combined Research -> Script LangGraph pipeline."""
 
     @pytest.fixture
-    def providers(self) -> tuple[MockSearchProvider, MockLLMProvider]:
-        return MockSearchProvider(), MockLLMProvider()
+    def providers(self) -> tuple[MockSearchProvider, LLMProvider]:
+        return MockSearchProvider(), ResearchMockWithVariedSections()
 
     @pytest.mark.asyncio
     async def test_pipeline_builds_and_compiles(self, providers) -> None:

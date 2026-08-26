@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import pytest
 
-from src.config.providers import ProviderConfigError, get_llm_provider, get_search_provider
+from src.config.providers import (
+    ProviderConfigError,
+    get_llm_provider,
+    get_search_provider,
+    get_voice_provider,
+)
 from src.config.settings import Settings
 from src.llm.mock import MockLLMProvider
 from src.tools.search_provider import MockSearchProvider
+from src.tools.voice_provider import MockVoiceProvider
 
 
 class TestGetLLMProvider:
@@ -73,3 +79,34 @@ class TestGetSearchProvider:
         monkeypatch.setenv("SEARCH_PROVIDER", "mock")
         provider = get_search_provider()
         assert isinstance(provider, MockSearchProvider)
+
+
+class TestGetVoiceProvider:
+    """Tests for voice provider selection."""
+
+    def test_mock_provider_selected(self) -> None:
+        settings = Settings(voice_provider="mock")
+        provider = get_voice_provider(settings)
+        assert isinstance(provider, MockVoiceProvider)
+
+    def test_mock_provider_case_insensitive(self) -> None:
+        settings = Settings(voice_provider="MOCK")
+        provider = get_voice_provider(settings)
+        assert isinstance(provider, MockVoiceProvider)
+
+    def test_edge_provider_selected(self) -> None:
+        from src.tools.edge_voice_provider import EdgeVoiceProvider
+
+        settings = Settings(voice_provider="edge")
+        provider = get_voice_provider(settings)
+        assert isinstance(provider, EdgeVoiceProvider)
+
+    def test_unknown_voice_provider_raises_config_error(self) -> None:
+        settings = Settings(voice_provider="not-a-real-provider")
+        with pytest.raises(ProviderConfigError):
+            get_voice_provider(settings)
+
+    def test_default_settings_used_when_none_passed(self, monkeypatch) -> None:
+        monkeypatch.setenv("VOICE_PROVIDER", "mock")
+        provider = get_voice_provider()
+        assert isinstance(provider, MockVoiceProvider)

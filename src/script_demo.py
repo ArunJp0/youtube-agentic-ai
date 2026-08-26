@@ -24,9 +24,36 @@ _SCRIPT_DEMO_RESPONSES = {
         "In this video we're exploring the science of dreaming - what your brain "
         "is actually doing while you sleep, and why dreams might matter more than you think."
     ),
-    "expanding on this single point": (
-        "Researchers point to this as one of the clearer explanations for what's "
-        "happening in your brain while you dream."
+    # One genuinely distinct canned narration per known MockLLMProvider
+    # key point (see src/llm/mock.py's "key point" response), keyed by the
+    # exact quoted point text ScriptAgent embeds as "Point to expand on:
+    # '<point>'." A single shared response here would make every section
+    # near-identical boilerplate and get collapsed by ScriptAgent's
+    # duplicate detection - see docs/DECISIONS.md.
+    "'Dreams occur mainly during REM sleep cycles'": (
+        "Most of our vivid dreaming happens during REM sleep, a stage that repeats "
+        "every ninety minutes or so through the night, when brain activity ramps up "
+        "to levels similar to being awake."
+    ),
+    "'Brain consolidates memories and processes emotions while dreaming'": (
+        "While we dream, the brain is busy sorting through the day's experiences, "
+        "strengthening important memories and working through emotional moments so "
+        "we wake up feeling a little more settled."
+    ),
+    "'Most adults spend about 2 hours per night dreaming'": (
+        "On average, adults spend around two hours every night dreaming, spread "
+        "across several REM cycles - dreaming is a much bigger part of sleep than "
+        "most people realize."
+    ),
+    "'Prefrontal cortex suppression creates dream illogic'": (
+        "The part of the brain responsible for logic and self-control quiets down "
+        "during dreams, which is exactly why dream scenarios can feel so strange, "
+        "illogical, or even impossible."
+    ),
+    "'Dreams may serve evolutionary functions like threat simulation'": (
+        "One leading theory suggests dreaming evolved as a kind of safe rehearsal "
+        "space, letting our ancestors practice reacting to threats without any "
+        "real risk."
     ),
     "conclusion": "So next time you wake up remembering a strange dream, you'll know there's real science behind it.",
     "call-to-action": (

@@ -37,7 +37,24 @@
 - Fallback model configured as gemini-3.6-flash
 - Live end-to-end Research → Script pipeline completed successfully
 - Current automated test count: 139 passed
+- Voice Generation Service implemented as a deterministic service (not an LLM agent)
+- VoiceProvider abstraction created, with Mock and free Edge TTS implementations
+- VoiceService extracts and orders narration (hook → introduction → sections → conclusion → call_to_action) while excluding metadata (sources, research notes, headings, visual notes)
+- Real Edge TTS narration audio generated successfully, saved to the gitignored `output/audio/` directory
+- Voice provider selection added via `VOICE_PROVIDER`/`VOICE_NAME` settings, mirroring the LLM/search provider pattern
+- Voice Service unit tests added using a mock voice provider and a monkeypatched Edge TTS client (no real network calls)
+- Current automated test count: 175 passed
+- Voice Generation Service MVP marked complete
+- Voice Service MVP completed using Edge TTS
+- Real MP3 generation validated locally
+- Script narration repetition issue identified and resolved
+- Root cause was repetitive ScriptAgent section generation
+- ScriptAgent now enforces distinct sections with retry-before-drop validation
+- VoiceService retains deduplication as a safety layer
+- Final regenerated narration kept 5/5 distinct sections
+- Manual audio review confirmed no repeated narration
+- 188/188 tests passing
 
 ## Current Next Milestone
 
-Voice generation service.
+Integrate VoiceService into the main Research → Script LangGraph pipeline.
