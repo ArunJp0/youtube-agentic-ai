@@ -58,3 +58,17 @@ class TestSettings:
         settings = Settings()
         assert settings.voice_provider == "edge"
         assert settings.voice_name == "en-US-GuyNeural"
+
+    def test_media_defaults_to_mock_with_no_api_key(self, monkeypatch) -> None:
+        monkeypatch.delenv("MEDIA_PROVIDER", raising=False)
+        monkeypatch.delenv("PEXELS_API_KEY", raising=False)
+        settings = Settings()
+        assert settings.media_provider == "mock"
+        assert settings.pexels_api_key is None
+
+    def test_media_env_vars_select_real_provider(self, monkeypatch) -> None:
+        monkeypatch.setenv("MEDIA_PROVIDER", "pexels")
+        monkeypatch.setenv("PEXELS_API_KEY", "test-pexels-key")
+        settings = Settings()
+        assert settings.media_provider == "pexels"
+        assert settings.pexels_api_key == "test-pexels-key"

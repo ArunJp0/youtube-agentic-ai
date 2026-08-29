@@ -7,11 +7,13 @@ import pytest
 from src.config.providers import (
     ProviderConfigError,
     get_llm_provider,
+    get_media_provider,
     get_search_provider,
     get_voice_provider,
 )
 from src.config.settings import Settings
 from src.llm.mock import MockLLMProvider
+from src.tools.media_provider import MockMediaProvider
 from src.tools.search_provider import MockSearchProvider
 from src.tools.voice_provider import MockVoiceProvider
 
@@ -110,3 +112,42 @@ class TestGetVoiceProvider:
         monkeypatch.setenv("VOICE_PROVIDER", "mock")
         provider = get_voice_provider()
         assert isinstance(provider, MockVoiceProvider)
+
+
+class TestGetMediaProvider:
+    """Tests for media provider selection."""
+
+    def test_mock_provider_selected(self) -> None:
+        settings = Settings(media_provider="mock")
+        provider = get_media_provider(settings)
+        assert isinstance(provider, MockMediaProvider)
+
+    def test_mock_provider_case_insensitive(self) -> None:
+        settings = Settings(media_provider="MOCK")
+        provider = get_media_provider(settings)
+        assert isinstance(provider, MockMediaProvider)
+
+    def test_pexels_provider_selected(self) -> None:
+        from src.tools.pexels_media_provider import PexelsMediaProvider
+
+        settings = Settings(media_provider="pexels", pexels_api_key="fake-key")
+        provider = get_media_provider(settings)
+        assert isinstance(provider, PexelsMediaProvider)
+        assert provider.api_key == "fake-key"
+
+    def test_pexels_provider_missing_api_key_raises(self) -> None:
+        from src.tools.media_provider import MediaProviderError
+
+        settings = Settings(media_provider="pexels", pexels_api_key=None)
+        with pytest.raises(MediaProviderError):
+            get_media_provider(settings)
+
+    def test_unknown_media_provider_raises_config_error(self) -> None:
+        settings = Settings(media_provider="not-a-real-provider")
+        with pytest.raises(ProviderConfigError):
+            get_media_provider(settings)
+
+    def test_default_settings_used_when_none_passed(self, monkeypatch) -> None:
+        monkeypatch.setenv("MEDIA_PROVIDER", "mock")
+        provider = get_media_provider()
+        assert isinstance(provider, MockMediaProvider)

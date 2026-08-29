@@ -106,4 +106,28 @@ Consistent with the free/no-paid-API MVP constraint, Edge TTS remains the defaul
 
 ## Generated media stays out of Git
 
-Audio files produced by the pipeline (`output/audio/*.mp3`) are written to a directory already excluded via `.gitignore`. Generated media is treated as build output, not source - it's reproducible from a topic string plus the configured providers, so there's nothing to gain from tracking it and real cost (repo bloat) in doing so.
+Audio files produced by the pipeline (`output/audio/*.mp3`) are written to a directory already excluded via `.gitignore`. Generated media is treated as build output, not source - it's reproducible from a topic string plus the configured providers, so there's nothing to gain from tracking it and real cost (repo bloat) in doing so. The same applies to visual assets under `output/media/`.
+
+## Visual media retrieval is a deterministic service, not an LLM agent
+
+Preparing visual assets for a `ScriptResult` requires no reasoning or judgment - deriving a search query from a section's own text is fixed keyword-extraction logic, and asset selection (prefer video, then landscape, then first non-duplicate candidate) is a fixed rule. `VisualMediaService` is implemented as a plain deterministic service (mirroring `VoiceService`) rather than a LangGraph agent, consistent with "don't build an autonomous agent unless there's a clear need."
+
+## MediaProvider abstraction with Pexels as the free MVP implementation
+
+Stock image/video retrieval is defined behind a `MediaProvider` interface (`src/tools/media_provider.py`), with a `MockMediaProvider` for tests and a free `PexelsMediaProvider` for real assets. Pexels was chosen over Pixabay/Unsplash for the MVP because its free tier needs only a simple API key (no OAuth), all content is royalty-free and watermark-free by license, and its API supports server-side `orientation=landscape` filtering - directly serving the "prefer 16:9 landscape" requirement without extra client-side logic. `VisualMediaService` depends only on the `MediaProvider` interface, never on the Pexels API directly.
+
+## Search queries are extracted deterministically, not via an LLM call
+
+`VisualMediaService.build_search_queries` derives search queries from a section's own heading and narration using fixed keyword extraction and concept mapping (see below) - no LLM call per section. This avoids spending Gemini quota on a task that doesn't need reasoning, and keeps queries strictly derived from that section's actual content rather than any hardcoded topic assumption.
+
+## Abstract/scientific narration is concept-mapped to concrete visual terms before search
+
+An initial version of query extraction just kept the first few non-stopword words by position, which let scientific/abstract phrasing ("prefrontal cortex suppression," "evolutionary functions") pass straight into the Pexels query untranslated while visually concrete words later in the sentence got truncated off - manual review caught this producing irrelevant results (e.g. an industrial fire-extinguisher video for a section about brain activity). The fix: a phrase/word concept map translates abstract terms to concrete visual concepts (e.g. "prefrontal cortex" → "human brain neuroscience"), an expanded low-value word list drops non-visual filler, and remaining keywords are ranked by membership in a generic "concrete/visual" vocabulary before trimming to the query length limit - so a late-but-visual word survives ahead of an early-but-abstract one.
+
+## Query generation uses a specific → broader → topic → last-resort fallback chain
+
+`VisualMediaService` tries an ordered list of queries per section - most specific (concept-mapped heading+narration) first, then a broader heading-only query, then one derived from the script's overall topic, then a generic last resort ("background footage") - stopping at the first that yields a usable (non-duplicate) asset. This gives a section a real chance at a relevant match before falling back to something generic, without ever leaving a section with no visual at all.
+
+## Duplicate visual assets are avoided by URL, not file content
+
+`VisualMediaService` tracks each successfully-used asset's source/download URL across the whole script and skips any later candidate matching one already used, picking the next candidate instead (or recording a clean failure if none remain). Comparing by URL - not downloading and hashing file content - keeps duplicate detection cheap and matches what "the same stock photo/video" actually means for this use case.

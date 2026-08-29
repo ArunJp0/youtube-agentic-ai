@@ -60,7 +60,21 @@
 - Failure short-circuit behavior tested
 - Real MP3 generated successfully
 - 190/190 tests passing
+- Visual Media Service implemented as a deterministic service (not an LLM agent)
+- MediaProvider abstraction created, with Mock and free Pexels implementations
+- Deterministic (non-LLM) keyword extraction derives a search query per section from its own heading/narration
+- VisualMediaService downloads one asset per section into the gitignored `output/media/` directory, avoiding duplicate assets across sections
+- Media provider selection added via `MEDIA_PROVIDER`/`PEXELS_API_KEY` settings, mirroring the LLM/search/voice provider pattern
+- Visual Media Service unit tests added using a mock media provider and a mocked Pexels HTTP client (no real network calls)
+- Media demo/runner validated end to end with mock media (real Pexels run pending a `PEXELS_API_KEY`)
+- 248/248 tests passing
+- Visual Media Service MVP marked complete
+- Real Pexels API retrieval validated with a live `PEXELS_API_KEY`
+- 5 section-specific videos downloaded successfully in one real run
+- Deterministic visual-query generation improved for semantic relevance (concept mapping + relevance-ranked keyword extraction + specific/broader/topic/last-resort fallback chain)
+- Manual review confirmed acceptable media relevance for all 5 sections, including the previously-irrelevant "prefrontal cortex" section (now returns an on-topic brain visual)
+- 261/261 tests passing
 
 ## Current Next Milestone
 
-Visual/Media generation service.
+Integrate VisualMediaService into the main Research → Script → Voice pipeline.

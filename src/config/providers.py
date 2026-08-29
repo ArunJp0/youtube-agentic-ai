@@ -8,6 +8,7 @@ from src.llm.provider import LLMProvider
 from src.llm.mock import MockLLMProvider
 from src.tools.search_provider import SearchProvider, MockSearchProvider
 from src.tools.voice_provider import VoiceProvider, MockVoiceProvider
+from src.tools.media_provider import MediaProvider, MockMediaProvider
 
 
 class ProviderConfigError(Exception):
@@ -86,4 +87,29 @@ def get_voice_provider(settings: Optional[Settings] = None) -> VoiceProvider:
 
     raise ProviderConfigError(
         f"Unknown VOICE_PROVIDER: '{settings.voice_provider}'. Expected 'mock' or 'edge'."
+    )
+
+
+def get_media_provider(settings: Optional[Settings] = None) -> MediaProvider:
+    """Build the configured MediaProvider.
+
+    Pexels-specific imports are done lazily so the mock path never depends
+    on it, and so VisualMediaService never has to know which concrete stock
+    media API is in use.
+
+    Raises:
+        ProviderConfigError: If MEDIA_PROVIDER is not a recognized value.
+    """
+    settings = settings or Settings()
+    provider_name = (settings.media_provider or "mock").strip().lower()
+
+    if provider_name == "mock":
+        return MockMediaProvider()
+    if provider_name == "pexels":
+        from src.tools.pexels_media_provider import PexelsMediaProvider
+
+        return PexelsMediaProvider(api_key=settings.pexels_api_key)
+
+    raise ProviderConfigError(
+        f"Unknown MEDIA_PROVIDER: '{settings.media_provider}'. Expected 'mock' or 'pexels'."
     )

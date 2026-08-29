@@ -27,6 +27,10 @@ class Settings:
     voice_provider: str = field(default_factory=lambda: os.environ.get("VOICE_PROVIDER", "mock"))
     voice_name: str = field(default_factory=lambda: os.environ.get("VOICE_NAME", "en-US-AriaNeural"))
 
+    # Media Provider: "mock" or "pexels"
+    media_provider: str = field(default_factory=lambda: os.environ.get("MEDIA_PROVIDER", "mock"))
+    pexels_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("PEXELS_API_KEY") or None)
+
     # Gemini
     gemini_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY") or None)
     gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"))
