@@ -74,7 +74,16 @@
 - Deterministic visual-query generation improved for semantic relevance (concept mapping + relevance-ranked keyword extraction + specific/broader/topic/last-resort fallback chain)
 - Manual review confirmed acceptable media relevance for all 5 sections, including the previously-irrelevant "prefrontal cortex" section (now returns an on-topic brain visual)
 - 261/261 tests passing
+- Visual Media Service integrated into the main LangGraph orchestration - it is now a pipeline stage, not just a standalone service
+- Current working orchestration: Topic input → Research Agent → Script Agent → Voice Service → Visual Media Service
+- Real end-to-end pipeline validated in one run via `python -m src.pipeline_demo "Why do humans dream?"`
+- Real pipeline stages completed in that run: Research → Script → Voice → Visual Media
+- Real Edge TTS audio generation succeeded within the full pipeline run
+- Real Pexels media retrieval/download succeeded within the full pipeline run
+- Output locations confirmed: `output/audio/` (narration MP3) and `output/media/` (section videos/images), both Git-ignored
+- 263/263 tests passing
+- Research → Script → Voice → Visual Media pipeline milestone marked complete
 
 ## Current Next Milestone
 
-Integrate VisualMediaService into the main Research → Script → Voice pipeline.
+Video Assembly Service - will combine the generated narration audio (VoiceResult) and downloaded section media (VisualResult) into a final MP4. Not yet started: video assembly itself, subtitles, thumbnail, metadata generation, QC, copyright checking, and YouTube upload.

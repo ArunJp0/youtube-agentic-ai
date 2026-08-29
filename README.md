@@ -41,16 +41,20 @@ ruff format .
 
 ## MVP Scope
 
-The first development phase implements the **Research** and **Script** workflows:
+The current working orchestration - Research → Script → Voice → Visual Media - is implemented and validated end-to-end with real providers:
 
 ```
-Topic Input → Research Agent → Structured Research Output → Script Agent → Structured Script Output
+Topic Input → Research Agent → Script Agent → Voice Service → Visual Media Service
 ```
 
 - **Research Agent**: researches a topic (real Wikipedia search + Gemini LLM, with mock providers for offline dev) and produces a structured `ResearchResult` (summary, key points, sourced facts, source URLs).
-- **Script Agent**: converts a `ResearchResult` into a structured `ScriptResult` (title, hook, introduction, narrated sections, conclusion, call to action, estimated duration, source references) - natural spoken-style narration for YouTube, grounded only in the research, ready for a future Voice/Visual Agent to consume.
+- **Script Agent**: converts a `ResearchResult` into a structured `ScriptResult` (title, hook, introduction, narrated sections, conclusion, call to action, estimated duration, source references) - natural spoken-style narration for YouTube, grounded only in the research.
+- **Voice Service**: converts a `ScriptResult` into narration audio (real Edge TTS, with a mock provider for offline dev), saved under `output/audio/`.
+- **Visual Media Service**: finds and downloads a stock image/video per script section (real Pexels, with a mock provider for offline dev), saved under `output/media/`.
 
-Voice, Visual/Video, QC, and YouTube upload agents are not implemented yet.
+All four stages run together as one LangGraph pipeline (`python -m src.pipeline_demo "<topic>"`); a failure at any stage stops the pipeline before the next one runs. `output/audio/` and `output/media/` are Git-ignored - generated media is build output, not source.
+
+Video assembly (combining the narration audio and section media into a final MP4), subtitles, thumbnail, metadata generation, QC, copyright checking, and YouTube upload are not implemented yet.
 
 ## Project Structure
 

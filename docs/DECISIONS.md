@@ -131,3 +131,15 @@ An initial version of query extraction just kept the first few non-stopword word
 ## Duplicate visual assets are avoided by URL, not file content
 
 `VisualMediaService` tracks each successfully-used asset's source/download URL across the whole script and skips any later candidate matching one already used, picking the next candidate instead (or recording a clean failure if none remain). Comparing by URL - not downloading and hashing file content - keeps duplicate detection cheap and matches what "the same stock photo/video" actually means for this use case.
+
+## Visual Media Service is now a pipeline stage, not just a standalone service
+
+`VisualMediaService` is called directly from a `media` node appended to the end of the Research → Script → Voice LangGraph pipeline, running after Voice succeeds. As with `VoiceService` joining the pipeline earlier, this doesn't change its nature: it remains a deterministic service invoked the same way whether called standalone (via the media demo) or from the graph, and it receives the same `ScriptResult` the script stage produced, unmodified.
+
+## Media generation only runs after voice succeeds; its own failure ends the pipeline without discarding earlier results
+
+The pipeline's conditional routing now covers four stages: Research → Script → Voice → Visual Media, each gated on the previous one's success. A Visual Media failure is surfaced as a structured `VisualResult` (success=False, error set) alongside the pipeline's overall `failed` status - the already-produced `ResearchResult`/`ScriptResult`/`VoiceResult` are preserved in the final state rather than discarded, so a downstream Video Assembly Service (or a human) can still inspect what succeeded.
+
+## Full four-stage pipeline validated end-to-end with all real providers together
+
+`python -m src.pipeline_demo "Why do humans dream?"` was run with every stage on its real provider simultaneously (Wikipedia search, Gemini LLM, Edge TTS, Pexels media) rather than each service only being validated in isolation. This confirmed the real providers compose correctly through the shared `PipelineState` - not just that each one works alone.
