@@ -15,6 +15,7 @@ from langgraph.graph import END, StateGraph
 
 from src.agents.research import ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent, ScriptAgentError
+from src.agents.visual_context_planner import VisualContextPlanner
 from src.models.media import VisualResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
@@ -100,7 +101,14 @@ def build_pipeline_graph(
     voice_service = VoiceService(
         voice_provider=voice_provider, voice_name=voice_name, output_dir=voice_output_dir
     )
-    visual_service = VisualMediaService(media_provider=media_provider, output_dir=media_output_dir)
+    # Reuses the same LLMProvider Research/Script already depend on - one
+    # extra call per pipeline run (for the whole script at once), not a new
+    # provider/setting. If that call fails, VisualContextPlanner falls back
+    # to the deterministic query-generation path on its own.
+    visual_planner = VisualContextPlanner(llm_provider=llm_provider)
+    visual_service = VisualMediaService(
+        media_provider=media_provider, visual_planner=visual_planner, output_dir=media_output_dir
+    )
     video_service = VideoAssemblyService(assembler=assembler, output_dir=video_output_dir)
 
     async def research_node(state: PipelineState) -> dict:

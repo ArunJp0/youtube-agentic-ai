@@ -145,9 +145,13 @@ def _print_final_summary(state: PipelineState) -> None:
     if state.visual_result:
         found = sum(1 for m in state.visual_result.sections if any(a.success for a in m.assets))
         slot_count = sum(len(m.assets) for m in state.visual_result.sections)
+        planner_status = (
+            "LLM semantic plan" if state.visual_result.semantic_planning_used else "deterministic fallback"
+        )
         print(
             f"Visual Media success: {state.visual_result.success} "
-            f"({found}/{len(state.visual_result.sections)} sections, {slot_count} visual slots)"
+            f"({found}/{len(state.visual_result.sections)} sections, {slot_count} visual slots, "
+            f"visual planning: {planner_status})"
         )
     else:
         print("Visual Media success: False")

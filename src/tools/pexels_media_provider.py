@@ -1,7 +1,9 @@
 # Pexels stock media provider (free tier, API key required)
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -93,6 +95,7 @@ class PexelsMediaProvider(MediaProvider):
                     width=video_file.get("width"),
                     height=video_file.get("height"),
                     duration_seconds=video.get("duration"),
+                    content_hint=_slug_from_url(video.get("url", "")),
                 )
             )
         return candidates
@@ -117,6 +120,7 @@ class PexelsMediaProvider(MediaProvider):
                     attribution=photo.get("photographer"),
                     width=photo.get("width"),
                     height=photo.get("height"),
+                    content_hint=photo.get("alt") or _slug_from_url(photo.get("url", "")),
                 )
             )
         return candidates
@@ -134,6 +138,22 @@ class PexelsMediaProvider(MediaProvider):
             ) from e
         except httpx.HTTPError as e:
             raise MediaProviderError(f"Pexels request failed: {e}") from e
+
+
+def _slug_from_url(url: str) -> Optional[str]:
+    """Pexels page URLs embed a human-readable content slug, e.g.
+    ".../video/hikers-trekking-through-autumn-meadow-35759719/" - parse it
+    into a plain phrase usable as lightweight content metadata (no extra
+    API calls needed). Returns None if the URL has no usable slug."""
+    if not url:
+        return None
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return None
+    slug = path.rsplit("/", 1)[-1]
+    slug = re.sub(r"-\d+$", "", slug)  # drop the trailing Pexels numeric ID
+    words = [w for w in slug.split("-") if w and not w.isdigit()]
+    return " ".join(words) if words else None
 
 
 def _pick_best_video_file(video_files: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

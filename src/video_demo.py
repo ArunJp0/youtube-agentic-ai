@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from src.config.providers import ProviderConfigError, get_media_provider, get_voice_provider
+from src.agents.visual_context_planner import VisualContextPlanner
+from src.config.providers import ProviderConfigError, get_llm_provider, get_media_provider, get_voice_provider
 from src.config.settings import Settings
 from src.models.video import VideoAssemblyResult
 from src.script_demo import run_script_demo
@@ -66,9 +67,14 @@ async def run_video_demo(topic: str) -> VideoAssemblyResult:
     narration_duration = voice_result.duration_seconds or script_result.estimated_duration_seconds
 
     media_settings = Settings(media_provider="pexels")
-    visual_service = VisualMediaService(media_provider=get_media_provider(media_settings))
+    visual_planner = VisualContextPlanner(llm_provider=get_llm_provider(media_settings))
+    visual_service = VisualMediaService(
+        media_provider=get_media_provider(media_settings), visual_planner=visual_planner
+    )
     print(f"\n[2/3] Finding visuals for {len(script_result.sections)} section(s) via Pexels...")
     visual_result = await visual_service.generate_visuals(script_result, narration_duration)
+    planner_status = "LLM semantic plan" if visual_result.semantic_planning_used else "deterministic fallback"
+    print(f"      Visual planning: {planner_status}")
     slot_count = sum(len(m.assets) for m in visual_result.sections)
     found = sum(1 for m in visual_result.sections if any(a.success for a in m.assets))
     print(

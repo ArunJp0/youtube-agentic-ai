@@ -48,6 +48,33 @@ class TestMediaAsset:
         assert asset.success is False
         assert "No suitable" in asset.error
 
+    def test_relevance_tier_and_score_default_to_none(self) -> None:
+        asset = MediaAsset(provider="pexels", search_query="q", section_index=0, success=True)
+        assert asset.relevance_tier is None
+        assert asset.relevance_score is None
+
+    def test_relevance_tier_and_score_can_be_set(self) -> None:
+        asset = MediaAsset(
+            provider="pexels",
+            search_query="q",
+            section_index=0,
+            success=True,
+            relevance_tier="high",
+            relevance_score=0.75,
+        )
+        assert asset.relevance_tier == "high"
+        assert asset.relevance_score == 0.75
+
+    def test_relevance_score_out_of_range_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MediaAsset(
+                provider="pexels",
+                search_query="q",
+                section_index=0,
+                success=True,
+                relevance_score=1.5,
+            )
+
     def test_reused_asset_can_be_flagged(self) -> None:
         asset = MediaAsset(
             provider="pexels",
@@ -106,6 +133,18 @@ class TestSectionMediaMapping:
         assert mapping.assets == []
         assert mapping.search_queries == []
         assert mapping.planned_duration_seconds == 0.0
+        assert mapping.semantic_summary is None
+        assert mapping.avoid_concepts == []
+
+    def test_mapping_carries_semantic_plan_fields(self) -> None:
+        mapping = SectionMediaMapping(
+            section_index=0,
+            section_heading="Intro",
+            semantic_summary="The mind forms a narrative from memories.",
+            avoid_concepts=["construction site"],
+        )
+        assert mapping.semantic_summary == "The mind forms a narrative from memories."
+        assert mapping.avoid_concepts == ["construction site"]
 
     def test_mapping_assets_default_factory_is_isolated(self) -> None:
         m1 = SectionMediaMapping(section_index=0, section_heading="A")
@@ -138,6 +177,27 @@ class TestVisualResult:
     def test_result_defaults(self) -> None:
         result = VisualResult(topic="Dreams", provider="mock", success=False)
         assert result.sections == []
+        assert result.semantic_planning_used is False
+        assert result.semantic_planning_fallback_reason is None
+
+    def test_result_records_semantic_planning_usage(self) -> None:
+        result = VisualResult(
+            topic="Dreams",
+            provider="mock",
+            success=True,
+            semantic_planning_used=True,
+        )
+        assert result.semantic_planning_used is True
+
+    def test_result_records_fallback_reason(self) -> None:
+        result = VisualResult(
+            topic="Dreams",
+            provider="mock",
+            success=True,
+            semantic_planning_used=False,
+            semantic_planning_fallback_reason="LLM call failed",
+        )
+        assert result.semantic_planning_fallback_reason == "LLM call failed"
 
     def test_topic_cannot_be_empty(self) -> None:
         with pytest.raises(ValidationError):

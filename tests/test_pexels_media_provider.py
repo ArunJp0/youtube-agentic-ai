@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from src.tools.media_provider import MediaProviderError
-from src.tools.pexels_media_provider import PexelsMediaProvider
+from src.tools.pexels_media_provider import PexelsMediaProvider, _slug_from_url
 
 
 class FakeResponse:
@@ -64,6 +64,21 @@ def _photo_payload(photos):
     return {"photos": photos}
 
 
+class TestSlugFromUrl:
+    def test_extracts_words_and_drops_trailing_id(self) -> None:
+        url = "https://www.pexels.com/video/hikers-trekking-through-autumn-meadow-35759719/"
+        assert _slug_from_url(url) == "hikers trekking through autumn meadow"
+
+    def test_numeric_only_slug_returns_none(self) -> None:
+        assert _slug_from_url("https://www.pexels.com/video/123") is None
+
+    def test_empty_url_returns_none(self) -> None:
+        assert _slug_from_url("") is None
+
+    def test_no_path_returns_none(self) -> None:
+        assert _slug_from_url("https://www.pexels.com/") is None
+
+
 class TestPexelsMediaProviderInit:
     def test_missing_api_key_raises(self) -> None:
         with pytest.raises(MediaProviderError, match="PEXELS_API_KEY"):
@@ -106,8 +121,29 @@ class TestPexelsMediaProviderSearch:
         assert candidates[0].attribution == "Jane Doe"
         assert candidates[0].duration_seconds == 10
         assert candidates[0].provider_asset_id == "4567890"
+        assert candidates[0].content_hint is None  # "video/123" has no descriptive slug, just an id
         assert fake_client.last_params["orientation"] == "landscape"
         assert fake_client.last_headers["Authorization"] == "test-key"
+
+    @pytest.mark.asyncio
+    async def test_video_content_hint_derived_from_descriptive_url_slug(self, monkeypatch) -> None:
+        payload = _video_payload(
+            [
+                {
+                    "id": 1,
+                    "url": "https://www.pexels.com/video/hikers-trekking-through-autumn-meadow-35759719/",
+                    "video_files": [
+                        {"link": "https://cdn.pexels.com/vid.mp4", "file_type": "video/mp4", "quality": "hd"}
+                    ],
+                }
+            ]
+        )
+        fake_client = FakeAsyncClient(response=FakeResponse(payload))
+        monkeypatch.setattr(httpx, "AsyncClient", fake_client)
+
+        provider = PexelsMediaProvider(api_key="test-key")
+        candidates = await provider.search("hikers")
+        assert candidates[0].content_hint == "hikers trekking through autumn meadow"
 
     @pytest.mark.asyncio
     async def test_video_missing_id_leaves_provider_asset_id_none(self, monkeypatch) -> None:
@@ -127,6 +163,43 @@ class TestPexelsMediaProviderSearch:
         provider = PexelsMediaProvider(api_key="test-key")
         candidates = await provider.search("ocean")
         assert candidates[0].provider_asset_id is None
+
+    @pytest.mark.asyncio
+    async def test_photo_content_hint_prefers_alt_text_over_url_slug(self, monkeypatch) -> None:
+        payload = _photo_payload(
+            [
+                {
+                    "url": "https://www.pexels.com/photo/some-generic-slug-456/",
+                    "alt": "A person sleeping peacefully in a dark bedroom",
+                    "photographer": "A",
+                    "src": {"original": "https://cdn.pexels.com/photo.jpg"},
+                }
+            ]
+        )
+        fake_client = FakeAsyncClient(response=FakeResponse(payload))
+        monkeypatch.setattr(httpx, "AsyncClient", fake_client)
+
+        provider = PexelsMediaProvider(api_key="test-key")
+        candidates = await provider.search("bedroom", prefer_video=False)
+        assert candidates[0].content_hint == "A person sleeping peacefully in a dark bedroom"
+
+    @pytest.mark.asyncio
+    async def test_photo_content_hint_falls_back_to_url_slug_when_no_alt(self, monkeypatch) -> None:
+        payload = _photo_payload(
+            [
+                {
+                    "url": "https://www.pexels.com/photo/misty-mountain-range-at-dawn-789/",
+                    "photographer": "A",
+                    "src": {"original": "https://cdn.pexels.com/photo.jpg"},
+                }
+            ]
+        )
+        fake_client = FakeAsyncClient(response=FakeResponse(payload))
+        monkeypatch.setattr(httpx, "AsyncClient", fake_client)
+
+        provider = PexelsMediaProvider(api_key="test-key")
+        candidates = await provider.search("mountains", prefer_video=False)
+        assert candidates[0].content_hint == "misty mountain range at dawn"
 
     @pytest.mark.asyncio
     async def test_falls_back_to_photos_when_no_videos(self, monkeypatch) -> None:

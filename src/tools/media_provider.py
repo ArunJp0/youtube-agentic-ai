@@ -27,6 +27,11 @@ class MediaCandidate:
     width: Optional[int] = None
     height: Optional[int] = None
     duration_seconds: Optional[float] = None
+    # Lightweight, provider-supplied description of what the asset actually
+    # shows (e.g. a Pexels photo's "alt" text, or a descriptive page-URL
+    # slug), used for deterministic semantic filtering without downloading
+    # the asset. None when the provider has no such signal available.
+    content_hint: Optional[str] = None
 
 
 class MediaProvider(ABC):
@@ -86,6 +91,7 @@ class MockMediaProvider(MediaProvider):
         results_per_query: int = 3,
         empty_for: Optional[set] = None,
         pool_size: Optional[int] = None,
+        content_hints: Optional[List[Optional[str]]] = None,
     ) -> None:
         """Initialize the mock provider.
 
@@ -98,10 +104,16 @@ class MockMediaProvider(MediaProvider):
                 stock library, for testing reuse/fallback behavior. If
                 None (default), every query+index combination gets its own
                 unique ID (effectively unlimited distinct assets).
+            content_hints: If set, candidate ``i`` (within a single search
+                call) gets ``content_hints[i % len(content_hints)]`` as its
+                ``content_hint`` - for testing semantic-filter behavior
+                deterministically. None (default) leaves every candidate's
+                content_hint unset, matching a provider with no such signal.
         """
         self.results_per_query = results_per_query
         self.empty_for = empty_for or set()
         self.pool_size = pool_size
+        self.content_hints = content_hints
         self.calls: List[Tuple[str, Any]] = []
 
     @property
@@ -121,6 +133,7 @@ class MockMediaProvider(MediaProvider):
         candidates = []
         for i in range(count):
             asset_id = str(i % self.pool_size) if self.pool_size else f"{slug}-{i}"
+            content_hint = self.content_hints[i % len(self.content_hints)] if self.content_hints else None
             candidates.append(
                 MediaCandidate(
                     asset_type=asset_type,
@@ -131,6 +144,7 @@ class MockMediaProvider(MediaProvider):
                     width=1920,
                     height=1080,
                     duration_seconds=8.0 if asset_type == "video" else None,
+                    content_hint=content_hint,
                 )
             )
         return candidates

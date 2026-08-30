@@ -13,7 +13,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from src.config.providers import ProviderConfigError, get_media_provider
+from src.agents.visual_context_planner import VisualContextPlanner
+from src.config.providers import ProviderConfigError, get_llm_provider, get_media_provider
 from src.config.settings import Settings
 from src.models.media import VisualResult
 from src.script_demo import run_script_demo
@@ -43,7 +44,11 @@ async def run_media_demo(topic: str) -> VisualResult:
 
     settings = Settings(media_provider="pexels")
     media_provider = get_media_provider(settings)
-    visual_service = VisualMediaService(media_provider=media_provider)
+    # Uses whatever LLM_PROVIDER is configured (falls back to the
+    # deterministic query generator automatically if it's mock, or if a
+    # real call fails) - see VisualContextPlanner.plan_visuals.
+    visual_planner = VisualContextPlanner(llm_provider=get_llm_provider(settings))
+    visual_service = VisualMediaService(media_provider=media_provider, visual_planner=visual_planner)
 
     print(f"\n[3/3] Finding visuals for {len(script_result.sections)} section(s) via Pexels...")
     return await visual_service.generate_visuals(
@@ -56,6 +61,10 @@ def print_visual_result(result: VisualResult) -> None:
     print("\n" + "=" * 60)
     print(f"VISUAL RESULT (provider: {result.provider})")
     print("=" * 60)
+    planner_status = "LLM semantic plan" if result.semantic_planning_used else "deterministic fallback"
+    print(f"Visual planning: {planner_status}")
+    if result.semantic_planning_fallback_reason:
+        print(f"   Fallback reason: {result.semantic_planning_fallback_reason}")
 
     total_slots = 0
     unique_ids = set()
@@ -66,6 +75,10 @@ def print_visual_result(result: VisualResult) -> None:
             f"\nSection {mapping.section_index + 1} ({mapping.section_heading}) "
             f"- {len(mapping.assets)} slot(s), {mapping.planned_duration_seconds:.1f}s planned"
         )
+        if mapping.semantic_summary:
+            print(f"   Meaning: {mapping.semantic_summary}")
+        if mapping.avoid_concepts:
+            print(f"   Avoiding: {', '.join(mapping.avoid_concepts)}")
         for slot_index, asset in enumerate(mapping.assets):
             query = mapping.search_queries[slot_index] if slot_index < len(mapping.search_queries) else ""
             total_slots += 1
@@ -76,9 +89,10 @@ def print_visual_result(result: VisualResult) -> None:
             asset_id = asset.provider_asset_id or asset.source_url or asset.local_file_path
             unique_ids.add(asset_id)
             reused_tag = " [REUSED]" if asset.reused else ""
+            tier_tag = f" [{asset.relevance_tier}]" if asset.relevance_tier else ""
             if asset.reused:
                 reused_count += 1
-            print(f"   Slot {slot_index + 1}: {query!r}{reused_tag}")
+            print(f"   Slot {slot_index + 1}: {query!r}{reused_tag}{tier_tag}")
             print(f"      Asset: {asset.local_file_path}")
             print(f"      Type:  {asset.asset_type}  ({asset.width}x{asset.height})")
             if asset.attribution:

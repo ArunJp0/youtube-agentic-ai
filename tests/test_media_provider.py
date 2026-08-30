@@ -80,6 +80,24 @@ class TestMockMediaProvider:
         assert ids <= {"0", "1"}
 
     @pytest.mark.asyncio
+    async def test_content_hint_unset_by_default(self) -> None:
+        provider = MockMediaProvider(results_per_query=3)
+        candidates = await provider.search("forest")
+        assert all(c.content_hint is None for c in candidates)
+
+    @pytest.mark.asyncio
+    async def test_content_hints_applied_by_index(self) -> None:
+        provider = MockMediaProvider(results_per_query=3, content_hints=["a hint", None, "another hint"])
+        candidates = await provider.search("forest")
+        assert [c.content_hint for c in candidates] == ["a hint", None, "another hint"]
+
+    @pytest.mark.asyncio
+    async def test_content_hints_cycle_when_shorter_than_results(self) -> None:
+        provider = MockMediaProvider(results_per_query=4, content_hints=["only hint"])
+        candidates = await provider.search("forest")
+        assert all(c.content_hint == "only hint" for c in candidates)
+
+    @pytest.mark.asyncio
     async def test_download_writes_file(self, tmp_path) -> None:
         provider = MockMediaProvider(results_per_query=1)
         candidates = await provider.search("sunrise")

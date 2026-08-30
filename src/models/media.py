@@ -39,6 +39,19 @@ class MediaAsset(BaseModel):
         default=False,
         description="True if this asset reuses an already-downloaded file rather than a fresh download",
     )
+    relevance_tier: Optional[str] = Field(
+        default=None,
+        description="Diagnostic selection tier: 'high' (matched a specific visual-plan query), "
+        "'neutral' (matched a neutral/fallback query), or 'reused' (reused an already-"
+        "downloaded asset). Not a guarantee of factual visual correctness.",
+    )
+    relevance_score: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Diagnostic 0-1 keyword-overlap score between the selected candidate's "
+        "metadata and the section's visual plan, for QC/diagnostics only",
+    )
     success: bool = Field(description="Whether an asset was found and downloaded successfully")
     error: Optional[str] = Field(default=None, description="Error message if retrieval failed")
 
@@ -61,6 +74,15 @@ class SectionMediaMapping(BaseModel):
     planned_duration_seconds: float = Field(
         default=0.0, ge=0.0, description="This section's total allocated timeline duration"
     )
+    semantic_summary: Optional[str] = Field(
+        default=None,
+        description="One-sentence description of what this section's visuals are meant to "
+        "convey, carried over from the visual plan",
+    )
+    avoid_concepts: List[str] = Field(
+        default_factory=list,
+        description="Concepts the visual plan flagged to avoid selecting for this section",
+    )
     assets: List[MediaAsset] = Field(
         default_factory=list,
         description="Assets selected for this section's visual slots, in playback order",
@@ -80,4 +102,12 @@ class VisualResult(BaseModel):
     success: bool = Field(description="Whether every section got at least one usable asset")
     error: Optional[str] = Field(
         default=None, description="Summary error if one or more sections failed"
+    )
+    semantic_planning_used: bool = Field(
+        default=False,
+        description="True if a real LLM semantic visual plan (VisualContextPlanner) was used "
+        "to select media for this result; False if the deterministic fallback was used",
+    )
+    semantic_planning_fallback_reason: Optional[str] = Field(
+        default=None, description="Why the deterministic fallback was used, if it was"
     )

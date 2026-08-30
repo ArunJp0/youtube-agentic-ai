@@ -210,6 +210,18 @@ class TestPipelineWorkflow:
         assert state.visual_result.success is True
         assert len(state.visual_result.sections) == len(state.script_result.sections)
 
+    @pytest.mark.asyncio
+    async def test_visual_media_uses_visual_context_planner_with_safe_fallback(self, providers) -> None:
+        """The pipeline wires a VisualContextPlanner (one shared LLMProvider
+        call) into the media stage. Since the mock LLM never returns valid
+        JSON, this exercises - and must not break on - the planner's own
+        deterministic fallback path."""
+        state = await self._run(providers)
+
+        assert state.visual_result.semantic_planning_used is False
+        assert state.visual_result.semantic_planning_fallback_reason is not None
+        assert state.status == "completed"
+
     # ---- B. VideoAssemblyResult stored in final state ----------------------
 
     @pytest.mark.asyncio

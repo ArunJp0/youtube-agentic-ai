@@ -196,6 +196,52 @@ The proportional (narration-word-count-based) section-duration calculation is ne
 
 Duration-aware visual planning consumes `VoiceResult.duration_seconds` as a read-only upstream input; no changes were made to voice synthesis, narration extraction, or `VoiceService` itself. This kept the change scoped to the visual/media/assembly layers it was meant to improve.
 
-## Known limitation: visual semantic relevance is still bounded by deterministic query generation and stock availability
+## Known limitation (resolved by Context-Aware Visual Planning): visual semantic relevance was bounded by deterministic query generation and stock availability
 
-Manual review of a real end-to-end run confirmed the repetition problem is substantially improved (clips now change throughout the video, no obvious looping), but some individual stock clips remain only loosely related to their section's narration. This is a content-quality limitation of deterministic (non-LLM) keyword/concept-mapped query generation combined with whatever Pexels actually has available for a given query - not a pipeline defect, since the pipeline still reliably produces a complete, correctly-timed, playable video. A future QC/visual-relevance-validation step (to reject weak matches and request alternatives) is a candidate future milestone but is not implemented yet.
+Manual review of a real end-to-end run confirmed the repetition problem was substantially improved (clips changed throughout the video, no obvious looping), but some individual stock clips were only loosely related to their section's narration. This was a content-quality limitation of deterministic (non-LLM) keyword/concept-mapped query generation combined with whatever Pexels actually had available for a given query - not a pipeline defect, since the pipeline still reliably produced a complete, correctly-timed, playable video. The Context-Aware Visual Planning and Semantic Media Filtering milestone below directly addresses the lexical-ambiguity part of this limitation; the entries under Known Limitations at the end of this document describe what remains.
+
+## A dedicated VisualContextPlanner supplies semantic understanding, not VisualMediaService or an autonomous agent
+
+Interpreting what a script section actually *means* (as opposed to which literal keywords it contains) requires judgment - exactly the kind of task an LLM is suited for and deterministic keyword extraction is not. Rather than growing `VisualMediaService` into something that reasons about meaning, or building a large autonomous multi-step agent, a small, focused `VisualContextPlanner` (`src/agents/visual_context_planner.py`) was added: it does one thing (read a whole script, return a structured per-section visual plan) and `VisualMediaService` remains a deterministic consumer of its output, unchanged in kind. This mirrors how `ResearchAgent`/`ScriptAgent` already own the LLM-reasoning steps in this codebase while the `services/` layer stays deterministic.
+
+## Visual planning is one LLM call for the whole script, never per-section or per-slot
+
+`VisualContextPlanner.plan_visuals` sends the entire script (topic, video title, every section's heading and narration, in order) to the LLM in a single request and expects one structured JSON response covering every section. This was a deliberate quota/cost constraint: a video's LLM spend for visual planning does not grow with its number of sections or, later, its number of duration-aware visual slots - it is always exactly one call, reusing the same `LLMProvider` already shared by Research and Script (no new provider or setting).
+
+## The visual plan is a typed structured object, not free text
+
+`SectionVisualPlan`/`VisualPlan` (`src/models/visual_plan.py`) give every section a `semantic_summary`, `visual_intents`, `search_queries`, `avoid_concepts`, and `neutral_fallback_queries`. Requiring the LLM to return this shape (parsed as strict JSON, with markdown-fence/commentary stripped defensively) rather than freeform prose keeps `VisualMediaService`'s consumption of it simple, typed, and testable, and gives the planner an explicit place to record disambiguation (`avoid_concepts`) rather than only a "better" keyword list.
+
+## Prompting for contextual disambiguation, not hardcoding word-sense rules
+
+The planner's prompt explicitly instructs the LLM to resolve ambiguous wording using the surrounding sentence and the video's overall topic (illustrated with one generic example - "constructs a narrative" meaning "mentally forms," not "builds" - inside the prompt text itself), rather than the codebase maintaining any dictionary of ambiguous words or topic-specific disambiguation rules. This keeps the mechanism fully generic: the same prompt structure was validated against an unrelated ambiguity (software "bug" vs. insect) in automated tests, and against the real "constructs ... humans exist" narration in a live run, without any code change between the two.
+
+## Planner failure falls back to the exact same deterministic path used when no planner is configured
+
+`VisualContextPlanner.plan_visuals` never raises for an LLM failure, a malformed response, or a schema/section-count mismatch - it catches all of these internally and returns `query_generation.build_deterministic_visual_plan(script)` instead, with `VisualPlan.used_semantic_planning=False` and a `fallback_reason` describing why. This is the identical deterministic plan `VisualMediaService` builds directly when constructed without a planner at all, so there is exactly one fallback implementation, not two divergent ones, and a Gemini outage degrades visual planning back to the already-validated pre-milestone behavior rather than failing the pipeline.
+
+## Deterministic query-generation logic was extracted to a shared module, not duplicated
+
+The keyword-extraction/concept-mapping/query-variant logic that previously lived on `VisualMediaService` was moved into `src/services/query_generation.py` as plain functions, used two ways: directly by `VisualMediaService` when no `VisualContextPlanner` is configured, and internally by `VisualContextPlanner`'s own fallback path. Both routes to "no semantic plan available" now share one implementation and one test suite (`tests/test_query_generation.py`) instead of risking two copies drifting apart.
+
+## Semantic filtering is deterministic keyword overlap against lightweight metadata, not a classifier
+
+`src/services/semantic_visual_filter.py` enforces the plan's `avoid_concepts` by checking a candidate's `content_hint` (a Pexels photo's "alt" text, or a descriptive words-only page-URL slug parsed with a small regex - see `MediaCandidate.content_hint`/`_slug_from_url`) for a substring match, and separately scores positive keyword overlap against `visual_intents`/`search_queries` for diagnostics. Deliberately not a classifier or an embeddings-based similarity check: the goal was a simple, explainable, unit-testable rule the LLM's plan can drive, not a second machine-learning layer. When a candidate has no usable metadata at all, it is not blocked - the filter only rejects on positive evidence of a mismatch, consistent with "a neutral relevant visual beats a specific but misleading one" without going so far as "reject anything unverified."
+
+## Query selection rotates one plan query per slot rather than retrying the full query list every slot
+
+Each visual slot searches its own specific query (rotated by slot index through the plan's `search_queries`, so different slots explore different facets of a section), then the plan's `neutral_fallback_queries`, then a shared last resort - mirroring the rotation approach already validated in the duration-aware milestone. An earlier draft of this change had every slot retry the *entire* specific-query list before falling back, which is unnecessary and would have significantly increased Pexels API calls once a section's stock pool is exhausted; per-slot rotation keeps search-call volume the same as before this milestone while adding semantic filtering on top.
+
+## Selected-asset diagnostics: relevance_tier and relevance_score are informational, not gates
+
+Each successfully selected `MediaAsset` records a `relevance_tier` (`"high"` for a specific-query match, `"neutral"` for a neutral/fallback-query match, `"reused"` for any form of asset reuse) and an optional `relevance_score` (keyword-overlap ratio against the plan, when metadata is available). Both are diagnostic only - printed in the demo runners and available for a future QC step - and are never used to reject a selection on their own; the pass/fail gate is `passes_avoid_filter`, which is explainable and testable, not a numeric threshold.
+
+## VideoAssemblyService and VoiceService remain out of scope
+
+Consistent with "VideoAssemblyService should not make semantic decisions," no changes were made to `VideoAssemblyService`, `FFmpegVideoAssembler`, or `VoiceService` for this milestone - `SectionMediaMapping`'s new `semantic_summary`/`avoid_concepts` fields are additive and optional, so `VideoAssemblyService`'s existing usable-asset mapping needed no changes at all.
+
+## Known limitations
+
+- The deterministic fallback plan (used when semantic planning is unavailable) still has no contextual understanding of ambiguous wording - it is a safe degradation path, not a second semantic solution.
+- The semantic filter judges a candidate only by lightweight text metadata (alt text or a URL slug); it does not inspect actual video/image frames, so misleading or missing metadata can still let a mismatched candidate through. A future Visual QC step inspecting actual candidate thumbnails/frames (e.g. via a vision model) is a candidate next milestone, not yet implemented.
+- For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.
