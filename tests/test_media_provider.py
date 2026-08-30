@@ -46,11 +46,38 @@ class TestMockMediaProvider:
         assert candidates == []
 
     @pytest.mark.asyncio
+    async def test_search_candidates_have_unique_ids_by_default(self) -> None:
+        provider = MockMediaProvider(results_per_query=3)
+        candidates = await provider.search("forest")
+        ids = [c.provider_asset_id for c in candidates]
+        assert len(set(ids)) == len(ids)
+        assert all(ids)  # every candidate has a non-empty id
+
+    @pytest.mark.asyncio
     async def test_search_candidates_have_unique_urls(self) -> None:
         provider = MockMediaProvider(results_per_query=3)
         candidates = await provider.search("forest")
         urls = [c.download_url for c in candidates]
         assert len(set(urls)) == len(urls)
+
+    @pytest.mark.asyncio
+    async def test_different_queries_produce_different_ids_by_default(self) -> None:
+        provider = MockMediaProvider(results_per_query=1)
+        a = await provider.search("forest")
+        b = await provider.search("ocean")
+        assert a[0].provider_asset_id != b[0].provider_asset_id
+
+    @pytest.mark.asyncio
+    async def test_pool_size_limits_distinct_ids_across_queries(self) -> None:
+        """pool_size simulates a limited stock library: different queries
+        can still surface the same small set of asset IDs, for testing
+        reuse/fallback behavior deterministically."""
+        provider = MockMediaProvider(results_per_query=1, pool_size=2)
+        a = await provider.search("forest")
+        b = await provider.search("ocean")
+        c = await provider.search("mountains")
+        ids = {a[0].provider_asset_id, b[0].provider_asset_id, c[0].provider_asset_id}
+        assert ids <= {"0", "1"}
 
     @pytest.mark.asyncio
     async def test_download_writes_file(self, tmp_path) -> None:

@@ -16,16 +16,20 @@ class TestMediaAsset:
             asset_type="video",
             local_file_path="output/media/section-01-abcd1234.mp4",
             source_url="https://www.pexels.com/video/12345",
+            provider_asset_id="12345",
             attribution="Jane Doe",
             search_query="ocean waves",
             section_index=0,
             duration_seconds=12.5,
             width=1920,
             height=1080,
+            reused=False,
             success=True,
         )
         assert asset.provider == "pexels"
         assert asset.asset_type == "video"
+        assert asset.provider_asset_id == "12345"
+        assert asset.reused is False
         assert asset.success is True
         assert asset.error is None
 
@@ -39,8 +43,22 @@ class TestMediaAsset:
         )
         assert asset.asset_type is None
         assert asset.local_file_path is None
+        assert asset.provider_asset_id is None
+        assert asset.reused is False
         assert asset.success is False
         assert "No suitable" in asset.error
+
+    def test_reused_asset_can_be_flagged(self) -> None:
+        asset = MediaAsset(
+            provider="pexels",
+            local_file_path="output/media/section-01-abcd1234.mp4",
+            provider_asset_id="12345",
+            search_query="ocean waves",
+            section_index=3,
+            reused=True,
+            success=True,
+        )
+        assert asset.reused is True
 
     def test_provider_cannot_be_empty(self) -> None:
         with pytest.raises(ValidationError):
@@ -68,28 +86,38 @@ class TestMediaAsset:
 class TestSectionMediaMapping:
     """Tests for the SectionMediaMapping model."""
 
-    def test_mapping_with_asset(self) -> None:
+    def test_mapping_with_multiple_ordered_assets(self) -> None:
         mapping = SectionMediaMapping(
             section_index=0,
             section_heading="Intro",
-            search_query="city skyline",
+            search_queries=["city skyline", "urban night"],
+            planned_duration_seconds=16.0,
             assets=[
-                MediaAsset(provider="mock", search_query="city skyline", section_index=0, success=True)
+                MediaAsset(provider="mock", search_query="city skyline", section_index=0, success=True),
+                MediaAsset(provider="mock", search_query="urban night", section_index=0, success=True),
             ],
         )
-        assert len(mapping.assets) == 1
+        assert len(mapping.assets) == 2
+        assert mapping.search_queries == ["city skyline", "urban night"]
+        assert mapping.planned_duration_seconds == 16.0
 
-    def test_mapping_defaults_to_no_assets(self) -> None:
-        mapping = SectionMediaMapping(section_index=0, section_heading="Intro", search_query="q")
+    def test_mapping_defaults(self) -> None:
+        mapping = SectionMediaMapping(section_index=0, section_heading="Intro")
         assert mapping.assets == []
+        assert mapping.search_queries == []
+        assert mapping.planned_duration_seconds == 0.0
 
     def test_mapping_assets_default_factory_is_isolated(self) -> None:
-        m1 = SectionMediaMapping(section_index=0, section_heading="A", search_query="a")
-        m2 = SectionMediaMapping(section_index=1, section_heading="B", search_query="b")
+        m1 = SectionMediaMapping(section_index=0, section_heading="A")
+        m2 = SectionMediaMapping(section_index=1, section_heading="B")
         m1.assets.append(
             MediaAsset(provider="mock", search_query="a", section_index=0, success=True)
         )
         assert m2.assets == []
+
+    def test_planned_duration_cannot_be_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            SectionMediaMapping(section_index=0, section_heading="A", planned_duration_seconds=-1.0)
 
 
 class TestVisualResult:
@@ -100,7 +128,7 @@ class TestVisualResult:
             topic="Dreams",
             provider="mock",
             sections=[
-                SectionMediaMapping(section_index=0, section_heading="Intro", search_query="q")
+                SectionMediaMapping(section_index=0, section_heading="Intro", search_queries=["q"])
             ],
             success=True,
         )
@@ -127,11 +155,24 @@ class TestVisualResult:
                 SectionMediaMapping(
                     section_index=0,
                     section_heading="Intro",
-                    search_query="q",
+                    search_queries=["q1", "q2"],
+                    planned_duration_seconds=20.0,
                     assets=[
                         MediaAsset(
-                            provider="mock", search_query="q", section_index=0, success=True
-                        )
+                            provider="mock",
+                            provider_asset_id="1",
+                            search_query="q1",
+                            section_index=0,
+                            success=True,
+                        ),
+                        MediaAsset(
+                            provider="mock",
+                            provider_asset_id="2",
+                            search_query="q2",
+                            section_index=0,
+                            reused=True,
+                            success=True,
+                        ),
                     ],
                 )
             ],

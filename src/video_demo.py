@@ -63,12 +63,18 @@ async def run_video_demo(topic: str) -> VideoAssemblyResult:
     if not voice_result.success:
         print(f"      Error: {voice_result.error}")
 
+    narration_duration = voice_result.duration_seconds or script_result.estimated_duration_seconds
+
     media_settings = Settings(media_provider="pexels")
     visual_service = VisualMediaService(media_provider=get_media_provider(media_settings))
     print(f"\n[2/3] Finding visuals for {len(script_result.sections)} section(s) via Pexels...")
-    visual_result = await visual_service.generate_visuals(script_result)
-    found = sum(1 for m in visual_result.sections if m.assets and m.assets[0].success)
-    print(f"      Media: {found}/{len(visual_result.sections)} section(s) (success={visual_result.success})")
+    visual_result = await visual_service.generate_visuals(script_result, narration_duration)
+    slot_count = sum(len(m.assets) for m in visual_result.sections)
+    found = sum(1 for m in visual_result.sections if any(a.success for a in m.assets))
+    print(
+        f"      Media: {found}/{len(visual_result.sections)} section(s) usable, "
+        f"{slot_count} visual slot(s) total (success={visual_result.success})"
+    )
 
     print("\n[3/3] Assembling final MP4 (FFmpeg: scale/crop/trim/loop per section, concat, mux audio)...")
     return await video_service.assemble_video(script_result, voice_result, visual_result)

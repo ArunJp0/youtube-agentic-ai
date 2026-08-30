@@ -1,28 +1,68 @@
 # Visual Media Service: prepares stock image/video assets for a ScriptResult.
 #
 # This is a deterministic service, not an LLM-driven reasoning agent: search
-# query extraction is fixed keyword/concept-mapping logic with no model
-# calls, and asset selection is a fixed rule (prefer video, then landscape,
-# then first non-duplicate candidate, falling back to a broader query).
-# Only the actual media search/download is delegated to a swappable
-# MediaProvider.
+# query extraction/expansion is fixed keyword/concept-mapping logic with no
+# model calls, and asset selection is a fixed rule (prefer video, then
+# landscape, then the first unique candidate, falling back to broader
+# queries, then to controlled reuse, then to a shared last resort). Only the
+# actual media search/download is delegated to a swappable MediaProvider.
+#
+# Visual quantity is duration-aware: how many distinct clips a section gets
+# is derived from that section's own share of the real narration duration
+# (see calculate_slot_count), never a fixed count per section or per video.
 from __future__ import annotations
 
 import os
 import re
 import uuid
-from typing import List, Set
+from dataclasses import dataclass
+from typing import Dict, List, Set, Tuple
 from urllib.parse import urlparse
 
 from src.models.media import MediaAsset, SectionMediaMapping, VisualResult
 from src.models.script import ScriptResult, ScriptSection
+from src.services.section_timing import calculate_section_durations
 from src.tools.media_provider import MediaCandidate, MediaProvider, MediaProviderError
 
 DEFAULT_MEDIA_OUTPUT_DIR = os.path.join("output", "media")
 DEFAULT_MAX_RESULTS_PER_QUERY = 5
 MAX_QUERY_TERMS = 4
 BROAD_QUERY_TERMS = 2
+VARIANT_QUERY_TERMS = 2
 LAST_RESORT_QUERY = "background footage"
+
+# How many of the most recently *used* assets (across the whole video, not
+# just this section) are off-limits for "controlled reuse" (selection
+# priority 3 below) - avoids immediate back-to-back repeats and a couple of
+# near-neighbors, without requiring full uniqueness across a long video.
+RECENT_REUSE_LOOKBACK = 2
+
+# A visual slot is never planned shorter than this, regardless of cadence
+# math - prevents pathologically short sections from being sliced into
+# many sub-clips that FFmpeg would barely show.
+MIN_SLOT_SECONDS = 3.0
+
+
+@dataclass(frozen=True)
+class _CadenceTier:
+    """One tier of the visual-cadence policy: for videos up to
+    ``max_total_seconds`` long, aim to change the visual roughly every
+    ``min_seconds_per_clip``-``max_seconds_per_clip`` seconds."""
+
+    max_total_seconds: float
+    min_seconds_per_clip: float
+    max_seconds_per_clip: float
+
+
+# Visual cadence policy, tiered by total narration duration: longer videos
+# hold each clip slightly longer, so the number of clips needed does not
+# grow linearly forever. Centralized here (not scattered magic numbers) so
+# the whole policy can be tuned in one place.
+CADENCE_POLICY: List[_CadenceTier] = [
+    _CadenceTier(max_total_seconds=300.0, min_seconds_per_clip=6.0, max_seconds_per_clip=10.0),  # <= 5 min
+    _CadenceTier(max_total_seconds=600.0, min_seconds_per_clip=8.0, max_seconds_per_clip=12.0),  # 5-10 min
+    _CadenceTier(max_total_seconds=float("inf"), min_seconds_per_clip=10.0, max_seconds_per_clip=15.0),  # > 10 min
+]
 
 # Deliberately small and generic (not topic-specific) - filtered out of
 # section text when building a search query, since they carry no visual
@@ -120,7 +160,7 @@ class VisualMediaServiceError(Exception):
     """Raised for configuration/programmer errors (e.g. missing input).
 
     Provider search/download failures are NOT raised - they are captured
-    per-section in the returned VisualResult (MediaAsset.success=False,
+    per-asset in the returned VisualResult (MediaAsset.success=False,
     error=...) so callers always get a structured result back.
     """
 
@@ -128,14 +168,16 @@ class VisualMediaServiceError(Exception):
 class VisualMediaService:
     """Deterministic service that prepares visual assets for a ScriptResult.
 
-    For each section: derives an ordered chain of search queries from its
-    own heading/narration (no LLM call) - a specific concept-mapped query,
-    a broader version of it, then the script's overall topic, then a last-
-    resort generic query - and tries the configured MediaProvider with each
-    in turn (video preferred, landscape orientation) until one yields a
-    candidate not already used elsewhere in this script. Records the
-    outcome as a MediaAsset even on total failure, so every section gets a
-    mapping entry.
+    For each section: derives how many distinct visual slots it needs from
+    its own share of the real narration duration (duration-aware, never a
+    fixed count), generates a small set of distinct concept-query variants
+    from its own heading/narration (no LLM call) so different slots search
+    for different facets of the same content, and fills each slot by
+    searching candidate metadata first and downloading only the one
+    candidate actually selected - preferring a never-used asset, then a
+    broader-query match, then (only if no unique candidate exists anywhere)
+    reusing an already-downloaded asset that wasn't used immediately
+    before, and only as a last resort reusing the most recent one.
     """
 
     def __init__(
@@ -152,7 +194,7 @@ class VisualMediaService:
             output_dir: Local directory to write downloaded assets into
                 (expected to be excluded from version control)
             max_results_per_query: Candidates to request per query, giving
-                room to skip duplicates already used by another section
+                room to find a unique (non-duplicate) match
             prefer_video: Ask the provider for video clips before images
         """
         self.media_provider = media_provider
@@ -160,22 +202,34 @@ class VisualMediaService:
         self.max_results_per_query = max_results_per_query
         self.prefer_video = prefer_video
 
-    async def generate_visuals(self, script: ScriptResult) -> VisualResult:
-        """Prepare a visual asset for every section of a ScriptResult.
+    async def generate_visuals(
+        self, script: ScriptResult, total_narration_duration_seconds: float
+    ) -> VisualResult:
+        """Prepare duration-aware visual assets for every section of a ScriptResult.
 
         Never raises for search/download failures - those are captured
-        per-section in the returned VisualResult. Only raises
+        per-asset in the returned VisualResult. Only raises
         VisualMediaServiceError for configuration/programmer errors (e.g. a
-        missing ScriptResult).
+        missing ScriptResult or a non-positive duration).
 
         Args:
             script: Structured script produced by the Script Agent
+            total_narration_duration_seconds: The real narration audio
+                duration (VoiceResult.duration_seconds) - the upstream
+                timing input this service's visual planning is based on.
+                Section/slot durations are derived from this, not estimated
+                independently.
 
         Returns:
-            Structured VisualResult mapping each section to its asset(s)
+            Structured VisualResult mapping each section to its ordered asset(s)
         """
         if script is None:
             raise VisualMediaServiceError("ScriptResult is required")
+        if total_narration_duration_seconds is None or total_narration_duration_seconds <= 0:
+            raise VisualMediaServiceError(
+                "total_narration_duration_seconds must be a positive number "
+                "(pass VoiceResult.duration_seconds)"
+            )
 
         if not script.sections:
             return VisualResult(
@@ -188,81 +242,154 @@ class VisualMediaService:
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-        used_urls: Set[str] = set()
+        section_durations = calculate_section_durations(
+            script.sections, total_narration_duration_seconds
+        )
+
+        downloaded_by_id: Dict[str, MediaAsset] = {}
+        used_ids_in_order: List[str] = []
         section_mappings: List[SectionMediaMapping] = []
 
-        for index, section in enumerate(script.sections):
-            queries = self.build_search_queries(section, script.topic)
-            asset = await self._find_and_download_asset(queries, index, used_urls)
-            if asset.success:
-                if asset.source_url:
-                    used_urls.add(asset.source_url)
-                used_urls.add(asset.local_file_path or "")
+        for index, (section, duration) in enumerate(zip(script.sections, section_durations)):
+            slot_count = self.calculate_slot_count(duration, total_narration_duration_seconds)
+            variants = self.build_query_variants(section, slot_count)
+            broader_query = self._build_concept_query(section.heading, BROAD_QUERY_TERMS)
+            topic_query = (
+                self._build_concept_query(script.topic, MAX_QUERY_TERMS) if script.topic else ""
+            )
+
+            slot_assets: List[MediaAsset] = []
+            slot_queries: List[str] = []
+            for slot_index in range(slot_count):
+                primary = variants[slot_index % len(variants)] if variants else broader_query
+                query_chain = self._ordered_unique(
+                    [primary, broader_query, topic_query, LAST_RESORT_QUERY]
+                )
+
+                asset, used_query = await self._acquire_slot_asset(
+                    query_chain, index, downloaded_by_id, used_ids_in_order
+                )
+                slot_assets.append(asset)
+                slot_queries.append(used_query)
+                if asset.success:
+                    used_ids_in_order.append(self._asset_key(asset))
 
             section_mappings.append(
                 SectionMediaMapping(
                     section_index=index,
                     section_heading=section.heading,
-                    search_query=asset.search_query,
-                    assets=[asset],
+                    search_queries=slot_queries,
+                    planned_duration_seconds=duration,
+                    assets=slot_assets,
                 )
             )
 
-        failed_count = sum(1 for m in section_mappings if not m.assets[0].success)
+        failed_sections = sum(
+            1 for mapping in section_mappings if not any(a.success for a in mapping.assets)
+        )
         error = None
-        if failed_count:
-            error = f"{failed_count} of {len(section_mappings)} section(s) could not get a media asset"
+        if failed_sections:
+            error = f"{failed_sections} of {len(section_mappings)} section(s) got no usable media asset"
 
         return VisualResult(
             topic=script.topic,
             provider=self.media_provider.name,
             sections=section_mappings,
-            success=(failed_count == 0),
+            success=(failed_sections == 0),
             error=error,
         )
+
+    # ---- duration-aware slot planning ---------------------------------------
+
+    @staticmethod
+    def calculate_slot_count(section_duration_seconds: float, total_video_duration_seconds: float) -> int:
+        """Calculate the minimum reasonable number of visual slots a section needs.
+
+        Duration-aware, not a fixed count: derived from the section's own
+        duration and the cadence tier that applies to the *total* video
+        duration (see CADENCE_POLICY). A section shorter than
+        ``MIN_SLOT_SECONDS`` always gets exactly one slot.
+
+        Args:
+            section_duration_seconds: This section's own planned duration
+            total_video_duration_seconds: The whole video's narration duration,
+                used to pick which cadence tier applies
+
+        Returns:
+            Number of visual slots (>= 1) to plan for this section
+        """
+        tier = VisualMediaService._select_cadence_tier(total_video_duration_seconds)
+        target_seconds_per_clip = (tier.min_seconds_per_clip + tier.max_seconds_per_clip) / 2
+
+        desired = max(1, round(section_duration_seconds / target_seconds_per_clip))
+        # Never slice a section into slots shorter than MIN_SLOT_SECONDS on
+        # average - that would over-fetch for no visible benefit.
+        max_by_floor = max(1, int(section_duration_seconds // MIN_SLOT_SECONDS))
+        return max(1, min(desired, max_by_floor))
+
+    @staticmethod
+    def _select_cadence_tier(total_video_duration_seconds: float) -> _CadenceTier:
+        for tier in CADENCE_POLICY:
+            if total_video_duration_seconds <= tier.max_total_seconds:
+                return tier
+        return CADENCE_POLICY[-1]
 
     # ---- query generation ---------------------------------------------------
 
     @staticmethod
-    def build_search_queries(section: ScriptSection, topic: str = "") -> List[str]:
-        """Derive an ordered chain of search-query candidates for a section.
+    def build_query_variants(section: ScriptSection, max_variants: int) -> List[str]:
+        """Generate up to ``max_variants`` distinct concept-query variants for a section.
 
-        Deterministic concept mapping + keyword extraction (no LLM call):
-        1. A specific query from the section's own heading + narration,
-           with scientific/abstract terms translated to concrete visual
-           concepts (e.g. "prefrontal cortex" -> "human brain neuroscience").
-        2. A broader version using just the heading, fewer terms.
-        3. A query derived from the script's overall topic.
-        4. A generic last-resort query.
-
-        Callers try each in order until one yields a usable asset.
+        Deterministic (no LLM call): the section's heading+narration are
+        concept-mapped and ranked the same way as the single-query builder,
+        then chunked into small groups of distinct concrete keywords - so
+        different visual slots within the same section search for
+        different (but still relevant) facets of its content instead of
+        all repeating the exact same query. Fully generic: works from
+        whatever concrete/visual vocabulary the section's own text (after
+        concept mapping) contains, for any topic.
 
         Args:
-            section: The ScriptSection to derive queries for
-            topic: The script's overall topic, used for the broader fallback
+            section: The ScriptSection to derive query variants for
+            max_variants: Maximum number of variants to generate (typically
+                the number of visual slots planned for this section)
 
         Returns:
-            Ordered, deduplicated, non-empty list of query strings
+            Ordered list of distinct query strings, length <= max_variants
+            (may be shorter if the section doesn't have enough distinct
+            concrete keywords)
         """
-        specific = VisualMediaService._build_concept_query(
-            f"{section.heading} {section.narration}", MAX_QUERY_TERMS
-        )
-        broader = VisualMediaService._build_concept_query(section.heading, BROAD_QUERY_TERMS)
-        topic_query = (
-            VisualMediaService._build_concept_query(topic, MAX_QUERY_TERMS) if topic else ""
-        )
+        if max_variants <= 0:
+            return []
 
-        queries: List[str] = []
-        for query in (specific, broader, topic_query, LAST_RESORT_QUERY):
-            if query and query not in queries:
-                queries.append(query)
-        return queries
+        combined = f"{section.heading} {section.narration}"
+        ranked = VisualMediaService._ranked_keywords(combined, max_candidates=40)
+
+        variants: List[str] = []
+        for start in range(0, len(ranked), VARIANT_QUERY_TERMS):
+            if len(variants) >= max_variants:
+                break
+            chunk = ranked[start : start + VARIANT_QUERY_TERMS]
+            if chunk:
+                variants.append(" ".join(chunk))
+        return variants
 
     @staticmethod
     def _build_concept_query(text: str, max_terms: int) -> str:
-        """Translate ``text`` into a short, concrete, visually-searchable query."""
+        """Translate ``text`` into a single short, concrete, visually-searchable query."""
+        ranked = VisualMediaService._ranked_keywords(text, max_candidates=20)
+        return " ".join(ranked[:max_terms]) if ranked else ""
+
+    @staticmethod
+    def _ranked_keywords(text: str, max_candidates: int) -> List[str]:
+        """Concept-map, extract, and rank keywords from ``text``.
+
+        Shared by both the single specific-query builder and the
+        multi-variant builder, so they always agree on what's concrete/
+        visual for the same input text.
+        """
         substituted = VisualMediaService._apply_concept_phrases(text.lower())
-        candidates = VisualMediaService._extract_keywords(substituted, max_candidates=20)
+        candidates = VisualMediaService._extract_keywords(substituted, max_candidates=max_candidates)
 
         mapped: List[str] = []
         seen: Set[str] = set()
@@ -274,15 +401,14 @@ class VisualMediaService:
                     mapped.append(token)
 
         if not mapped:
-            return ""
+            return []
 
-        # Concrete/visual words are prioritized when trimming to max_terms,
-        # so a late but concrete word (e.g. "night") isn't crowded out by
-        # earlier but non-visual ones (e.g. "hours").
+        # Concrete/visual words are prioritized, so a late but concrete
+        # word (e.g. "night") isn't crowded out by an earlier but non-
+        # visual one (e.g. "hours").
         boosted = [w for w in mapped if w in _CONCRETE_VISUAL_BOOST]
         rest = [w for w in mapped if w not in _CONCRETE_VISUAL_BOOST]
-        ordered = boosted + rest
-        return " ".join(ordered[:max_terms])
+        return boosted + rest
 
     @staticmethod
     def _apply_concept_phrases(lowered_text: str) -> str:
@@ -305,17 +431,46 @@ class VisualMediaService:
                 break
         return keywords
 
+    @staticmethod
+    def _ordered_unique(queries: List[str]) -> List[str]:
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for query in queries:
+            if query and query not in seen:
+                seen.add(query)
+                ordered.append(query)
+        return ordered
+
     # ---- asset selection/download -------------------------------------------
 
-    async def _find_and_download_asset(
-        self, queries: List[str], section_index: int, used_urls: Set[str]
-    ) -> MediaAsset:
-        provider_name = self.media_provider.name
-        last_query = queries[-1] if queries else ""
-        last_error = "No search queries available"
+    async def _acquire_slot_asset(
+        self,
+        query_chain: List[str],
+        section_index: int,
+        downloaded_by_id: Dict[str, MediaAsset],
+        used_ids_in_order: List[str],
+    ) -> Tuple[MediaAsset, str]:
+        """Fill one visual slot: search metadata for each query in the chain
+        (without downloading), then select and download only the one
+        candidate actually chosen.
 
-        for query in queries:
-            last_query = query
+        Selection priority:
+            1. A candidate never used anywhere in this video yet
+               (tried query-by-query, most specific first).
+            2. An already-downloaded asset not used in the last
+               RECENT_REUSE_LOOKBACK slots (no re-download - reuses the
+               existing local file).
+            3. Any already-downloaded asset, even the most recent one
+               (immediate repetition - absolute last resort).
+
+        Returns:
+            (asset, query_used_to_find_it)
+        """
+        recent_ids = set(used_ids_in_order[-RECENT_REUSE_LOOKBACK:])
+        last_error = "No search queries available"
+        searched_any = False
+
+        for query in query_chain:
             try:
                 candidates = await self.media_provider.search(
                     query, prefer_video=self.prefer_video, max_results=self.max_results_per_query
@@ -327,51 +482,106 @@ class VisualMediaService:
                 last_error = f"Unexpected media search error: {e}"
                 continue
 
+            searched_any = True
             candidate = next(
-                (
-                    c
-                    for c in candidates
-                    if c.source_url not in used_urls and c.download_url not in used_urls
-                ),
-                None,
+                (c for c in candidates if self._candidate_key(c) not in downloaded_by_id), None
             )
-            if candidate is None:
-                last_error = "No suitable (non-duplicate) media asset found"
-                continue
+            if candidate is not None:
+                return await self._download_new_asset(candidate, query, section_index, downloaded_by_id)
 
-            output_path = os.path.join(
-                self.output_dir, self._build_filename(section_index, candidate)
-            )
-            try:
-                await self.media_provider.download(candidate, output_path)
-            except MediaProviderError as e:
-                last_error = f"Media download failed: {e}"
-                continue
-            except Exception as e:
-                last_error = f"Unexpected download error: {e}"
-                continue
+        # No never-used candidate found anywhere in the chain - fall back to
+        # reusing an already-downloaded asset rather than failing the slot.
+        fallback_query = query_chain[-1] if query_chain else ""
 
-            return MediaAsset(
-                provider=provider_name,
-                asset_type=candidate.asset_type,
-                local_file_path=output_path,
-                source_url=candidate.source_url,
-                attribution=candidate.attribution,
-                search_query=query,
+        for asset_id, asset in downloaded_by_id.items():
+            if asset_id not in recent_ids:
+                return self._reuse_asset(asset, fallback_query, section_index), fallback_query
+
+        if downloaded_by_id:
+            any_asset = next(iter(downloaded_by_id.values()))
+            return self._reuse_asset(any_asset, fallback_query, section_index), fallback_query
+
+        if not searched_any:
+            last_error = last_error or "No search queries available"
+        else:
+            last_error = "No media asset available (search returned no usable candidates)"
+
+        return (
+            MediaAsset(
+                provider=self.media_provider.name,
+                search_query=fallback_query or "unknown",
                 section_index=section_index,
-                duration_seconds=candidate.duration_seconds,
-                width=candidate.width,
-                height=candidate.height,
-                success=True,
+                success=False,
+                error=last_error,
+            ),
+            fallback_query,
+        )
+
+    async def _download_new_asset(
+        self,
+        candidate: MediaCandidate,
+        query: str,
+        section_index: int,
+        downloaded_by_id: Dict[str, MediaAsset],
+    ) -> Tuple[MediaAsset, str]:
+        output_path = os.path.join(self.output_dir, self._build_filename(section_index, candidate))
+        try:
+            await self.media_provider.download(candidate, output_path)
+        except MediaProviderError as e:
+            return (
+                MediaAsset(
+                    provider=self.media_provider.name,
+                    search_query=query,
+                    section_index=section_index,
+                    success=False,
+                    error=f"Media download failed: {e}",
+                ),
+                query,
+            )
+        except Exception as e:
+            return (
+                MediaAsset(
+                    provider=self.media_provider.name,
+                    search_query=query,
+                    section_index=section_index,
+                    success=False,
+                    error=f"Unexpected download error: {e}",
+                ),
+                query,
             )
 
-        return MediaAsset(
-            provider=provider_name,
-            search_query=last_query,
+        asset = MediaAsset(
+            provider=self.media_provider.name,
+            asset_type=candidate.asset_type,
+            local_file_path=output_path,
+            source_url=candidate.source_url,
+            provider_asset_id=candidate.provider_asset_id,
+            attribution=candidate.attribution,
+            search_query=query,
             section_index=section_index,
-            success=False,
-            error=last_error,
+            duration_seconds=candidate.duration_seconds,
+            width=candidate.width,
+            height=candidate.height,
+            reused=False,
+            success=True,
         )
+        downloaded_by_id[self._candidate_key(candidate)] = asset
+        return asset, query
+
+    @staticmethod
+    def _reuse_asset(existing_asset: MediaAsset, query: str, section_index: int) -> MediaAsset:
+        """Reference an already-downloaded asset for another slot - no new download."""
+        return existing_asset.model_copy(
+            update={"search_query": query, "section_index": section_index, "reused": True}
+        )
+
+    @staticmethod
+    def _candidate_key(candidate: MediaCandidate) -> str:
+        return candidate.provider_asset_id or candidate.source_url or candidate.download_url
+
+    @staticmethod
+    def _asset_key(asset: MediaAsset) -> str:
+        return asset.provider_asset_id or asset.source_url or asset.local_file_path or ""
 
     @staticmethod
     def _build_filename(section_index: int, candidate: MediaCandidate) -> str:

@@ -143,8 +143,12 @@ def _print_final_summary(state: PipelineState) -> None:
         print("Voice success: False")
 
     if state.visual_result:
-        found = sum(1 for m in state.visual_result.sections if m.assets and m.assets[0].success)
-        print(f"Visual Media success: {state.visual_result.success} ({found}/{len(state.visual_result.sections)} sections)")
+        found = sum(1 for m in state.visual_result.sections if any(a.success for a in m.assets))
+        slot_count = sum(len(m.assets) for m in state.visual_result.sections)
+        print(
+            f"Visual Media success: {state.visual_result.success} "
+            f"({found}/{len(state.visual_result.sections)} sections, {slot_count} visual slots)"
+        )
     else:
         print("Visual Media success: False")
 

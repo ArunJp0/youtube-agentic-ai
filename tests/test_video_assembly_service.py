@@ -98,7 +98,7 @@ def _successful_visual_result(tmp_path, num_sections: int = 2) -> VisualResult:
             SectionMediaMapping(
                 section_index=i,
                 section_heading=f"Section {i + 1}",
-                search_query="q",
+                search_queries=["q"],
                 assets=[
                     MediaAsset(
                         provider="mock",
@@ -109,6 +109,38 @@ def _successful_visual_result(tmp_path, num_sections: int = 2) -> VisualResult:
                         success=True,
                     )
                 ],
+            )
+        )
+    return VisualResult(topic="Why do humans dream?", provider="mock", sections=sections, success=True)
+
+
+def _multi_asset_visual_result(tmp_path, slots_per_section: int = 3) -> VisualResult:
+    """A VisualResult where each section has multiple ordered assets,
+    simulating the new duration-aware multi-slot planning."""
+    sections = []
+    for i in range(2):
+        assets = []
+        for slot in range(slots_per_section):
+            media_path = str(tmp_path / f"section-{i + 1}-slot-{slot + 1}.mp4")
+            with open(media_path, "wb") as f:
+                f.write(b"FAKE MEDIA")
+            assets.append(
+                MediaAsset(
+                    provider="mock",
+                    asset_type="video",
+                    local_file_path=media_path,
+                    search_query=f"q{slot}",
+                    section_index=i,
+                    success=True,
+                )
+            )
+        sections.append(
+            SectionMediaMapping(
+                section_index=i,
+                section_heading=f"Section {i + 1}",
+                search_queries=[f"q{slot}" for slot in range(slots_per_section)],
+                planned_duration_seconds=15.0,
+                assets=assets,
             )
         )
     return VisualResult(topic="Why do humans dream?", provider="mock", sections=sections, success=True)
@@ -177,7 +209,7 @@ class TestVideoAssemblyServiceValidation:
                 SectionMediaMapping(
                     section_index=0,
                     section_heading="Section One",
-                    search_query="q",
+                    search_queries=["q"],
                     assets=[
                         MediaAsset(
                             provider="mock",
@@ -192,7 +224,7 @@ class TestVideoAssemblyServiceValidation:
                 SectionMediaMapping(
                     section_index=1,
                     section_heading="Section Two",
-                    search_query="q",
+                    search_queries=["q"],
                     assets=[
                         MediaAsset(
                             provider="mock",
@@ -211,7 +243,10 @@ class TestVideoAssemblyServiceValidation:
         result = await service.assemble_video(script, voice_result, visual_result)
 
         assert result.success is False
-        assert "not found" in result.error.lower()
+        # A section left with zero usable (on-disk) assets is reported as
+        # missing media, even if the underlying MediaAsset itself claimed
+        # success - a broken/deleted file is not a usable asset.
+        assert "missing media" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_missing_section_media_mapping_returns_clean_failure(self, tmp_path) -> None:
@@ -230,7 +265,7 @@ class TestVideoAssemblyServiceValidation:
                 SectionMediaMapping(
                     section_index=0,
                     section_heading="Section One",
-                    search_query="q",
+                    search_queries=["q"],
                     assets=[
                         MediaAsset(
                             provider="mock",
@@ -245,7 +280,7 @@ class TestVideoAssemblyServiceValidation:
                 SectionMediaMapping(
                     section_index=1,
                     section_heading="Section Two",
-                    search_query="q",
+                    search_queries=["q"],
                     assets=[MediaAsset(provider="mock", search_query="q", section_index=1, success=False, error="no asset")],
                 ),
             ],
@@ -268,38 +303,64 @@ class TestVideoAssemblyServiceValidation:
 
         assert result.success is False
 
+    @pytest.mark.asyncio
+    async def test_section_with_one_failed_slot_among_several_is_still_usable(self, tmp_path) -> None:
+        """A section with multiple planned slots, where only some
+        succeeded, must still be assembled using the successful ones -
+        not treated as missing media."""
+        script = _sample_script()
+        voice_result = _successful_voice_result(tmp_path)
+        media_path = str(tmp_path / "section-1-slot-1.mp4")
+        with open(media_path, "wb") as f:
+            f.write(b"FAKE MEDIA")
+        other_media_path = str(tmp_path / "section-2.mp4")
+        with open(other_media_path, "wb") as f:
+            f.write(b"FAKE MEDIA")
+        visual_result = VisualResult(
+            topic="Dreams",
+            provider="mock",
+            success=True,
+            sections=[
+                SectionMediaMapping(
+                    section_index=0,
+                    section_heading="Section One",
+                    search_queries=["q1", "q2"],
+                    assets=[
+                        MediaAsset(
+                            provider="mock",
+                            asset_type="video",
+                            local_file_path=media_path,
+                            search_query="q1",
+                            section_index=0,
+                            success=True,
+                        ),
+                        MediaAsset(
+                            provider="mock", search_query="q2", section_index=0, success=False, error="no asset"
+                        ),
+                    ],
+                ),
+                SectionMediaMapping(
+                    section_index=1,
+                    section_heading="Section Two",
+                    search_queries=["q"],
+                    assets=[
+                        MediaAsset(
+                            provider="mock",
+                            asset_type="video",
+                            local_file_path=other_media_path,
+                            search_query="q",
+                            section_index=1,
+                            success=True,
+                        )
+                    ],
+                ),
+            ],
+        )
+        service = VideoAssemblyService(assembler=FakeVideoAssembler(audio_duration=30.0), output_dir=str(tmp_path / "out"))
 
-class TestVideoAssemblyServiceTiming:
-    def test_durations_proportional_to_narration_length(self) -> None:
-        sections = [
-            ScriptSection(heading="A", narration="one two three four"),
-            ScriptSection(
-                heading="B", narration="one two three four five six seven eight ten eleven twelve"
-            ),
-        ]
-        durations = VideoAssemblyService.calculate_section_durations(sections, 40.0)
-        assert len(durations) == 2
-        assert durations[1] > durations[0]
-        assert sum(durations) == pytest.approx(40.0, abs=0.01)
+        result = await service.assemble_video(script, voice_result, visual_result)
 
-    def test_durations_sum_exactly_matches_total_despite_rounding(self) -> None:
-        sections = [ScriptSection(heading=f"S{i}", narration="word " * (i + 1)) for i in range(5)]
-        durations = VideoAssemblyService.calculate_section_durations(sections, 123.456)
-        assert sum(durations) == pytest.approx(123.456, abs=0.001)
-
-    def test_single_section_gets_full_duration(self) -> None:
-        sections = [ScriptSection(heading="Only", narration="Some narration text here.")]
-        durations = VideoAssemblyService.calculate_section_durations(sections, 50.0)
-        assert durations == pytest.approx([50.0])
-
-    def test_equal_length_sections_get_equal_durations(self) -> None:
-        sections = [
-            ScriptSection(heading="A", narration="one two three four"),
-            ScriptSection(heading="B", narration="five six seven eight"),
-        ]
-        durations = VideoAssemblyService.calculate_section_durations(sections, 20.0)
-        assert durations[0] == pytest.approx(10.0)
-        assert durations[1] == pytest.approx(10.0)
+        assert result.success is True
 
 
 class TestVideoAssemblyServiceAssembly:
@@ -424,3 +485,43 @@ class TestVideoAssemblyServiceAssembly:
         assert result.fps == 24
         assert assembler.build_calls[0]["width"] == 1280
         assert assembler.build_calls[0]["fps"] == 24
+
+    @pytest.mark.asyncio
+    async def test_multiple_assets_per_section_all_built_in_order(self, tmp_path) -> None:
+        script = _sample_script()
+        voice_result = _successful_voice_result(tmp_path)
+        visual_result = _multi_asset_visual_result(tmp_path, slots_per_section=3)
+        assembler = FakeVideoAssembler(audio_duration=30.0)
+        service = VideoAssemblyService(assembler=assembler, output_dir=str(tmp_path / "out"))
+
+        result = await service.assemble_video(script, voice_result, visual_result)
+
+        assert result.success is True
+        # 2 sections x 3 slots each = 6 clips total, built in section/slot order.
+        assert len(assembler.build_calls) == 6
+        assert assembler.build_calls[0]["input_path"].endswith("section-1-slot-1.mp4")
+        assert assembler.build_calls[1]["input_path"].endswith("section-1-slot-2.mp4")
+        assert assembler.build_calls[2]["input_path"].endswith("section-1-slot-3.mp4")
+        assert assembler.build_calls[3]["input_path"].endswith("section-2-slot-1.mp4")
+        clip_paths = assembler.concat_call["section_clip_paths"]
+        assert len(clip_paths) == 6
+        assert clip_paths == sorted(clip_paths)  # section-01-slot-01, ..., section-02-slot-03
+
+    @pytest.mark.asyncio
+    async def test_multiple_assets_per_section_split_duration_evenly(self, tmp_path) -> None:
+        """Each slot within a section gets an equal share of that
+        section's planned duration - deterministic, no overlap or gaps."""
+        script = _sample_script()
+        voice_result = _successful_voice_result(tmp_path)
+        visual_result = _multi_asset_visual_result(tmp_path, slots_per_section=3)
+        assembler = FakeVideoAssembler(audio_duration=30.0)
+        service = VideoAssemblyService(assembler=assembler, output_dir=str(tmp_path / "out"))
+
+        result = await service.assemble_video(script, voice_result, visual_result)
+
+        section_one_calls = assembler.build_calls[:3]
+        durations = [c["target_duration_seconds"] for c in section_one_calls]
+        assert all(d == pytest.approx(durations[0]) for d in durations)
+        # The 3 slot durations for a section must sum back to that
+        # section's own planned share of the total narration duration.
+        assert sum(durations) == pytest.approx(result.section_durations_seconds[0], abs=0.01)

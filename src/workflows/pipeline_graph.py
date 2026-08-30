@@ -157,7 +157,14 @@ def build_pipeline_graph(
         try:
             # The same ScriptResult produced by the script stage is passed
             # straight through - the script is never regenerated or rewritten.
-            result = await visual_service.generate_visuals(state.script_result)
+            # VoiceResult.duration_seconds (the real narration audio length)
+            # is the upstream timing input for visual planning; fall back to
+            # the script's own deterministic estimate only if a voice
+            # provider couldn't report a duration.
+            narration_duration = (
+                state.voice_result.duration_seconds or state.script_result.estimated_duration_seconds
+            )
+            result = await visual_service.generate_visuals(state.script_result, narration_duration)
         except VisualMediaServiceError as e:
             return {
                 "visual_result": None,

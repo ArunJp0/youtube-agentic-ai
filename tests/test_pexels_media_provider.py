@@ -83,6 +83,7 @@ class TestPexelsMediaProviderSearch:
         payload = _video_payload(
             [
                 {
+                    "id": 4567890,
                     "url": "https://www.pexels.com/video/123",
                     "duration": 10,
                     "user": {"name": "Jane Doe"},
@@ -104,8 +105,28 @@ class TestPexelsMediaProviderSearch:
         assert candidates[0].download_url == "https://cdn.pexels.com/vid_hd.mp4"  # hd preferred over sd
         assert candidates[0].attribution == "Jane Doe"
         assert candidates[0].duration_seconds == 10
+        assert candidates[0].provider_asset_id == "4567890"
         assert fake_client.last_params["orientation"] == "landscape"
         assert fake_client.last_headers["Authorization"] == "test-key"
+
+    @pytest.mark.asyncio
+    async def test_video_missing_id_leaves_provider_asset_id_none(self, monkeypatch) -> None:
+        payload = _video_payload(
+            [
+                {
+                    "url": "https://www.pexels.com/video/123",
+                    "video_files": [
+                        {"link": "https://cdn.pexels.com/vid.mp4", "file_type": "video/mp4", "quality": "hd"}
+                    ],
+                }
+            ]
+        )
+        fake_client = FakeAsyncClient(response=FakeResponse(payload))
+        monkeypatch.setattr(httpx, "AsyncClient", fake_client)
+
+        provider = PexelsMediaProvider(api_key="test-key")
+        candidates = await provider.search("ocean")
+        assert candidates[0].provider_asset_id is None
 
     @pytest.mark.asyncio
     async def test_falls_back_to_photos_when_no_videos(self, monkeypatch) -> None:

@@ -168,6 +168,34 @@ Stock media (`output/media/`) and generated narration audio (`output/audio/`) ar
 
 With five stages now chained, "completed" was moved from the Visual Media stage to the Video Assembly stage - a pipeline is only reported as completed once a real final MP4 exists. A Video Assembly failure is surfaced as a structured `VideoAssemblyResult` (success=False, error set) alongside the pipeline's overall `failed` status, with all earlier-stage results (`ResearchResult`/`ScriptResult`/`VoiceResult`/`VisualResult`) preserved rather than discarded.
 
-## Known limitation: fixed clip count per section can produce visible stock footage repetition
+## Visual slot count is duration-aware, not a fixed count per section/video
 
-The current `VisualMediaService`/`VideoAssemblyService` combination fetches a limited/fixed number of stock clips per script section regardless of that section's actual duration. For longer sections (or longer videos generally), this can mean the same short stock clip is looped or the same handful of clips recur, which is visibly repetitive even though each clip was semantically relevant when selected. This is treated as a known visual-quality limitation of the current MVP, not a pipeline defect - the pipeline still produces a complete, correctly-timed, playable video. The planned fix (duration-aware multi-clip planning) is the next milestone.
+`VisualMediaService.calculate_slot_count` derives how many distinct visual slots a section needs from that section's own share of the real narration duration (`VoiceResult.duration_seconds`, passed in as an upstream timing input - never re-estimated independently), not from a fixed number per section or per video. A small tiered cadence policy (`CADENCE_POLICY`, a centralized, non-scattered list of constants) sets the target seconds-per-clip based on total video length: ~6-10s/clip for videos up to 5 minutes, ~8-12s/clip for 5-10 minutes, ~10-15s/clip beyond 10 minutes - so longer videos hold each clip slightly longer rather than needing linearly more clips. This directly replaces the earlier fixed one-clip-per-section approach that caused visible repetition on longer sections.
+
+## A section may contain multiple ordered visual assets
+
+`SectionMediaMapping.assets` is a list, not a single asset: `VisualMediaService` fills each section's planned slots in order, and `VideoAssemblyService` builds and concatenates one clip per slot (each sized to an even share of that section's planned duration) instead of exactly one clip per section. No FFmpeg wrapper/interface changes were needed - `VideoAssembler.build_section_clip` already operated per-single-clip; only the calling orchestration in `VideoAssemblyService` changed to loop over multiple assets per section. A section counts as usable for assembly if at least one of its planned slots produced a usable, on-disk asset - not all of them - since occasional single-slot fallback failures shouldn't discard an otherwise-fine section.
+
+## Only the asset actually selected for a slot is downloaded
+
+`MediaProvider.search()` (metadata only) and `.download()` (explicit, one candidate at a time) were already separate before this milestone; duration-aware planning does not change that interface. `VisualMediaService` inspects search results in-memory to pick a candidate and calls `.download()` only for the one candidate chosen per slot - never for rejected candidates, and never for a slot filled by reusing an already-downloaded asset (see below). This keeps storage/bandwidth proportional to what a video actually needs, even though there are now more slots than before.
+
+## Global duplicate prevention with reuse only as a fallback, never the default
+
+`VisualMediaService` tracks every asset it has downloaded across the *entire* video (keyed by `provider_asset_id`, falling back to URL) and applies a strict selection priority per slot: (1) a never-used asset for the slot's own query, (2) a never-used asset for a broader/topic-level query, (3) an already-downloaded asset that wasn't used in the last couple of slots (`RECENT_REUSE_LOOKBACK`) - reusing its local file with no re-download, (4) only if nothing else qualifies, the most recently used asset regardless of recency (immediate repetition, last resort). `MediaAsset.reused` records which of these happened. The system does not try to guarantee zero repetition at all cost: for long videos where Pexels genuinely lacks enough unique matching stock footage, controlled reuse (and, as a last resort, looping) is an accepted, deliberate fallback rather than a failure condition.
+
+## Query-variant expansion stays deterministic and topic-generic
+
+When a section needs multiple slots, `VisualMediaService.build_query_variants` generates several distinct-but-relevant search queries from that section's own heading+narration by chunking the same ranked/concept-mapped keyword pool (shared with the single broader-query builder via `_ranked_keywords`) into small groups, rather than repeating one query for every slot. This is still a fixed deterministic algorithm - no LLM call per visual slot - and was verified to generalize across unrelated topic domains (electric vehicles, space, volcanoes, ancient trade routes), not just the dream-narration examples that originally motivated it.
+
+## Section timing logic is shared, not duplicated
+
+The proportional (narration-word-count-based) section-duration calculation is needed by both `VisualMediaService` (to size slot counts) and `VideoAssemblyService` (to size clips) - it was extracted into a single `src/services/section_timing.py` module that both import, replacing what had been a duplicated/near-duplicated calculation living on `VideoAssemblyService` alone.
+
+## VoiceService was intentionally left unchanged
+
+Duration-aware visual planning consumes `VoiceResult.duration_seconds` as a read-only upstream input; no changes were made to voice synthesis, narration extraction, or `VoiceService` itself. This kept the change scoped to the visual/media/assembly layers it was meant to improve.
+
+## Known limitation: visual semantic relevance is still bounded by deterministic query generation and stock availability
+
+Manual review of a real end-to-end run confirmed the repetition problem is substantially improved (clips now change throughout the video, no obvious looping), but some individual stock clips remain only loosely related to their section's narration. This is a content-quality limitation of deterministic (non-LLM) keyword/concept-mapped query generation combined with whatever Pexels actually has available for a given query - not a pipeline defect, since the pipeline still reliably produces a complete, correctly-timed, playable video. A future QC/visual-relevance-validation step (to reject weak matches and request alternatives) is a candidate future milestone but is not implemented yet.

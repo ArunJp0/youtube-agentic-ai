@@ -22,6 +22,7 @@ class MediaCandidate:
     asset_type: str  # "image" or "video"
     download_url: str
     source_url: str
+    provider_asset_id: Optional[str] = None
     attribution: Optional[str] = None
     width: Optional[int] = None
     height: Optional[int] = None
@@ -84,6 +85,7 @@ class MockMediaProvider(MediaProvider):
         self,
         results_per_query: int = 3,
         empty_for: Optional[set] = None,
+        pool_size: Optional[int] = None,
     ) -> None:
         """Initialize the mock provider.
 
@@ -91,9 +93,15 @@ class MockMediaProvider(MediaProvider):
             results_per_query: Number of fake candidates to return per search
             empty_for: Set of query strings that should return no results,
                 for testing empty/no-result fallback behavior
+            pool_size: If set, candidate IDs cycle through only this many
+                distinct assets regardless of query - simulates a limited
+                stock library, for testing reuse/fallback behavior. If
+                None (default), every query+index combination gets its own
+                unique ID (effectively unlimited distinct assets).
         """
         self.results_per_query = results_per_query
         self.empty_for = empty_for or set()
+        self.pool_size = pool_size
         self.calls: List[Tuple[str, Any]] = []
 
     @property
@@ -112,11 +120,13 @@ class MockMediaProvider(MediaProvider):
         slug = "-".join(query.lower().split())
         candidates = []
         for i in range(count):
+            asset_id = str(i % self.pool_size) if self.pool_size else f"{slug}-{i}"
             candidates.append(
                 MediaCandidate(
                     asset_type=asset_type,
-                    download_url=f"https://mock.media/files/{slug}-{i}.{'mp4' if asset_type == 'video' else 'jpg'}",
-                    source_url=f"https://mock.media/page/{slug}-{i}",
+                    download_url=f"https://mock.media/files/{asset_id}.{'mp4' if asset_type == 'video' else 'jpg'}",
+                    source_url=f"https://mock.media/page/{asset_id}",
+                    provider_asset_id=asset_id,
                     attribution="Mock Contributor",
                     width=1920,
                     height=1080,

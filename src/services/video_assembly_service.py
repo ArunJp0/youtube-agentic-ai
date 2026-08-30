@@ -1,11 +1,12 @@
 # Video Assembly Service: combines a VoiceResult's narration audio and a
-# VisualResult's section media into one final MP4.
+# VisualResult's ordered per-section media into one final MP4.
 #
 # This is a deterministic service, not an LLM-driven reasoning agent:
 # section timing is a fixed proportional calculation from narration word
-# counts, and section-to-media mapping is taken directly from the given
-# VisualResult. Only the actual video encoding/muxing is delegated to a
-# swappable VideoAssembler (FFmpeg by default).
+# counts (shared with VisualMediaService via section_timing), and each
+# section's already-planned assets are used in the exact order
+# VisualMediaService selected them. Only the actual video encoding/muxing
+# is delegated to a swappable VideoAssembler (FFmpeg by default).
 from __future__ import annotations
 
 import os
@@ -14,9 +15,10 @@ import uuid
 from typing import Dict, List, Optional
 
 from src.models.media import MediaAsset, VisualResult
-from src.models.script import ScriptResult, ScriptSection
+from src.models.script import ScriptResult
 from src.models.video import VideoAssemblyResult
 from src.models.voice import VoiceResult
+from src.services.section_timing import calculate_section_durations
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 
 DEFAULT_VIDEO_OUTPUT_DIR = os.path.join("output", "video")
@@ -39,11 +41,11 @@ class VideoAssemblyService:
     generated ScriptResult, VoiceResult, and VisualResult.
 
     Never regenerates the script, narration, or section media - it only
-    consumes what those three earlier stages already produced. Each
-    section's on-screen duration is calculated deterministically from that
-    section's narration word count as a proportion of the total narration
-    audio duration; the audio (not any per-section estimate) is the
-    authoritative timeline.
+    consumes what those three earlier stages already produced, including
+    VisualMediaService's own per-section slot planning: however many
+    assets a section has, they are used in that exact order, each scaled
+    to an equal share of that section's planned duration. The narration
+    audio (not any per-section estimate) is the authoritative timeline.
     """
 
     def __init__(
@@ -107,7 +109,7 @@ class VideoAssemblyService:
         if not script.sections:
             return self._failure("ScriptResult has no sections to assemble")
 
-        assets_by_section, error = self._map_assets_by_section(script.sections, visual_result)
+        section_assets, error = self._map_usable_assets_by_section(script, visual_result)
         if error:
             return self._failure(error)
 
@@ -118,30 +120,16 @@ class VideoAssemblyService:
         except Exception as e:
             return self._failure(f"Unexpected error probing narration audio: {e}")
 
-        section_durations = self.calculate_section_durations(script.sections, audio_duration)
+        section_durations = calculate_section_durations(script.sections, audio_duration)
 
         os.makedirs(self.output_dir, exist_ok=True)
         output_path = os.path.join(self.output_dir, self._build_filename(script))
 
         try:
             with tempfile.TemporaryDirectory(prefix="video_assembly_") as tmp_dir:
-                section_clip_paths = []
-                for index, duration in enumerate(section_durations):
-                    asset = assets_by_section[index]
-                    clip_path = os.path.join(tmp_dir, f"section-{index + 1:02d}.mp4")
-                    self.assembler.build_section_clip(
-                        input_path=asset.local_file_path,
-                        output_path=clip_path,
-                        target_duration_seconds=duration,
-                        width=self.width,
-                        height=self.height,
-                        fps=self.fps,
-                        is_video=(asset.asset_type == "video"),
-                    )
-                    section_clip_paths.append(clip_path)
-
+                clip_paths = self._build_all_clips(section_assets, section_durations, tmp_dir)
                 self.assembler.concatenate_and_mux_audio(
-                    section_clip_paths=section_clip_paths,
+                    section_clip_paths=clip_paths,
                     audio_path=voice_result.audio_file_path,
                     output_path=output_path,
                     tmp_dir=tmp_dir,
@@ -173,61 +161,77 @@ class VideoAssemblyService:
             section_durations_seconds=[round(d, 2) for d in section_durations],
         )
 
-    # ---- section timing -------------------------------------------------
+    # ---- clip building --------------------------------------------------
 
-    @staticmethod
-    def calculate_section_durations(
-        sections: List[ScriptSection], total_duration_seconds: float
-    ) -> List[float]:
-        """Deterministically split ``total_duration_seconds`` across sections.
-
-        Each section's share is proportional to its narration word count
-        relative to the combined word count of all sections (no LLM call).
-        The last section absorbs any rounding drift so the durations always
-        sum to exactly ``total_duration_seconds``.
-
-        Args:
-            sections: Script sections, in order
-            total_duration_seconds: The narration audio's total duration -
-                the authoritative timeline for the whole video
-
-        Returns:
-            One duration (seconds) per section, in the same order, summing
-            to exactly ``total_duration_seconds``
-        """
-        word_counts = [max(len(section.narration.split()), 1) for section in sections]
-        total_words = sum(word_counts)
-
-        durations = [total_duration_seconds * (count / total_words) for count in word_counts]
-
-        if durations:
-            drift = total_duration_seconds - sum(durations)
-            durations[-1] += drift
-
-        return durations
+    def _build_all_clips(
+        self,
+        section_assets: Dict[int, List[MediaAsset]],
+        section_durations: List[float],
+        tmp_dir: str,
+    ) -> List[str]:
+        """Build one normalized clip per visual slot, across all sections,
+        in playback order. Each section's assets split that section's
+        planned duration evenly among themselves."""
+        clip_paths: List[str] = []
+        for section_index, duration in enumerate(section_durations):
+            assets = section_assets[section_index]
+            slot_duration = duration / len(assets)
+            for slot_index, asset in enumerate(assets):
+                clip_path = os.path.join(
+                    tmp_dir, f"section-{section_index + 1:02d}-slot-{slot_index + 1:02d}.mp4"
+                )
+                self.assembler.build_section_clip(
+                    input_path=asset.local_file_path,
+                    output_path=clip_path,
+                    target_duration_seconds=slot_duration,
+                    width=self.width,
+                    height=self.height,
+                    fps=self.fps,
+                    is_video=(asset.asset_type == "video"),
+                )
+                clip_paths.append(clip_path)
+        return clip_paths
 
     # ---- helpers ----------------------------------------------------------
 
     @staticmethod
-    def _map_assets_by_section(
-        sections: List[ScriptSection], visual_result: VisualResult
-    ) -> tuple[Dict[int, MediaAsset], Optional[str]]:
-        """Build section_index -> successful MediaAsset, or an error message
-        describing what's missing/broken."""
-        assets_by_section: Dict[int, MediaAsset] = {}
-        for mapping in visual_result.sections:
-            if mapping.assets and mapping.assets[0].success:
-                assets_by_section[mapping.section_index] = mapping.assets[0]
+    def _map_usable_assets_by_section(
+        script: ScriptResult, visual_result: VisualResult
+    ) -> tuple[Dict[int, List[MediaAsset]], Optional[str]]:
+        """Build section_index -> ordered list of usable (successful, on-disk)
+        MediaAssets, or an error message describing what's missing/broken.
 
-        missing_indices = [i for i in range(len(sections)) if i not in assets_by_section]
+        A section is usable if it has at least one successful asset with a
+        file that actually exists on disk - VisualMediaService's own slot
+        planning may occasionally leave a section with fewer successful
+        assets than planned (see its fallback-reuse behavior), which is
+        fine as long as at least one usable asset remains.
+        """
+        assets_by_section: Dict[int, List[MediaAsset]] = {
+            mapping.section_index: mapping.assets for mapping in visual_result.sections
+        }
+
+        usable_by_section: Dict[int, List[MediaAsset]] = {}
+        missing_indices: List[int] = []
+        broken_paths: List[str] = []
+
+        for index in range(len(script.sections)):
+            assets = assets_by_section.get(index, [])
+            usable = [a for a in assets if a.success and a.local_file_path]
+            existing = [a for a in usable if os.path.exists(a.local_file_path)]
+            broken_paths.extend(a.local_file_path for a in usable if not os.path.exists(a.local_file_path))
+
+            if not existing:
+                missing_indices.append(index)
+            else:
+                usable_by_section[index] = existing
+
         if missing_indices:
             return {}, f"Missing media for section(s): {[i + 1 for i in missing_indices]}"
+        if broken_paths:
+            return {}, f"Media file(s) not found: {broken_paths}"
 
-        for index, asset in assets_by_section.items():
-            if not asset.local_file_path or not os.path.exists(asset.local_file_path):
-                return {}, f"Media file not found for section {index + 1}: {asset.local_file_path}"
-
-        return assets_by_section, None
+        return usable_by_section, None
 
     @staticmethod
     def _build_filename(script: ScriptResult) -> str:
