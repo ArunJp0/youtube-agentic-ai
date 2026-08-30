@@ -159,3 +159,15 @@ Video encoding/muxing is delegated to the local FFmpeg/ffprobe binaries via a th
 ## Downloaded/generated intermediate assets are temporary working files for now
 
 Stock media (`output/media/`) and generated narration audio (`output/audio/`) are treated as temporary working assets for the current MVP - they may be safely cleaned up once downstream processing (video assembly, eventual upload) has consumed them. Final assembled videos (`output/video/`) should be retained according to a future retention policy once one exists. No automated cleanup or retention enforcement is implemented yet; this is deferred to a later milestone rather than guessed at now.
+
+## Video Assembly Service is now the final pipeline stage, not just a standalone service
+
+`VideoAssemblyService` is called directly from a `video_assembly` node appended to the end of the Research → Script → Voice → Visual Media LangGraph pipeline, running after Visual Media succeeds. As with `VoiceService` and `VisualMediaService` joining the pipeline earlier, this doesn't change its nature: it remains a deterministic service invoked the same way whether called standalone (via the video demo) or from the graph, and it receives the exact `ScriptResult`/`VoiceResult`/`VisualResult` already produced earlier in the same run - nothing is regenerated, re-synthesized, or re-downloaded.
+
+## Pipeline status only becomes "completed" when video assembly itself succeeds
+
+With five stages now chained, "completed" was moved from the Visual Media stage to the Video Assembly stage - a pipeline is only reported as completed once a real final MP4 exists. A Video Assembly failure is surfaced as a structured `VideoAssemblyResult` (success=False, error set) alongside the pipeline's overall `failed` status, with all earlier-stage results (`ResearchResult`/`ScriptResult`/`VoiceResult`/`VisualResult`) preserved rather than discarded.
+
+## Known limitation: fixed clip count per section can produce visible stock footage repetition
+
+The current `VisualMediaService`/`VideoAssemblyService` combination fetches a limited/fixed number of stock clips per script section regardless of that section's actual duration. For longer sections (or longer videos generally), this can mean the same short stock clip is looped or the same handful of clips recur, which is visibly repetitive even though each clip was semantically relevant when selected. This is treated as a known visual-quality limitation of the current MVP, not a pipeline defect - the pipeline still produces a complete, correctly-timed, playable video. The planned fix (duration-aware multi-clip planning) is the next milestone.

@@ -92,7 +92,19 @@
 - Standalone video demo (`python -m src.video_demo`) validated end to end with real providers
 - 304/304 tests passing
 - Video Assembly Service (standalone) milestone marked complete
+- VideoAssemblyService integrated into the main LangGraph orchestration - it is now the final pipeline stage, not just a standalone service
+- Current working orchestration: Topic → Research Agent → Script Agent → Voice Service → Visual Media Service → Video Assembly Service → Final MP4
+- The complete pipeline can now produce a final MP4 from a topic string in one run
+- Real end-to-end orchestration validated in one run via `python -m src.pipeline_demo "Why do humans dream?"`: real Wikipedia research/search, real Gemini LLM, real Edge TTS, real Pexels media retrieval, real FFmpeg video assembly
+- Research, Script, Voice, Visual Media, and Video Assembly all completed successfully in that run; Script produced 5 distinct sections; Visual Media used section-specific Pexels assets
+- Final MP4 manually reviewed and considered acceptable: voice clear, visuals generally match narration, no black screens, narration complete, no abnormal cuts
+- Final output confirmed: H.264/AAC MP4, 1920x1080, 30 fps, ~163.8 seconds in the full-orchestration run
+- ffprobe validation succeeded
+- Output locations confirmed: `output/audio/`, `output/media/`, and `output/video/` are all generated runtime artifacts and remain Git-ignored
+- Known visual-quality limitation identified (not a pipeline failure): the current implementation uses a limited/fixed number of stock clips per script section, so longer videos may visibly repeat stock footage
+- 307/307 tests passing
+- Full Research → Script → Voice → Visual Media → Video Assembly orchestration milestone marked complete
 
 ## Current Next Milestone
 
-Integrate the completed VideoAssemblyService into the main orchestration, so the pipeline becomes: Topic → Research Agent → Script Agent → Voice Service → Visual Media Service → Video Assembly Service → Final MP4. Not yet started: subtitles, background music, QC, thumbnail, metadata generation, copyright checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets.
+Duration-aware multi-clip visual planning and assembly improvement. Planned: derive the number of distinct stock clips a section needs from its actual duration (no fixed clip count per section/video), fetch only the minimum number of relevant clips needed to cover that duration, avoid exact stock-video repetition across the final video where possible, avoid downloading unnecessary media just to hit a fixed count, and treat looping as a last-resort fallback rather than the default - while preserving storage efficiency and semantic relevance. Not yet implemented. Also still not started: subtitles, background music, QC, thumbnail, metadata generation, copyright checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets.

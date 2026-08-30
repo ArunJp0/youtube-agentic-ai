@@ -1,10 +1,11 @@
-# Full Research -> Script -> Voice -> Visual Media pipeline using LangGraph.
+# Full Research -> Script -> Voice -> Visual Media -> Video Assembly
+# pipeline using LangGraph.
 #
 # This module does not implement any research, scripting, voice-synthesis,
-# or visual-media logic itself - it only wires the existing ResearchAgent,
-# ScriptAgent, VoiceService, and VisualMediaService together into a single
-# LangGraph state machine, passing each stage's output directly into the
-# next stage's input.
+# visual-media, or video-encoding logic itself - it only wires the existing
+# ResearchAgent, ScriptAgent, VoiceService, VisualMediaService, and
+# VideoAssemblyService together into a single LangGraph state machine,
+# passing each stage's output directly into the next stage's input.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,27 +18,36 @@ from src.agents.script import ScriptAgent, ScriptAgentError
 from src.models.media import VisualResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
+from src.models.video import VideoAssemblyResult
 from src.models.voice import VoiceResult
+from src.services.video_assembly_service import (
+    DEFAULT_VIDEO_OUTPUT_DIR,
+    VideoAssemblyService,
+    VideoAssemblyServiceError,
+)
 from src.services.visual_media_service import (
     DEFAULT_MEDIA_OUTPUT_DIR,
     VisualMediaService,
     VisualMediaServiceError,
 )
 from src.services.voice_service import DEFAULT_OUTPUT_DIR, VoiceService, VoiceServiceError
+from src.tools.ffmpeg_video_assembler import VideoAssembler
 from src.tools.media_provider import MediaProvider
 from src.tools.voice_provider import VoiceProvider
 
 
 @dataclass
 class PipelineState:
-    """Shared state for the Research -> Script -> Voice -> Visual Media pipeline."""
+    """Shared state for the Research -> Script -> Voice -> Visual Media ->
+    Video Assembly pipeline."""
 
     topic: str = ""
     research_result: Optional[ResearchResult] = None
     script_result: Optional[ScriptResult] = None
     voice_result: Optional[VoiceResult] = None
     visual_result: Optional[VisualResult] = None
-    # pending -> researching -> researched -> scripted -> voiced -> completed -> failed
+    video_assembly_result: Optional[VideoAssemblyResult] = None
+    # pending -> researching -> researched -> scripted -> voiced -> visualized -> completed -> failed
     status: str = "pending"
     error: Optional[str] = None
 
@@ -48,23 +58,28 @@ def build_pipeline_graph(
     voice_provider: VoiceProvider,
     voice_name: str,
     media_provider: MediaProvider,
+    assembler: VideoAssembler,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
+    video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
 ) -> StateGraph:
-    """Build the LangGraph state machine chaining Research -> Script -> Voice -> Visual Media.
+    """Build the LangGraph state machine chaining Research -> Script -> Voice
+    -> Visual Media -> Video Assembly.
 
-    Reuses the existing ResearchAgent, ScriptAgent, VoiceService, and
-    VisualMediaService as-is (no duplicated business logic); this graph only
-    wires their existing async interfaces together and shares one
-    PipelineState across all four. VoiceService and VisualMediaService both
-    remain deterministic services here - each is invoked directly, not
-    treated as a reasoning agent. VisualMediaService receives the same
-    ScriptResult produced by the script stage, unmodified.
+    Reuses the existing ResearchAgent, ScriptAgent, VoiceService,
+    VisualMediaService, and VideoAssemblyService as-is (no duplicated
+    business logic, no reimplemented FFmpeg calls); this graph only wires
+    their existing async interfaces together and shares one PipelineState
+    across all five. VoiceService, VisualMediaService, and
+    VideoAssemblyService all remain deterministic services here - each is
+    invoked directly, not treated as a reasoning agent. VideoAssemblyService
+    receives the exact ScriptResult/VoiceResult/VisualResult already
+    produced earlier in this same run - nothing is regenerated or re-downloaded.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media → END
-                    │                  │               │
-                    └──────(error)─────┴──────(error)───┴──────(error)──→ END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ video_assembly → END
+                    │                  │               │              │
+                    └──────(error)─────┴──────(error)───┴───(error)────┴──────(error)──→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
@@ -72,8 +87,10 @@ def build_pipeline_graph(
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
+        assembler: VideoAssembler implementation for the Video Assembly Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
+        video_output_dir: Directory the Video Assembly Service writes the final MP4 into
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -84,6 +101,7 @@ def build_pipeline_graph(
         voice_provider=voice_provider, voice_name=voice_name, output_dir=voice_output_dir
     )
     visual_service = VisualMediaService(media_provider=media_provider, output_dir=media_output_dir)
+    video_service = VideoAssemblyService(assembler=assembler, output_dir=video_output_dir)
 
     async def research_node(state: PipelineState) -> dict:
         try:
@@ -163,7 +181,41 @@ def build_pipeline_graph(
                 "error": f"Visual media generation failed: {result.error}",
             }
 
-        return {"visual_result": result, "status": "completed", "error": None}
+        return {"visual_result": result, "status": "visualized", "error": None}
+
+    async def video_assembly_node(state: PipelineState) -> dict:
+        try:
+            # The exact ScriptResult/VoiceResult/VisualResult already
+            # produced earlier in this run are passed straight through -
+            # nothing is regenerated, re-synthesized, or re-downloaded.
+            result = await video_service.assemble_video(
+                state.script_result, state.voice_result, state.visual_result
+            )
+        except VideoAssemblyServiceError as e:
+            return {
+                "video_assembly_result": None,
+                "status": "failed",
+                "error": f"Video assembly failed: {e}",
+            }
+        except Exception as e:
+            return {
+                "video_assembly_result": None,
+                "status": "failed",
+                "error": f"Unexpected video assembly error: {e}",
+            }
+
+        if not result.success:
+            # VideoAssemblyService never raises for FFmpeg/processing
+            # failures - it reports them in VideoAssemblyResult.error
+            # instead. Surface that in pipeline state (and keep the
+            # VideoAssemblyResult itself for inspection).
+            return {
+                "video_assembly_result": result,
+                "status": "failed",
+                "error": f"Video assembly failed: {result.error}",
+            }
+
+        return {"video_assembly_result": result, "status": "completed", "error": None}
 
     def route_after_research(state: PipelineState) -> str:
         """Only proceed to scripting if research actually produced a result."""
@@ -177,17 +229,29 @@ def build_pipeline_graph(
         """Only proceed to visual media generation if voice actually succeeded."""
         return "media" if state.voice_result is not None and state.voice_result.success else END
 
+    def route_after_media(state: PipelineState) -> str:
+        """Only proceed to video assembly if visual media actually succeeded."""
+        return (
+            "video_assembly"
+            if state.visual_result is not None and state.visual_result.success
+            else END
+        )
+
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
     graph.add_node("voice", voice_node)
     graph.add_node("media", media_node)
+    graph.add_node("video_assembly", video_assembly_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
     graph.add_conditional_edges("script", route_after_script, {"voice": "voice", END: END})
     graph.add_conditional_edges("voice", route_after_voice, {"media": "media", END: END})
-    graph.set_finish_point("media")
+    graph.add_conditional_edges(
+        "media", route_after_media, {"video_assembly": "video_assembly", END: END}
+    )
+    graph.set_finish_point("video_assembly")
 
     return graph
 
@@ -199,30 +263,37 @@ async def run_pipeline(
     voice_provider: VoiceProvider,
     voice_name: str,
     media_provider: MediaProvider,
+    assembler: VideoAssembler,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
+    video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
 ) -> PipelineState:
-    """Run the full Research -> Script -> Voice -> Visual Media pipeline and
-    return the final state.
+    """Run the full Research -> Script -> Voice -> Visual Media -> Video
+    Assembly pipeline and return the final state.
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
     can inspect ``status``/``error`` directly, including on partial failure
-    (e.g. research, scripting, and voice succeeded but visual media failed).
+    (e.g. research, scripting, voice, and visual media all succeeded but
+    video assembly failed).
 
     Each stage only runs if the previous one succeeded - a failure at any
     stage short-circuits the rest of the pipeline and it never silently
-    continues (see route_after_research/route_after_script/route_after_voice).
+    continues (see route_after_research/route_after_script/route_after_voice/
+    route_after_media). Pipeline status only becomes "completed" once video
+    assembly itself succeeds and a real final MP4 exists.
 
     Args:
-        topic: Research topic to investigate, script, narrate, and illustrate
+        topic: Research topic to investigate, script, narrate, illustrate, and assemble
         search_provider: SearchProvider implementation for the Research Agent
         llm_provider: LLMProvider implementation shared by Research and Script agents
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
+        assembler: VideoAssembler implementation for the Video Assembly Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
+        video_output_dir: Directory the Video Assembly Service writes the final MP4 into
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -233,8 +304,10 @@ async def run_pipeline(
         voice_provider,
         voice_name,
         media_provider,
+        assembler,
         voice_output_dir,
         media_output_dir,
+        video_output_dir,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
@@ -246,6 +319,7 @@ async def run_pipeline(
         script_result=raw_result.get("script_result"),
         voice_result=raw_result.get("voice_result"),
         visual_result=raw_result.get("visual_result"),
+        video_assembly_result=raw_result.get("video_assembly_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )

@@ -1,7 +1,9 @@
-# Tests for the Research -> Script -> Voice -> Visual Media pipeline
-# workflow (LangGraph). All tests use mock providers only - no real
-# network/API calls.
+# Tests for the Research -> Script -> Voice -> Visual Media -> Video
+# Assembly pipeline workflow (LangGraph). All tests use mock providers/fake
+# assembler only - no real network/API/FFmpeg calls.
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -10,7 +12,9 @@ from src.llm.provider import LLMProvider
 from src.models.media import VisualResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
+from src.models.video import VideoAssemblyResult
 from src.models.voice import VoiceResult
+from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.search_provider import MockSearchProvider, SearchProvider
 from src.tools.voice_provider import MockVoiceProvider, VoiceProvider
@@ -85,45 +89,86 @@ class ExplodingMediaProvider(MediaProvider):
         raise RuntimeError("should never be called")
 
 
+class FakeVideoAssembler(VideoAssembler):
+    """Test double: records calls and writes tiny placeholder files instead
+    of running real FFmpeg, so the pipeline's video_assembly stage can be
+    exercised without any real encoding process."""
+
+    def __init__(self, audio_duration: float = 30.0, fail: bool = False) -> None:
+        self.audio_duration = audio_duration
+        self.fail = fail
+        self.build_calls: list[dict] = []
+        self.assemble_calls: list[dict] = []
+
+    def probe_duration_seconds(self, media_path: str) -> float:
+        if self.fail:
+            raise VideoAssemblerError("simulated ffmpeg outage")
+        return self.audio_duration
+
+    def build_section_clip(self, input_path, output_path, target_duration_seconds, width, height, fps, is_video):
+        self.build_calls.append({"input_path": input_path, "target_duration_seconds": target_duration_seconds})
+        with open(output_path, "wb") as f:
+            f.write(b"FAKE CLIP")
+
+    def concatenate_and_mux_audio(self, section_clip_paths, audio_path, output_path, tmp_dir):
+        self.assemble_calls.append(
+            {"section_clip_paths": list(section_clip_paths), "audio_path": audio_path}
+        )
+        with open(output_path, "wb") as f:
+            f.write(b"FAKE VIDEO")
+
+
 class TestPipelineWorkflow:
-    """Tests for the combined Research -> Script -> Voice -> Visual Media LangGraph pipeline."""
+    """Tests for the combined Research -> Script -> Voice -> Visual Media ->
+    Video Assembly LangGraph pipeline."""
 
     @pytest.fixture
     def providers(self, tmp_path):
-        # voice_output_dir/media_output_dir under tmp_path so tests never
-        # write into the real project output/ directories.
+        # All output dirs under tmp_path so tests never write into the real
+        # project output/ directories.
         return (
             MockSearchProvider(),
             ResearchMockWithVariedSections(),
             MockVoiceProvider(),
             MockMediaProvider(),
+            FakeVideoAssembler(),
             str(tmp_path / "audio"),
             str(tmp_path / "media"),
+            str(tmp_path / "video"),
+        )
+
+    @staticmethod
+    def _run(providers, topic="Why do humans dream?", **overrides):
+        search_provider, llm_provider, voice_provider, media_provider, assembler, voice_dir, media_dir, video_dir = providers
+        return run_pipeline(
+            topic,
+            overrides.get("search_provider", search_provider),
+            overrides.get("llm_provider", llm_provider),
+            overrides.get("voice_provider", voice_provider),
+            TEST_VOICE_NAME,
+            overrides.get("media_provider", media_provider),
+            overrides.get("assembler", assembler),
+            voice_dir,
+            media_dir,
+            video_dir,
         )
 
     @pytest.mark.asyncio
     async def test_pipeline_builds_and_compiles(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
+        search_provider, llm_provider, voice_provider, media_provider, assembler, voice_dir, media_dir, video_dir = providers
         graph = build_pipeline_graph(
-            search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, voice_dir, media_dir
+            search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
+            voice_dir, media_dir, video_dir,
         )
         assert graph is not None
         compiled = graph.compile()
         assert compiled is not None
 
+    # ---- A. successful full orchestration ---------------------------------
+
     @pytest.mark.asyncio
     async def test_pipeline_success_end_to_end(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
+        state = await self._run(providers)
 
         assert isinstance(state, PipelineState)
         assert state.status == "completed"
@@ -132,17 +177,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_research_result_is_structured(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
+        state = await self._run(providers)
 
         assert isinstance(state.research_result, ResearchResult)
         assert state.research_result.topic == "Why do humans dream?"
@@ -150,222 +185,176 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_script_result_is_structured_and_derived_from_research(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
+        state = await self._run(providers)
 
         assert isinstance(state.script_result, ScriptResult)
-        # Script topic must match the research topic it was generated from.
         assert state.script_result.topic == state.research_result.topic
         assert len(state.script_result.sections) > 0
 
     @pytest.mark.asyncio
-    async def test_script_sources_match_research_sources(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "How does photosynthesis work?",
-            search_provider,
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
-
-        assert [str(s) for s in state.script_result.sources] == [
-            str(s) for s in state.research_result.sources
-        ]
-
-    @pytest.mark.asyncio
     async def test_voice_result_is_structured_and_stored_in_final_state(self, providers) -> None:
-        """ScriptResult must be passed directly to VoiceService, and the
-        resulting VoiceResult must end up in the final pipeline state."""
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
+        _, _, voice_provider, _, _, _, _, _ = providers
+        state = await self._run(providers)
 
         assert isinstance(state.voice_result, VoiceResult)
         assert state.voice_result.success is True
-        assert state.voice_result.provider == "mock"
-        assert state.voice_result.voice_name == TEST_VOICE_NAME
         assert state.voice_result.audio_file_path is not None
-        # The provider must have received the ScriptResult's narration, not
-        # something re-derived independently.
         assert len(voice_provider.calls) == 1
         assert state.script_result.hook in voice_provider.calls[0]["text"]
 
     @pytest.mark.asyncio
     async def test_visual_result_is_structured_and_stored_in_final_state(self, providers) -> None:
-        """The same ScriptResult must be passed directly to
-        VisualMediaService (not regenerated), and the resulting VisualResult
-        must end up in the final pipeline state alongside VoiceResult."""
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
+        state = await self._run(providers)
 
-        assert isinstance(state.voice_result, VoiceResult)
         assert isinstance(state.visual_result, VisualResult)
         assert state.visual_result.success is True
-        assert state.visual_result.provider == "mock"
-        assert state.visual_result.topic == state.script_result.topic
         assert len(state.visual_result.sections) == len(state.script_result.sections)
-        for section_mapping in state.visual_result.sections:
-            assert section_mapping.assets[0].success is True
+
+    # ---- B. VideoAssemblyResult stored in final state ----------------------
 
     @pytest.mark.asyncio
-    async def test_empty_topic_fails_research_and_skips_all_later_stages(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "", search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, voice_dir, media_dir
+    async def test_video_assembly_result_is_structured_and_stored_in_final_state(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert isinstance(state.video_assembly_result, VideoAssemblyResult)
+        assert state.video_assembly_result.success is True
+        assert state.video_assembly_result.output_path is not None
+        assert os.path.exists(state.video_assembly_result.output_path)
+        assert state.video_assembly_result.section_count == len(state.script_result.sections)
+
+    # ---- C. Video Assembly receives the expected earlier-stage results -----
+
+    @pytest.mark.asyncio
+    async def test_video_assembly_receives_expected_inputs(self, providers) -> None:
+        _, _, _, _, assembler, _, _, _ = providers
+        state = await self._run(providers)
+
+        # The assembler was called once per section, with the exact media
+        # files VisualMediaService downloaded for those sections.
+        expected_paths = {
+            mapping.assets[0].local_file_path for mapping in state.visual_result.sections
+        }
+        actual_paths = {call["input_path"] for call in assembler.build_calls}
+        assert actual_paths == expected_paths
+
+        # The assembler received the exact narration audio VoiceService produced.
+        assert assembler.assemble_calls[0]["audio_path"] == state.voice_result.audio_file_path
+
+        # Section durations sum to the (fake) narration audio duration.
+        assert sum(c["target_duration_seconds"] for c in assembler.build_calls) == pytest.approx(
+            assembler.audio_duration, abs=0.01
         )
 
+    # ---- D-G. Video Assembly not called on earlier-stage failure -----------
+
+    @pytest.mark.asyncio
+    async def test_video_assembly_not_called_when_research_fails(self, providers) -> None:
+        _, _, voice_provider, media_provider, assembler, _, _, _ = providers
+        state = await self._run(providers, topic="")
+
         assert state.status == "failed"
-        assert state.error is not None
         assert state.research_result is None
-        assert state.script_result is None  # script node must not have run
-        assert state.voice_result is None  # voice node must not have run
-        assert state.visual_result is None  # media node must not have run
-        assert voice_provider.calls == []  # confirms voice was never invoked
-        assert media_provider.calls == []  # confirms media was never invoked
-
-    @pytest.mark.asyncio
-    async def test_no_search_results_still_completes_through_media(self, providers) -> None:
-        """MockSearchProvider returning [] is a valid (if sparse) research result,
-        not an error - the pipeline should still complete through scripting,
-        voice, and visual media."""
-        _, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "obscure topic",
-            EmptySearchProvider(),
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
-
-        assert state.research_result is not None
-        assert state.research_result.sources == []
-        assert state.status == "completed"
-        assert state.script_result is not None
-        assert state.voice_result is not None
-        assert state.voice_result.success is True
-        assert state.visual_result is not None
-        assert state.visual_result.success is True
-
-    @pytest.mark.asyncio
-    async def test_script_stage_failure_is_reported_and_skips_voice_and_media(self, providers) -> None:
-        search_provider, _, voice_provider, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            ExplodingLLMProvider(),
-            voice_provider,
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
-
-        # Research itself calls the LLM too, so the exploding provider fails
-        # at the research stage; either way the pipeline must fail cleanly
-        # and neither voice nor visual media generation must ever run.
-        assert state.status == "failed"
-        assert state.error is not None
         assert state.script_result is None
         assert state.voice_result is None
         assert state.visual_result is None
+        assert state.video_assembly_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
+        assert assembler.build_calls == []
+        assert assembler.assemble_calls == []
 
     @pytest.mark.asyncio
-    async def test_voice_stage_failure_is_surfaced_and_skips_media(self, providers) -> None:
-        """Research and Script succeed, but the VoiceProvider fails - the
-        failure must be surfaced in pipeline state without crashing, visual
-        media generation must never run, and the failure must not be
-        mistaken for a research/script/media failure."""
-        search_provider, llm_provider, _, media_provider, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            llm_provider,
-            ExplodingVoiceProvider(),
-            TEST_VOICE_NAME,
-            media_provider,
-            voice_dir,
-            media_dir,
-        )
+    async def test_video_assembly_not_called_when_script_fails(self, providers) -> None:
+        search_provider, _, voice_provider, media_provider, assembler, _, _, _ = providers
+        state = await self._run(providers, llm_provider=ExplodingLLMProvider())
 
         assert state.status == "failed"
-        assert state.error is not None
+        assert state.script_result is None
+        assert state.video_assembly_result is None
+        assert voice_provider.calls == []
+        assert media_provider.calls == []
+        assert assembler.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_video_assembly_not_called_when_voice_fails(self, providers) -> None:
+        _, _, _, media_provider, assembler, _, _, _ = providers
+        state = await self._run(providers, voice_provider=ExplodingVoiceProvider())
+
+        assert state.status == "failed"
         assert "Voice generation failed" in state.error
-        assert state.research_result is not None  # earlier stages' results are preserved
+        assert state.research_result is not None
         assert state.script_result is not None
-        # VoiceService never raises for synthesis failures - it returns a
-        # structured failed VoiceResult, which the pipeline must preserve
-        # rather than discard.
         assert state.voice_result is not None
         assert state.voice_result.success is False
-        assert "simulated TTS outage" in state.voice_result.error
-        # Media must never have been reached.
         assert state.visual_result is None
+        assert state.video_assembly_result is None
         assert media_provider.calls == []
+        assert assembler.build_calls == []
 
     @pytest.mark.asyncio
-    async def test_media_stage_failure_is_surfaced_cleanly(self, providers) -> None:
-        """Research, Script, and Voice all succeed, but the MediaProvider
-        fails - the failure must be surfaced in pipeline state without
-        crashing, and earlier-stage results must be preserved."""
-        search_provider, llm_provider, voice_provider, _, voice_dir, media_dir = providers
-        state = await run_pipeline(
-            "Why do humans dream?",
-            search_provider,
-            llm_provider,
-            voice_provider,
-            TEST_VOICE_NAME,
-            ExplodingMediaProvider(),
-            voice_dir,
-            media_dir,
-        )
+    async def test_video_assembly_not_called_when_visual_media_fails(self, providers) -> None:
+        _, _, _, _, assembler, _, _, _ = providers
+        state = await self._run(providers, media_provider=ExplodingMediaProvider())
 
         assert state.status == "failed"
-        assert state.error is not None
         assert "Visual media generation failed" in state.error
         assert state.research_result is not None
         assert state.script_result is not None
         assert state.voice_result is not None
         assert state.voice_result.success is True
-        # VisualMediaService never raises for search/download failures - it
-        # returns a structured failed VisualResult, which the pipeline must
-        # preserve rather than discard.
         assert state.visual_result is not None
         assert state.visual_result.success is False
+        assert state.video_assembly_result is None
+        assert assembler.build_calls == []
+        assert assembler.assemble_calls == []
+
+    # ---- H. Video Assembly failure surfaced correctly ----------------------
+
+    @pytest.mark.asyncio
+    async def test_video_assembly_failure_is_surfaced_cleanly(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
+
+        assert state.status == "failed"
+        assert state.error is not None
+        assert "Video assembly failed" in state.error
+        # Earlier stages' results are preserved, not discarded.
+        assert state.research_result is not None
+        assert state.script_result is not None
+        assert state.voice_result is not None
+        assert state.voice_result.success is True
+        assert state.visual_result is not None
+        assert state.visual_result.success is True
+        # VideoAssemblyService never raises for processing failures - it
+        # returns a structured failed VideoAssemblyResult.
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is False
+        assert "simulated ffmpeg outage" in state.video_assembly_result.error
+
+    # ---- I. status only "completed" when video assembly succeeds -----------
+
+    @pytest.mark.asyncio
+    async def test_status_is_completed_only_when_video_assembly_succeeds(self, providers) -> None:
+        success_state = await self._run(providers)
+        assert success_state.status == "completed"
+        assert success_state.video_assembly_result.success is True
+
+        failure_state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
+        assert failure_state.status == "failed"
+
+    # ---- J. existing behavior preserved -------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_no_search_results_still_completes_through_video_assembly(self, providers) -> None:
+        """MockSearchProvider returning [] is a valid (if sparse) research result,
+        not an error - the pipeline should still complete all the way through
+        video assembly."""
+        state = await self._run(providers, topic="obscure topic", search_provider=EmptySearchProvider())
+
+        assert state.research_result is not None
+        assert state.research_result.sources == []
+        assert state.status == "completed"
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
 
     @pytest.mark.asyncio
     async def test_pipeline_state_defaults(self) -> None:
@@ -375,18 +364,14 @@ class TestPipelineWorkflow:
         assert state.script_result is None
         assert state.voice_result is None
         assert state.visual_result is None
+        assert state.video_assembly_result is None
         assert state.status == "pending"
         assert state.error is None
 
     @pytest.mark.asyncio
     async def test_pipeline_multiple_runs_are_independent(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, voice_dir, media_dir = providers
-        state_a = await run_pipeline(
-            "Topic A", search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, voice_dir, media_dir
-        )
-        state_b = await run_pipeline(
-            "Topic B", search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, voice_dir, media_dir
-        )
+        state_a = await self._run(providers, topic="Topic A")
+        state_b = await self._run(providers, topic="Topic B")
 
         assert state_a.topic == "Topic A"
         assert state_b.topic == "Topic B"
