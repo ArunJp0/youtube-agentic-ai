@@ -143,3 +143,19 @@ The pipeline's conditional routing now covers four stages: Research â†’ Script â
 ## Full four-stage pipeline validated end-to-end with all real providers together
 
 `python -m src.pipeline_demo "Why do humans dream?"` was run with every stage on its real provider simultaneously (Wikipedia search, Gemini LLM, Edge TTS, Pexels media) rather than each service only being validated in isolation. This confirmed the real providers compose correctly through the shared `PipelineState` - not just that each one works alone.
+
+## Video assembly is a deterministic service, not an LLM agent
+
+Combining a `VoiceResult`'s narration audio with a `VisualResult`'s section media into a final MP4 requires no reasoning or judgment - per-section timing is a fixed proportional calculation from narration word counts, and section-to-media mapping is taken directly from the given `VisualResult`. `VideoAssemblyService` is implemented as a plain deterministic service (mirroring `VoiceService`/`VisualMediaService`), consistent with "don't build an autonomous agent unless there's a clear need."
+
+## FFmpeg as the video assembly backend, wrapped behind a VideoAssembler interface
+
+Video encoding/muxing is delegated to the local FFmpeg/ffprobe binaries via a thin `VideoAssembler` interface (`src/tools/ffmpeg_video_assembler.py`), so `VideoAssemblyService` never shells out to FFmpeg directly and can be tested against a fake assembler. Unlike the LLM/search/voice/media providers, there's no "mock FFmpeg" shipped for real use - FFmpeg is a fixed local tool, not a swappable remote vendor - so the abstraction exists purely for testability, and availability is checked eagerly (constructing `FFmpegVideoAssembler` fails immediately, with a clear Windows install command, if `ffmpeg`/`ffprobe` aren't on PATH).
+
+## Section video duration is proportional to narration word count, not an LLM estimate
+
+`VideoAssemblyService.calculate_section_durations` allocates the narration audio's total duration across sections by each section's share of the combined narration word count (e.g. a section with 20% of the words gets ~20% of the timeline), with the last section absorbing rounding drift so durations always sum exactly to the audio duration. The audio file is the authoritative timeline, per the "voice controls total video duration" requirement - video length is never independently estimated.
+
+## Downloaded/generated intermediate assets are temporary working files for now
+
+Stock media (`output/media/`) and generated narration audio (`output/audio/`) are treated as temporary working assets for the current MVP - they may be safely cleaned up once downstream processing (video assembly, eventual upload) has consumed them. Final assembled videos (`output/video/`) should be retained according to a future retention policy once one exists. No automated cleanup or retention enforcement is implemented yet; this is deferred to a later milestone rather than guessed at now.

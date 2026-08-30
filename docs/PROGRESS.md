@@ -83,7 +83,16 @@
 - Output locations confirmed: `output/audio/` (narration MP3) and `output/media/` (section videos/images), both Git-ignored
 - 263/263 tests passing
 - Research → Script → Voice → Visual Media pipeline milestone marked complete
+- Video Assembly Service implemented as a standalone deterministic service (not an LLM agent, not yet wired into the main pipeline)
+- FFmpeg-backed assembly: real Edge TTS narration and real Pexels section media combined into a final MP4
+- Deterministic (non-LLM) section timing: proportional to each section's narration word count, audio track as the authoritative timeline
+- Final MP4 manually reviewed and found acceptable: voice is clear, all 5 visual sections appear correctly, no black screens, narration complete, no abnormal/sudden cuts (some stock footage repetition judged acceptable for current MVP)
+- Final output format confirmed: MP4 container, H.264 video, AAC audio, 1920x1080, 30 fps, ~81.5 seconds
+- ffprobe validation confirmed video/audio duration alignment
+- Standalone video demo (`python -m src.video_demo`) validated end to end with real providers
+- 304/304 tests passing
+- Video Assembly Service (standalone) milestone marked complete
 
 ## Current Next Milestone
 
-Video Assembly Service - will combine the generated narration audio (VoiceResult) and downloaded section media (VisualResult) into a final MP4. Not yet started: video assembly itself, subtitles, thumbnail, metadata generation, QC, copyright checking, and YouTube upload.
+Integrate the completed VideoAssemblyService into the main orchestration, so the pipeline becomes: Topic → Research Agent → Script Agent → Voice Service → Visual Media Service → Video Assembly Service → Final MP4. Not yet started: subtitles, background music, QC, thumbnail, metadata generation, copyright checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets.

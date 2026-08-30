@@ -54,7 +54,11 @@ Topic Input → Research Agent → Script Agent → Voice Service → Visual Med
 
 All four stages run together as one LangGraph pipeline (`python -m src.pipeline_demo "<topic>"`); a failure at any stage stops the pipeline before the next one runs. `output/audio/` and `output/media/` are Git-ignored - generated media is build output, not source.
 
-Video assembly (combining the narration audio and section media into a final MP4), subtitles, thumbnail, metadata generation, QC, copyright checking, and YouTube upload are not implemented yet.
+- **Video Assembly Service**: combines a `VoiceResult`'s narration audio with a `VisualResult`'s section media into a final MP4 (FFmpeg: H.264 video, AAC audio, 1920x1080, 30 fps), saved under `output/video/`. Implemented and validated standalone (`python -m src.video_demo`); **not yet wired into the main pipeline** - it must be run separately for now.
+
+Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
+
+Integrating Video Assembly into the main pipeline, subtitles, thumbnail, metadata generation, QC, copyright checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet.
 
 ## Project Structure
 
