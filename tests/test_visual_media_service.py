@@ -523,6 +523,129 @@ class TestGenerateVisualsFailureHandling:
         assert any(a.success for a in result.sections[0].assets)
 
 
+class TestBuildPlanAndPreBuiltPlanReuse:
+    """build_plan() is public so a caller (e.g. Visual QC) can build the
+    plan once and hand it to generate_visuals(), avoiding a second,
+    redundant LLM planning call."""
+
+    @pytest.mark.asyncio
+    async def test_build_plan_matches_internally_built_plan_shape(self, tmp_path) -> None:
+        script = _sample_script(sections=[_section("A", "Some narration text here.")])
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+
+        plan = service.build_plan(script)
+
+        assert plan.used_semantic_planning is False
+        assert len(plan.sections) == 1
+
+    @pytest.mark.asyncio
+    async def test_passing_prebuilt_plan_skips_second_planner_call(self, tmp_path) -> None:
+        script = _sample_script(sections=[_section("A", "Some narration text here.")])
+        plan = _plan_for(SectionVisualPlan(section_index=0, search_queries=["q"]))
+        planner = FakeVisualPlanner(plan)
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(media_provider=provider, visual_planner=planner, output_dir=str(tmp_path))
+
+        await service.generate_visuals(script, 20.0, visual_plan=plan)
+
+        assert planner.calls == 0  # the pre-built plan was used, not re-derived
+
+    @pytest.mark.asyncio
+    async def test_no_plan_passed_still_builds_one_internally(self, tmp_path) -> None:
+        script = _sample_script(sections=[_section("A", "Some narration text here.")])
+        plan = _plan_for(SectionVisualPlan(section_index=0, search_queries=["q"]))
+        planner = FakeVisualPlanner(plan)
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(media_provider=provider, visual_planner=planner, output_dir=str(tmp_path))
+
+        await service.generate_visuals(script, 20.0)
+
+        assert planner.calls == 1
+
+
+class TestAcquireReplacementAsset:
+    """Public entry point Visual QC uses for bounded replacement - reuses
+    the exact same selection/reuse-fallback rules as normal slot filling,
+    plus never selects/reuses an excluded id."""
+
+    @pytest.mark.asyncio
+    async def test_excluded_id_is_never_selected(self, tmp_path) -> None:
+        section = _section(
+            "How Electric Motors Work",
+            "Electric vehicles use battery packs and electric motors to generate torque today.",
+        )
+        script = _sample_script(sections=[section])
+        provider = MockMediaProvider(results_per_query=5, pool_size=3)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        plan = service.build_plan(script)
+        section_plan = plan.sections[0]
+
+        downloaded_by_id: dict = {}
+        used_ids_in_order: list = []
+        first_asset, _ = await service.acquire_replacement_asset(
+            section_plan, 0, 0, downloaded_by_id, used_ids_in_order, set()
+        )
+        excluded = {first_asset.provider_asset_id}
+
+        second_asset, _ = await service.acquire_replacement_asset(
+            section_plan, 0, 0, downloaded_by_id, used_ids_in_order, excluded
+        )
+
+        assert second_asset.provider_asset_id != first_asset.provider_asset_id
+
+    @pytest.mark.asyncio
+    async def test_mutates_shared_state_for_global_dedup(self, tmp_path) -> None:
+        section = _section(
+            "How Electric Motors Work",
+            "Electric vehicles use battery packs and electric motors to generate torque today.",
+        )
+        script = _sample_script(sections=[section])
+        provider = MockMediaProvider(results_per_query=5, pool_size=5)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        plan = service.build_plan(script)
+        section_plan = plan.sections[0]
+
+        downloaded_by_id: dict = {}
+        used_ids_in_order: list = []
+        asset, _ = await service.acquire_replacement_asset(
+            section_plan, 0, 0, downloaded_by_id, used_ids_in_order, set()
+        )
+
+        # acquire_replacement_asset mutates downloaded_by_id itself (like
+        # normal slot filling); used_ids_in_order tracking is the caller's
+        # responsibility (VisualQCService appends it after evaluating the
+        # replacement), the same division of labor generate_visuals uses.
+        assert asset.provider_asset_id in downloaded_by_id
+        assert downloaded_by_id[asset.provider_asset_id].provider_asset_id == asset.provider_asset_id
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_excluded_reuse_only_when_nothing_else_available(self, tmp_path) -> None:
+        section = _section(
+            "How Electric Motors Work",
+            "Electric vehicles use battery packs and electric motors to generate torque today.",
+        )
+        script = _sample_script(sections=[section])
+        provider = MockMediaProvider(results_per_query=3, pool_size=1)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        plan = service.build_plan(script)
+        section_plan = plan.sections[0]
+
+        downloaded_by_id: dict = {}
+        used_ids_in_order: list = []
+        first_asset, _ = await service.acquire_replacement_asset(
+            section_plan, 0, 0, downloaded_by_id, used_ids_in_order, set()
+        )
+        # Only one distinct asset ever exists (pool_size=1) - excluding it
+        # leaves nothing else, so it must still be returned as a last resort.
+        result_asset, _ = await service.acquire_replacement_asset(
+            section_plan, 0, 0, downloaded_by_id, used_ids_in_order, {first_asset.provider_asset_id}
+        )
+
+        assert result_asset.provider_asset_id == first_asset.provider_asset_id
+        assert result_asset.reused is True
+
+
 class TestGenerateVisualsWithSemanticPlanner:
     """Semantic-planner integration: VisualMediaService uses the plan's
     search_queries/avoid_concepts/neutral_fallback_queries and applies the

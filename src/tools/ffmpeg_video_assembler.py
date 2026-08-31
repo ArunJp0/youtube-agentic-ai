@@ -75,6 +75,32 @@ class VideoAssembler(ABC):
         (H.264 video / AAC audio) to ``output_path``."""
         raise NotImplementedError
 
+    @abstractmethod
+    def extract_frames(
+        self,
+        input_path: str,
+        timestamps_seconds: List[float],
+        output_dir: str,
+        basename: str,
+    ) -> List[str]:
+        """Extract one representative JPEG frame per timestamp from a video.
+
+        For Visual QC's frame sampling - never every frame, just the given
+        timestamps (see src/services/frame_sampling.py for how those are
+        chosen).
+
+        Args:
+            input_path: Source video file
+            timestamps_seconds: Timestamps to extract, in seconds
+            output_dir: Directory to write the extracted frame files into
+            basename: Filename prefix for the extracted frames
+
+        Returns:
+            Extracted frame file paths, in the same order as
+            ``timestamps_seconds``
+        """
+        raise NotImplementedError
+
 
 def _require_binary(name: str) -> str:
     path = shutil.which(name)
@@ -202,6 +228,29 @@ class FFmpegVideoAssembler(VideoAssembler):
                 output_path,
             ]
         )
+
+    def extract_frames(
+        self,
+        input_path: str,
+        timestamps_seconds: List[float],
+        output_dir: str,
+        basename: str,
+    ) -> List[str]:
+        os.makedirs(output_dir, exist_ok=True)
+        frame_paths = []
+        for index, timestamp in enumerate(timestamps_seconds):
+            output_path = os.path.join(output_dir, f"{basename}-{index + 1:02d}.jpg")
+            command = [
+                self.ffmpeg_path, "-y",
+                "-ss", f"{max(timestamp, 0.0):.3f}",
+                "-i", input_path,
+                "-frames:v", "1",
+                "-q:v", "2",
+                output_path,
+            ]
+            self._run(command)
+            frame_paths.append(output_path)
+        return frame_paths
 
     def _run(self, command: List[str]) -> subprocess.CompletedProcess:
         try:

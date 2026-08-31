@@ -127,13 +127,35 @@
 - Real end-to-end pipeline validated in one run via `python -m src.pipeline_demo "Why do humans dream?"`: real Gemini semantic visual planning succeeded (no fallback triggered) for all 5 script sections, producing 21 total visual slots and 21 unique real Pexels assets with 0 reuse; final MP4 assembled successfully
 - Manual review confirmed the previously-reported real failure is fixed: the narration phrase "philosophical discourse features much debate regarding constructs within which humans exist" produced avoid concepts including "building construction sites" and "physical Lego blocks or scaffolding", and no construction-site footage was selected for that section
 - Context-Aware Visual Planning and Semantic Media Filtering milestone marked **COMPLETE**
+- Standalone Visual QC capability implemented: `VisualQCService` inspects actual representative frames from already-selected/downloaded media (not just search metadata) and judges whether each asset fits its script section's meaning, the overall topic, and the `VisualContextPlanner`'s semantic summary/avoid concepts
+- Deterministic frame sampling (`src/services/frame_sampling.py`) picks 1-3 representative timestamps per clip based only on its own duration (never every frame): a 50% midpoint for short clips, 25%/75% for medium ones, 25%/50%/75% for longer ones
+- A new `VisualRelevanceEvaluator` abstraction (`src/tools/visual_relevance_evaluator.py`) keeps Visual QC provider-agnostic, with a `MockVisualRelevanceEvaluator` for tests and a real `GeminiVisualRelevanceEvaluator` that reuses Gemini's existing `generateContent` endpoint with image parts added - no new/unsupported API surface, and `LLMProvider`/`GeminiLLMProvider` (used by Research/Script) were left untouched
+- One vision request per script section, batching every asset selected for that section's slots - never one call per frame or per slot - keeping vision-model usage cheap regardless of section size
+- Centralized relevance thresholds (`APPROVE_SCORE_THRESHOLD=0.70`, `NEUTRAL_SCORE_THRESHOLD=0.50`) turn each raw vision verdict into a decision: approved, neutral/acceptable, weak (replacement recommended), or rejected (misleading, overrides score) - a neutral relevant clip is treated as acceptable, not penalized for being non-literal
+- Bounded replacement implemented: a weak/rejected asset triggers up to `max_replacement_attempts` (default 2) requests back through `VisualMediaService.acquire_replacement_asset` (a new public entry point reusing the exact same selection/global-duplicate-prevention rules, extended to never reselect an explicitly QC-rejected id), never an unbounded retry loop
+- Lightweight sequence-level repetition checking (`src/services/repetition_check.py`) flags back-to-back or short-interval reuse of the same asset ID by position - not frame-level computer-vision duplicate detection
+- Explicit fallback states implemented: `evaluation_source` distinguishes `vision` (real verdict), `metadata_fallback` (vision evaluator failed for that section - kept on the upstream metadata filter's prior approval, never silently marked vision-approved), and `error` (no usable verdict returned)
+- `VideoAssemblyService` was not modified - Visual QC logic lives entirely in the new `VisualQCService`, never inside video assembly
+- 503/503 tests passing (mocked evaluator/assembler/replacement-provider throughout - no real Gemini or FFmpeg calls in the automated suite), covering QC model validation, frame-sampling timestamp selection, all four relevance-decision tiers, bounded replacement (including exhaustion and rejected-id exclusion), vision-vs-metadata-fallback distinction, repetition detection, section/asset ordering, and non-mutation of the original `VisualResult`
+- Real standalone run validated via `python -m src.visual_qc_demo "Why do humans dream?"`: real visual planning + real Pexels media (11 assets across 5 sections), then real Gemini vision QC - 5 vision calls (one per section), 10 assets highly relevant, 1 neutral/acceptable, 0 warnings, 0 rejected, 0 replacements needed, real Gemini vision succeeded for every section (metadata fallback never triggered)
+- Standalone Visual QC milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/visual_qc_demo.py` is a separate standalone runner for this milestone
 
 ## Known Limitations
 
 - Semantic relevance now depends on the quality of the LLM's contextual understanding (when the planner succeeds) or on deterministic keyword/concept mapping (when it falls back) combined with what stock footage Pexels actually has for a given query. The deterministic fallback path still has no contextual understanding of ambiguous wording - it exists only as a safe, previously-validated degradation path, not a semantic solution in its own right.
-- The semantic filter only judges a candidate by lightweight text metadata (alt text or a URL slug) - it does not inspect actual video/image frames, so a candidate with no usable metadata, or misleading metadata, can still pass through unfiltered.
+- Visual QC now inspects actual frame content (not just text metadata), but only as a standalone capability - the main pipeline still assembles video from `VisualMediaService`'s output without QC in between until the next milestone integrates it.
+- A QC-driven replacement re-evaluation is an additional vision call per attempt (bounded by `max_replacement_attempts`, not free).
+- Frame sampling inspects a small, fixed number of representative timestamps, not full scene detection - a clip that changes content between sampled frames could still be judged on an unrepresentative moment.
+- Repetition checking remains asset-ID/position based only, not frame-level computer-vision duplicate detection.
 - For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.
 
 ## Current Next Milestone
 
-Visual QC / relevance validation of actual selected media - inspecting the real downloaded candidate (e.g. thumbnail/frame content via a vision model) rather than only its text metadata, to catch mismatches the deterministic semantic filter can't see. Also not yet started, in no particular priority order: subtitles/captions, background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets (`output/audio/`, `output/media/`).
+Integrate Visual QC into the main orchestration, between Visual Media and Video Assembly:
+
+```
+Topic → Research → Script → Voice → Visual Context Planner → Visual Media Service
+      → Visual QC → Video Assembly → Final MP4
+```
+
+Not yet started, in no particular priority order: subtitles/captions, background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets (`output/audio/`, `output/media/`).

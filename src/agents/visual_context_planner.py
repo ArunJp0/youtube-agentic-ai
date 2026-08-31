@@ -13,15 +13,13 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import List
 
 from src.llm.provider import LLMProvider
 from src.models.script import ScriptResult
 from src.models.visual_plan import SectionVisualPlan, VisualPlan
+from src.services.llm_json import extract_json_object
 from src.services.query_generation import build_deterministic_visual_plan
-
-_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 
 
 class VisualContextPlannerError(Exception):
@@ -139,7 +137,7 @@ class VisualContextPlanner:
 
     @staticmethod
     def _parse_response(raw_text: str, expected_count: int) -> List[SectionVisualPlan]:
-        payload = VisualContextPlanner._extract_json(raw_text)
+        payload = extract_json_object(raw_text)
         data = json.loads(payload)
 
         sections_data = data.get("sections") if isinstance(data, dict) else None
@@ -156,15 +154,3 @@ class VisualContextPlanner:
                 f"range 0..{expected_count - 1}"
             )
         return plans
-
-    @staticmethod
-    def _extract_json(raw_text: str) -> str:
-        text = raw_text.strip()
-        fence_match = _JSON_FENCE_RE.match(text)
-        if fence_match:
-            text = fence_match.group(1).strip()
-
-        start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise VisualContextPlannerError("No JSON object found in visual plan response")
-        return text[start : end + 1]

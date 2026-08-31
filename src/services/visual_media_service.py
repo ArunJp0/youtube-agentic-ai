@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from src.agents.visual_context_planner import VisualContextPlanner
@@ -122,7 +122,10 @@ class VisualMediaService:
         self.prefer_video = prefer_video
 
     async def generate_visuals(
-        self, script: ScriptResult, total_narration_duration_seconds: float
+        self,
+        script: ScriptResult,
+        total_narration_duration_seconds: float,
+        visual_plan: Optional[VisualPlan] = None,
     ) -> VisualResult:
         """Prepare duration-aware, context-planned visual assets for every
         section of a ScriptResult.
@@ -139,6 +142,11 @@ class VisualMediaService:
                 timing input this service's visual planning is based on.
                 Section/slot durations are derived from this, not estimated
                 independently.
+            visual_plan: Optional pre-built VisualPlan (e.g. from a prior
+                ``build_plan(script)`` call). Pass this when a caller needs
+                the same plan for another purpose (e.g. Visual QC) and must
+                avoid a second, redundant LLM planning call. If omitted,
+                one is built internally as before.
 
         Returns:
             Structured VisualResult mapping each section to its ordered asset(s)
@@ -162,7 +170,7 @@ class VisualMediaService:
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-        plan = self._build_plan(script)
+        plan = visual_plan if visual_plan is not None else self.build_plan(script)
         section_durations = calculate_section_durations(
             script.sections, total_narration_duration_seconds
         )
@@ -215,11 +223,17 @@ class VisualMediaService:
             semantic_planning_fallback_reason=plan.fallback_reason,
         )
 
-    def _build_plan(self, script: ScriptResult) -> VisualPlan:
+    def build_plan(self, script: ScriptResult) -> VisualPlan:
         """Get the per-section visual plan: from the configured planner (one
         LLM call for the whole script, with its own internal deterministic
         fallback) if one is set, otherwise directly from the deterministic
-        query-generation logic."""
+        query-generation logic.
+
+        Public so a caller that needs the plan for another purpose (e.g.
+        Visual QC re-selecting a replacement asset) can build it once and
+        pass it into ``generate_visuals`` via ``visual_plan=``, rather than
+        triggering a second LLM planning call.
+        """
         if self.visual_planner is not None:
             return self.visual_planner.plan_visuals(script)
         return build_deterministic_visual_plan(script)
@@ -261,6 +275,40 @@ class VisualMediaService:
 
     # ---- asset selection/download -------------------------------------------
 
+    async def acquire_replacement_asset(
+        self,
+        section_plan: SectionVisualPlan,
+        slot_index: int,
+        section_index: int,
+        downloaded_by_id: Dict[str, MediaAsset],
+        used_ids_in_order: List[str],
+        exclude_ids: Set[str],
+    ) -> Tuple[MediaAsset, str]:
+        """Public entry point for a QC-driven replacement: acquire a new
+        asset for one already-filled slot using the exact same selection/
+        reuse-fallback rules as normal slot filling (see
+        ``_acquire_slot_asset``), but additionally never select or reuse
+        any id in ``exclude_ids`` (e.g. an asset Visual QC has already
+        rejected for this slot).
+
+        Mutates ``downloaded_by_id``/``used_ids_in_order`` in place, the
+        same way the normal generation loop does, so global duplicate
+        prevention is preserved across a QC-driven replacement - callers
+        should reconstruct these two from an existing VisualResult before
+        the first call (see VisualQCService).
+
+        Returns:
+            (asset, query_used_to_find_it)
+        """
+        return await self._acquire_slot_asset(
+            section_plan,
+            slot_index,
+            section_index,
+            downloaded_by_id,
+            used_ids_in_order,
+            exclude_ids=exclude_ids,
+        )
+
     async def _acquire_slot_asset(
         self,
         section_plan: SectionVisualPlan,
@@ -268,6 +316,7 @@ class VisualMediaService:
         section_index: int,
         downloaded_by_id: Dict[str, MediaAsset],
         used_ids_in_order: List[str],
+        exclude_ids: Optional[Set[str]] = None,
     ) -> Tuple[MediaAsset, str]:
         """Fill one visual slot from a section's visual plan.
 
@@ -294,7 +343,8 @@ class VisualMediaService:
         Returns:
             (asset, query_used_to_find_it)
         """
-        recent_ids = set(used_ids_in_order[-RECENT_REUSE_LOOKBACK:])
+        exclude = exclude_ids or set()
+        recent_ids = set(used_ids_in_order[-RECENT_REUSE_LOOKBACK:]) | exclude
         specific_queries = section_plan.search_queries
         primary = specific_queries[slot_index % len(specific_queries)] if specific_queries else None
 
@@ -347,6 +397,13 @@ class VisualMediaService:
 
         for asset_id, asset in downloaded_by_id.items():
             if asset_id not in recent_ids:
+                return self._reuse_asset(asset, fallback_query, section_index), fallback_query
+
+        # Still nothing recent-and-not-excluded: prefer anything not
+        # explicitly excluded (e.g. a QC-rejected id) over an excluded one,
+        # even if it was used recently.
+        for asset_id, asset in downloaded_by_id.items():
+            if asset_id not in exclude:
                 return self._reuse_asset(asset, fallback_query, section_index), fallback_query
 
         if downloaded_by_id:

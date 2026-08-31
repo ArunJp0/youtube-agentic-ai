@@ -173,6 +173,82 @@ class TestFFmpegVideoAssemblerCommandConstruction:
         assert concat_list.index("clip1.mp4") < concat_list.index("clip2.mp4")
 
 
+class TestFFmpegVideoAssemblerExtractFrames:
+    def test_extracts_one_file_per_timestamp_in_order(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        paths = assembler.extract_frames("in.mp4", [1.0, 2.5, 4.0], str(tmp_path), "clip")
+
+        assert len(commands) == 3
+        assert paths == [
+            str(tmp_path / "clip-01.jpg"),
+            str(tmp_path / "clip-02.jpg"),
+            str(tmp_path / "clip-03.jpg"),
+        ]
+
+    def test_each_command_seeks_to_its_own_timestamp(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.extract_frames("in.mp4", [0.5, 3.25], str(tmp_path), "frame")
+
+        assert commands[0][commands[0].index("-ss") + 1] == "0.500"
+        assert commands[1][commands[1].index("-ss") + 1] == "3.250"
+        for cmd in commands:
+            assert "-frames:v" in cmd
+            assert "1" in cmd
+
+    def test_negative_timestamp_clamped_to_zero(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.extract_frames("in.mp4", [-1.0], str(tmp_path), "frame")
+        assert commands[0][commands[0].index("-ss") + 1] == "0.000"
+
+    def test_output_dir_created_if_missing(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: FakeCompletedProcess())
+
+        nested_dir = str(tmp_path / "nested" / "frames")
+        assembler.extract_frames("in.mp4", [1.0], nested_dir, "frame")
+
+        import os
+
+        assert os.path.isdir(nested_dir)
+
+    def test_ffmpeg_failure_raises_video_assembler_error(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: FakeCompletedProcess(returncode=1, stderr="bad frame")
+        )
+        with pytest.raises(VideoAssemblerError, match="bad frame"):
+            assembler.extract_frames("in.mp4", [1.0], str(tmp_path), "frame")
+
+
 class TestFFmpegVideoAssemblerErrorHandling:
     def test_ffmpeg_binary_disappears_between_check_and_run(self, monkeypatch) -> None:
         monkeypatch.setattr("shutil.which", _which_found)

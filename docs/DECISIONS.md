@@ -240,8 +240,70 @@ Each successfully selected `MediaAsset` records a `relevance_tier` (`"high"` for
 
 Consistent with "VideoAssemblyService should not make semantic decisions," no changes were made to `VideoAssemblyService`, `FFmpegVideoAssembler`, or `VoiceService` for this milestone - `SectionMediaMapping`'s new `semantic_summary`/`avoid_concepts` fields are additive and optional, so `VideoAssemblyService`'s existing usable-asset mapping needed no changes at all.
 
+## Known limitation (addressed by standalone Visual QC below): the semantic filter never inspected actual frame content
+
+The semantic filter judges a candidate only by lightweight text metadata (alt text or a URL slug); it does not inspect actual video/image frames, so misleading or missing metadata could still let a mismatched candidate through. The Visual QC milestone below adds real frame inspection as a standalone capability; it is not yet wired into the main pipeline, so this limitation still applies to the end-to-end orchestration until the next (integration) milestone.
+
+## Visual QC is a separate service, not logic added to VideoAssemblyService or VisualMediaService
+
+Judging whether an already-selected asset's actual visual content fits a section is a distinct responsibility from selecting candidates (`VisualMediaService`) or assembling the final video (`VideoAssemblyService`), so it was implemented as its own `VisualQCService` (`src/services/visual_qc_service.py`) rather than folded into either. `VisualQCService` consumes what those two already produce/would consume (`ScriptResult`, `VisualPlan`, `VisualResult`) and can call back into `VisualMediaService` for a replacement, but neither existing service gained semantic-judgment logic of its own - `VideoAssemblyService` in particular remains untouched, consistent with "VideoAssemblyService should not make semantic decisions."
+
+## Visual QC inspects actual representative frames, not just metadata
+
+Metadata-only filtering (the prior milestone's `passes_avoid_filter`) can only judge what a provider's alt text or URL slug happens to describe - it cannot catch a mismatch the metadata doesn't mention. `VisualQCService` instead extracts a small number of real frames from each already-downloaded asset (via a new `VideoAssembler.extract_frames` method, using the same ffmpeg binary already relied on for assembly) and sends them to a vision-capable evaluator, so the QC decision is grounded in what the clip actually shows.
+
+## Frame sampling is deterministic, duration-based, and capped at 3 frames - never every frame
+
+`src/services/frame_sampling.py`'s `calculate_sample_timestamps` picks a fixed, small number of timestamps from a clip's own duration alone: 1 frame (50%) for clips up to 6s, 2 frames (25%/75%) up to 15s, 3 frames (25%/50%/75%) beyond that - never proportional to duration, never a full scan. This bounds both FFmpeg extraction cost and, more importantly, the number/size of images sent to the vision model per asset, regardless of how long a selected clip happens to be. An image asset skips extraction entirely - the downloaded file itself is the one "frame."
+
+## VisualRelevanceEvaluator is a new abstraction, not an extension of LLMProvider
+
+`LLMProvider.generate_text(prompt) -> str` has no way to carry images, and extending it would give every existing caller (Research/Script agents, `VisualContextPlanner`) a parameter they never use. Instead, `VisualRelevanceEvaluator` (`src/tools/visual_relevance_evaluator.py`) is a small, separate interface - `evaluate_section(context) -> List[RawAssetVerdict]` - with a `MockVisualRelevanceEvaluator` for tests and a real `GeminiVisualRelevanceEvaluator`. `GeminiLLMProvider`/`LLMProvider` and Research/Script's use of them were not modified.
+
+## The real vision evaluator reuses Gemini's existing generateContent endpoint, not a new API
+
+Before implementing the real evaluator, the existing `GeminiLLMProvider` (`src/llm/gemini.py`) was inspected: it already calls the `generateContent` REST endpoint, which Gemini's flash models support multimodally via `inline_data` image parts alongside `text` parts in the same request. `GeminiVisualRelevanceEvaluator` (`src/tools/gemini_visual_relevance_evaluator.py`) reuses that same endpoint shape (base64-encoded JPEG/PNG/WebP frames as `inline_data`, one request per section), rather than inventing an unsupported call or a second SDK dependency. It defaults to `settings.gemini_model` (the same model Research/Script/`VisualContextPlanner` already use, which is natively multimodal) via a new `get_visual_relevance_evaluator(settings)` factory that reuses `LLM_PROVIDER` rather than adding a separate setting - a mock `LLM_PROVIDER` gets the mock evaluator, a real one gets the real evaluator, automatically.
+
+## A shared JSON-extraction helper replaces the duplicated one in VisualContextPlanner
+
+`VisualContextPlanner` already had a private `_extract_json` (strip a markdown fence, find the outermost `{...}`) for parsing its own structured LLM response. `GeminiVisualRelevanceEvaluator` needs the identical logic for its own structured vision response. Rather than duplicating it, it was extracted into `src/services/llm_json.py` (`extract_json_object`/`JsonExtractionError`) and `VisualContextPlanner` was refactored (behavior-preserving, its own tests unchanged) to use the shared version - a small, justified refactor rather than a second copy.
+
+## One vision request per section, never per frame or per slot
+
+`VisualQCService` batches every asset selected for a section's visual slots into a single `evaluate_section` call, with all of that asset's representative frames attached and labeled by `asset_id`. This mirrors the same per-script-not-per-section discipline `VisualContextPlanner` already established for text planning, applied to vision calls: a section with 5 visual slots costs exactly 1 vision request (plus any bounded replacement re-checks), not 5.
+
+## Relevance decisions come from centralized thresholds, not the evaluator's own opinion
+
+`RawAssetVerdict` (the vision evaluator's raw output) carries only a `relevance_score` (0-1) and a `misleading_or_conflicting` flag - it does not decide "approved" vs "rejected" itself. `VisualQCService` owns that policy via two centralized constants, `APPROVE_SCORE_THRESHOLD` (0.70) and `NEUTRAL_SCORE_THRESHOLD` (0.50): `>= 0.70` approved, `0.50-0.69` neutral/acceptable (still kept - a relevant-but-not-literal B-roll clip is not penalized), `< 0.50` weak (replacement recommended), and `misleading_or_conflicting=True` always forces rejection regardless of score. Keeping this in one service-level place (not scattered per-call magic numbers, and not left to the evaluator to decide) makes the policy tunable and testable independent of the vision model's own behavior.
+
+## Bounded replacement reuses VisualMediaService's own selection logic, not a second implementation
+
+When Visual QC recommends replacing a weak/misleading asset, it doesn't re-implement candidate search - it calls a new public `VisualMediaService.acquire_replacement_asset`, which delegates to the exact same `_acquire_slot_asset` selection/reuse-fallback rules normal slot filling already uses, extended with an `exclude_ids` parameter so a QC-rejected id is never immediately reselected or reused as a fallback (only chosen again as an absolute last resort if literally nothing else was ever downloaded). This is capped at `max_replacement_attempts` (default 2, configurable) per slot - never an unbounded search - and if no acceptable replacement is found, the best-available asset is kept and explicitly flagged (`decision="weak"`/`"rejected"`, `replaced`/`replacement_attempts` recorded) rather than the pipeline stalling.
+
+## VisualQCService reconstructs VisualMediaService's global dedup state from an already-finished VisualResult
+
+Because Visual QC runs as a separate, standalone step after `generate_visuals()` has already returned, it doesn't have access to the live `downloaded_by_id`/`used_ids_in_order` maps `VisualMediaService` used internally during selection. `VisualQCService._reconstruct_global_state` rebuilds an equivalent state by walking the given `VisualResult`'s existing assets, so a QC-driven replacement still respects global duplicate prevention across the whole video, not just within one section.
+
+## VisualMediaService.build_plan() is public so Visual QC never triggers a second LLM planning call
+
+`VisualMediaService.generate_visuals()` now accepts an optional `visual_plan=` parameter; when omitted it still builds one internally exactly as before. The demo/QC flow calls the now-public `build_plan(script)` once, passes that same plan into `generate_visuals(visual_plan=plan)`, and later into `VisualQCService.run_qc(..., visual_plan=plan, ...)` - one planning call serves both selection and QC, rather than QC re-deriving (and potentially drifting from) a second plan.
+
+## Repetition checking is asset-ID/position based, not frame-level computer vision
+
+`src/services/repetition_check.py` flags an asset id that reappears within `RECENT_REUSE_LOOKBACK` slots of its own previous occurrence (the same policy constant `VisualMediaService` already uses for reuse-after-gap), by comparing ids and positions in the final selected sequence - not by comparing frame pixels. This is deliberately simple for this milestone: sufficient to catch the obvious case (the same stock clip showing up twice in a row or in quick succession) without building real computer-vision duplicate detection.
+
+## Explicit vision/metadata-fallback/error distinction - never a silent vision-approved default
+
+Every `AssetQCResult` records an `evaluation_source`: `"vision"` (a real evaluator verdict was used), `"metadata_fallback"` (the vision evaluator failed for that whole section - the asset is kept on the upstream metadata filter's prior approval, which already ran during selection), or `"error"` (the evaluator's response didn't include a verdict for this specific asset). A section-level evaluator failure never silently becomes "vision approved" - it's marked `metadata_fallback` and surfaced on `VisualQCResult.fallback_used`/`fallback_reason`, so a caller can always tell whether an asset was actually vision-checked.
+
+## Standalone-first: Visual QC is not yet wired into the main LangGraph pipeline
+
+This milestone intentionally stops short of integration. `src/workflows/pipeline_graph.py` is unchanged, and `src/visual_qc_demo.py` is a separate standalone runner (mock script → real visual planning/media → real Visual QC) used to validate the capability against real downloaded media and a real vision model before touching the orchestration. Wiring `VisualQCService` in as a `visual_qc` node between `media` and `video_assembly` is the next planned milestone.
+
 ## Known limitations
 
-- The deterministic fallback plan (used when semantic planning is unavailable) still has no contextual understanding of ambiguous wording - it is a safe degradation path, not a second semantic solution.
-- The semantic filter judges a candidate only by lightweight text metadata (alt text or a URL slug); it does not inspect actual video/image frames, so misleading or missing metadata can still let a mismatched candidate through. A future Visual QC step inspecting actual candidate thumbnails/frames (e.g. via a vision model) is a candidate next milestone, not yet implemented.
+- Visual QC is implemented but not yet integrated into the main pipeline - `pipeline_demo.py`'s end-to-end run does not currently include it.
+- A QC-driven replacement attempt costs one additional vision call per attempt (bounded by `max_replacement_attempts`, not free).
+- Frame sampling inspects a small, fixed number of representative timestamps (not full scene detection) - a clip that changes content between sampled frames could still be judged on an unrepresentative moment.
+- Repetition checking remains asset-ID/position based, not frame-level computer-vision duplicate detection.
 - For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.

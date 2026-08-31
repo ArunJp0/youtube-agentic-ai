@@ -58,7 +58,9 @@ Topic Input → Research Agent → Script Agent → Voice Service → Visual Con
 
 All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo "<topic>"`); a failure at any stage stops the pipeline before the next one runs, and the pipeline only reports `completed` once a real final MP4 exists. `output/audio/`, `output/media/`, and `output/video/` are all generated runtime artifacts and are Git-ignored - nothing under them is source.
 
-**Known limitation**: the semantic filter only judges a candidate by lightweight text metadata (a Pexels photo's alt text or a descriptive URL slug), not actual frame content - so a candidate with misleading or missing metadata can still pass through unfiltered. This is a content-quality limitation, not a pipeline failure - videos are still produced complete and correctly timed. A future Visual QC step that inspects actual candidate thumbnails/frames (e.g. via a vision model) is a candidate next milestone.
+**Known limitation**: the semantic filter used during selection only judges a candidate by lightweight text metadata (a Pexels photo's alt text or a descriptive URL slug), not actual frame content - so a candidate with misleading or missing metadata can still pass through unfiltered *in the main pipeline*. This is a content-quality limitation, not a pipeline failure - videos are still produced complete and correctly timed.
+
+A **Visual QC** capability that inspects real representative frames from already-selected media with a vision model (`VisualQCService`, `src/visual_qc_demo.py`) has been implemented and validated standalone, but is **not yet wired into the main pipeline** above - integrating it as a stage between Visual Media Service and Video Assembly Service is the next planned milestone.
 
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 

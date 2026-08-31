@@ -117,6 +117,9 @@ class FakeVideoAssembler(VideoAssembler):
         with open(output_path, "wb") as f:
             f.write(b"FAKE VIDEO")
 
+    def extract_frames(self, input_path, timestamps_seconds, output_dir, basename):
+        raise NotImplementedError("not exercised by pipeline workflow tests")
+
 
 class TestPipelineWorkflow:
     """Tests for the combined Research -> Script -> Voice -> Visual Media ->

@@ -9,6 +9,7 @@ from src.llm.mock import MockLLMProvider
 from src.tools.search_provider import SearchProvider, MockSearchProvider
 from src.tools.voice_provider import VoiceProvider, MockVoiceProvider
 from src.tools.media_provider import MediaProvider, MockMediaProvider
+from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
 
 
 class ProviderConfigError(Exception):
@@ -112,4 +113,33 @@ def get_media_provider(settings: Optional[Settings] = None) -> MediaProvider:
 
     raise ProviderConfigError(
         f"Unknown MEDIA_PROVIDER: '{settings.media_provider}'. Expected 'mock' or 'pexels'."
+    )
+
+
+def get_visual_relevance_evaluator(settings: Optional[Settings] = None) -> VisualRelevanceEvaluator:
+    """Build the configured VisualRelevanceEvaluator (Visual QC's vision model).
+
+    Reuses LLM_PROVIDER rather than a separate setting: vision QC is the
+    same underlying LLM capability (Gemini) as Research/Script, just with
+    image input, so a mock LLM setup gets a mock evaluator and a real
+    Gemini setup gets the real one, with no extra configuration required.
+
+    Gemini-specific imports are done lazily so the mock path never depends
+    on it, matching every other provider factory here.
+
+    Raises:
+        ProviderConfigError: If LLM_PROVIDER is not a recognized value.
+    """
+    settings = settings or Settings()
+    provider_name = (settings.llm_provider or "mock").strip().lower()
+
+    if provider_name == "mock":
+        return MockVisualRelevanceEvaluator()
+    if provider_name == "gemini":
+        from src.tools.gemini_visual_relevance_evaluator import GeminiVisualRelevanceEvaluator
+
+        return GeminiVisualRelevanceEvaluator(api_key=settings.gemini_api_key, model=settings.gemini_model)
+
+    raise ProviderConfigError(
+        f"Unknown LLM_PROVIDER: '{settings.llm_provider}'. Expected 'mock' or 'gemini'."
     )
