@@ -1,5 +1,5 @@
 # Live demo runner for the complete Research -> Script -> Voice -> Visual
-# Media -> Video Assembly pipeline.
+# Media -> Visual QC -> Video Assembly pipeline.
 #
 # Uses the existing provider factory (src.config.providers / Settings), so
 # with the current .env configuration (LLM_PROVIDER=gemini,
@@ -7,7 +7,7 @@
 # this calls real Wikipedia search, real Gemini LLM processing (including
 # its existing retry/backoff/fallback-model behavior, untouched by this
 # module), real Edge TTS narration synthesis, real Pexels stock media
-# retrieval, and real FFmpeg video assembly.
+# retrieval, real Gemini vision QC, and real FFmpeg video assembly.
 from __future__ import annotations
 
 import asyncio
@@ -19,12 +19,14 @@ from src.config.providers import (
     get_llm_provider,
     get_media_provider,
     get_search_provider,
+    get_visual_relevance_evaluator,
     get_voice_provider,
 )
 from src.config.settings import Settings
 from src.main import print_research_result
 from src.media_demo import print_visual_result
 from src.script_demo import print_script_result
+from src.visual_qc_demo import print_qc_result
 from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.services.visual_media_service import DEFAULT_MEDIA_OUTPUT_DIR
 from src.services.voice_service import DEFAULT_OUTPUT_DIR
@@ -33,12 +35,17 @@ from src.workflows.pipeline_graph import PipelineState, build_pipeline_graph
 
 DEFAULT_TOPIC = "Why do humans dream?"
 
+# Visual Context Planner runs inside the "media" stage (VisualMediaService
+# builds the plan and consumes it in the same step) rather than as its own
+# top-level progress stage - it isn't a separately observable pipeline step
+# from the outside, just an internal part of how Visual Media selects assets.
 _STAGE_LABELS = {
-    "research": "[1/5] Research",
-    "script": "[2/5] Script",
-    "voice": "[3/5] Voice",
-    "media": "[4/5] Visual Media",
-    "video_assembly": "[5/5] Video Assembly",
+    "research": "[1/6] Research",
+    "script": "[2/6] Script",
+    "voice": "[3/6] Voice",
+    "media": "[4/6] Visual Media",
+    "visual_qc": "[5/6] Visual QC",
+    "video_assembly": "[6/6] Video Assembly",
 }
 
 
@@ -51,7 +58,7 @@ def _ensure_utf8_stdout() -> None:
 
 
 async def run_pipeline_demo(topic: str) -> PipelineState:
-    """Run the full 5-stage pipeline, printing progress as each stage completes.
+    """Run the full 6-stage pipeline, printing progress as each stage completes.
 
     Provider selection comes entirely from Settings/.env via the existing
     provider factory (src.config.providers) - this function does not
@@ -80,12 +87,13 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
     search_provider = get_search_provider(settings)
     voice_provider = get_voice_provider(settings)
     media_provider = get_media_provider(settings)
+    visual_relevance_evaluator = get_visual_relevance_evaluator(settings)
 
     print(f"Pipeline: {topic}")
     print(
         f"   LLM: {settings.llm_provider} | Search: {settings.search_provider} "
         f"| Voice: {settings.voice_provider} ({settings.voice_name}) "
-        f"| Media: {settings.media_provider} | Video: ffmpeg"
+        f"| Media: {settings.media_provider} | Visual QC: {visual_relevance_evaluator.name} | Video: ffmpeg"
     )
     print("=" * 60)
 
@@ -96,6 +104,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         settings.voice_name,
         media_provider,
         assembler,
+        visual_relevance_evaluator,
         DEFAULT_OUTPUT_DIR,
         DEFAULT_MEDIA_OUTPUT_DIR,
         DEFAULT_VIDEO_OUTPUT_DIR,
@@ -117,7 +126,10 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         research_result=accumulated.get("research_result"),
         script_result=accumulated.get("script_result"),
         voice_result=accumulated.get("voice_result"),
+        visual_plan=accumulated.get("visual_plan"),
         visual_result=accumulated.get("visual_result"),
+        visual_qc_result=accumulated.get("visual_qc_result"),
+        qc_approved_visual_result=accumulated.get("qc_approved_visual_result"),
         video_assembly_result=accumulated.get("video_assembly_result"),
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
@@ -155,6 +167,16 @@ def _print_final_summary(state: PipelineState) -> None:
         )
     else:
         print("Visual Media success: False")
+
+    if state.visual_qc_result:
+        qc = state.visual_qc_result
+        print(
+            f"Visual QC success: {qc.success} ({qc.approved_count} approved incl. fallback, "
+            f"{qc.warning_count} warning, {qc.rejected_count} rejected, {qc.replaced_count} replaced, "
+            f"{qc.vision_calls_made} vision call(s), fallback used: {qc.fallback_used})"
+        )
+    else:
+        print("Visual QC success: False")
 
     if state.video_assembly_result:
         result = state.video_assembly_result
@@ -221,6 +243,12 @@ async def main() -> None:
         print("# VISUAL MEDIA RESULT")
         print("#" * 60)
         print_visual_result(state.visual_result)
+
+    if state.visual_qc_result:
+        print("\n" + "#" * 60)
+        print("# VISUAL QC RESULT")
+        print("#" * 60)
+        print_qc_result(state.visual_qc_result, state.visual_result)
 
     if state.video_assembly_result:
         print("\n" + "#" * 60)

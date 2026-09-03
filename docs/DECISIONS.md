@@ -296,14 +296,39 @@ Because Visual QC runs as a separate, standalone step after `generate_visuals()`
 
 Every `AssetQCResult` records an `evaluation_source`: `"vision"` (a real evaluator verdict was used), `"metadata_fallback"` (the vision evaluator failed for that whole section - the asset is kept on the upstream metadata filter's prior approval, which already ran during selection), or `"error"` (the evaluator's response didn't include a verdict for this specific asset). A section-level evaluator failure never silently becomes "vision approved" - it's marked `metadata_fallback` and surfaced on `VisualQCResult.fallback_used`/`fallback_reason`, so a caller can always tell whether an asset was actually vision-checked.
 
-## Standalone-first: Visual QC is not yet wired into the main LangGraph pipeline
+## Standalone-first, then integration: Visual QC was validated alone before touching the pipeline
 
-This milestone intentionally stops short of integration. `src/workflows/pipeline_graph.py` is unchanged, and `src/visual_qc_demo.py` is a separate standalone runner (mock script → real visual planning/media → real Visual QC) used to validate the capability against real downloaded media and a real vision model before touching the orchestration. Wiring `VisualQCService` in as a `visual_qc` node between `media` and `video_assembly` is the next planned milestone.
+The prior milestone intentionally stopped short of integration - `src/visual_qc_demo.py` (mock script → real visual planning/media → real Visual QC) validated the capability against real downloaded media and a real vision model before the orchestration itself was touched. This milestone wires the already-validated `VisualQCService` into `src/workflows/pipeline_graph.py` as a `visual_qc` node between `media` and `video_assembly` - no QC evaluation/replacement/frame-sampling logic was reworked or duplicated to do this, only the graph wiring.
+
+## Visual QC integration reuses VisualQCService as-is; the pipeline only adds routing policy
+
+`build_pipeline_graph`'s new `visual_qc_node` calls `VisualQCService.run_qc(...)` exactly as `visual_qc_demo.py` already did - same method, same bounded-replacement mechanism, same fallback behavior. The only new logic added at the pipeline layer is deciding what to do with the result (continue vs. stop before Video Assembly) - see the hard-QC-failure decision below - keeping `VisualQCService` itself unaware of being called from a graph versus standalone, consistent with how `VoiceService`/`VisualMediaService`/`VideoAssemblyService` already join the pipeline unchanged in kind.
+
+## Visual Media builds the plan once and threads it through state for Visual QC to reuse
+
+`VisualMediaService.generate_visuals()`'s existing `visual_plan=` parameter (added specifically for this purpose in the standalone-QC milestone) is now used by the pipeline's `media_node`: it calls the now-public `build_plan(script)` once, stores the result on `PipelineState.visual_plan`, and passes it into `generate_visuals(visual_plan=plan)`. `visual_qc_node` reads `state.visual_plan` back out for `run_qc(...)`. One Gemini planning call serves both selection and QC for the whole pipeline run - Visual QC never triggers a second one.
+
+## The pre-QC VisualResult is never silently overwritten; a separate field carries the QC-approved version
+
+`PipelineState.visual_result` continues to mean exactly what it always has - `VisualMediaService`'s direct output, untouched by QC. A new `PipelineState.qc_approved_visual_result` field carries the post-QC version (with any replaced assets swapped in), populated by `visual_qc_node` once QC completes acceptably. `video_assembly_node` was changed to consume `qc_approved_visual_result`, never `visual_result` - so Video Assembly always builds the final MP4 from QC-approved media, while the original selection remains inspectable in state for diagnostics/comparison.
+
+## Hard QC failure is defined at the pipeline level as "a misleading asset survived bounded replacement"
+
+`VisualQCService.run_qc` itself reports `success=True` whenever the QC process completes without crashing, regardless of individual verdicts - by design, it always keeps *something* per slot (best-available-asset philosophy, matching `VisualMediaService`'s own selection fallback). The pipeline needed its own policy for "is this result actually acceptable to build a video from," so `visual_qc_node` treats `VisualQCResult.rejected_count > 0` (at least one asset still flagged `misleading_or_conflicting` after every bounded replacement attempt failed to find something safe) as a hard failure: pipeline status becomes `failed`, Video Assembly never runs, and every earlier-stage result is preserved in state rather than discarded. A `weak`-but-not-misleading asset (low score, no safe replacement found) does *not* block the pipeline - only content actively flagged misleading does, consistent with "prioritize avoiding misleading visuals over demanding literal footage for every abstract concept." This policy lives in the workflow node, not inside `VisualQCService`, since it's specifically about what the *pipeline* considers acceptable to publish, not a property of QC evaluation itself.
+
+## Metadata-fallback approval is allowed to continue the pipeline
+
+When the vision evaluator fails for a section (e.g. a Gemini outage), `VisualQCService` already falls back to approving that section's assets on the strength of the upstream metadata filter that ran during selection (`evaluation_source="metadata_fallback"`) - never silently marking them "vision approved." Since a metadata-fallback decision is never `rejected`, it doesn't trip the hard-failure policy above: the pipeline continues to Video Assembly, and `VisualQCResult.fallback_used`/`fallback_reason` (already part of the existing model) is preserved in `PipelineState.visual_qc_result` for inspection. This matches the pipeline's established pattern of degrading gracefully on a provider outage (see `VisualContextPlanner`'s own fallback) rather than treating every third-party failure as fatal.
+
+## Pipeline demo progress stays at 6 top-level stages; Visual Context Planner is not a separate one
+
+`src/pipeline_demo.py`'s stage labels became `[1/6] Research` … `[6/6] Video Assembly`, adding only `visual_qc` as a new top-level stage. The Visual Context Planner runs inside `media_node` (it's how `VisualMediaService` gets its plan) and was not given its own progress label - from outside the pipeline it isn't a separately observable step, and giving it one would suggest a 7-stage pipeline where there are really 6 orchestrated stages.
 
 ## Known limitations
 
-- Visual QC is implemented but not yet integrated into the main pipeline - `pipeline_demo.py`'s end-to-end run does not currently include it.
+- Semantic relevance still depends on the quality of the LLM's contextual understanding (when planning/QC succeed) or deterministic fallback logic (when they don't), combined with what stock footage Pexels actually has for a given query - perfect semantic matching is not guaranteed given finite provider inventory, even with Visual QC now integrated.
 - A QC-driven replacement attempt costs one additional vision call per attempt (bounded by `max_replacement_attempts`, not free).
 - Frame sampling inspects a small, fixed number of representative timestamps (not full scene detection) - a clip that changes content between sampled frames could still be judged on an unrepresentative moment.
-- Repetition checking remains asset-ID/position based, not frame-level computer-vision duplicate detection.
+- Repetition checking remains asset-ID/position based, not frame-level computer-vision duplicate detection - controlled visual reuse may still occur in longer videos.
 - For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.
+- The visual pipeline (planning → selection → QC → assembly) is considered complete for the current MVP; it is not planned to be further over-optimized without a new concrete problem to justify it.

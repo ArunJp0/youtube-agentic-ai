@@ -1,6 +1,7 @@
-# Tests for the Research -> Script -> Voice -> Visual Media -> Video
-# Assembly pipeline workflow (LangGraph). All tests use mock providers/fake
-# assembler only - no real network/API/FFmpeg calls.
+# Tests for the Research -> Script -> Voice -> Visual Media -> Visual QC ->
+# Video Assembly pipeline workflow (LangGraph). All tests use mock
+# providers/fake assembler/fake evaluator only - no real network/API/FFmpeg
+# calls.
 from __future__ import annotations
 
 import os
@@ -13,10 +14,12 @@ from src.models.media import VisualResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
 from src.models.video import VideoAssemblyResult
+from src.models.visual_qc import RawAssetVerdict, VisualQCResult
 from src.models.voice import VoiceResult
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.search_provider import MockSearchProvider, SearchProvider
+from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
 from src.tools.voice_provider import MockVoiceProvider, VoiceProvider
 from src.workflows.pipeline_graph import PipelineState, build_pipeline_graph, run_pipeline
 
@@ -91,14 +94,15 @@ class ExplodingMediaProvider(MediaProvider):
 
 class FakeVideoAssembler(VideoAssembler):
     """Test double: records calls and writes tiny placeholder files instead
-    of running real FFmpeg, so the pipeline's video_assembly stage can be
-    exercised without any real encoding process."""
+    of running real FFmpeg, so the pipeline's visual_qc/video_assembly
+    stages can be exercised without any real encoding/extraction process."""
 
     def __init__(self, audio_duration: float = 30.0, fail: bool = False) -> None:
         self.audio_duration = audio_duration
         self.fail = fail
         self.build_calls: list[dict] = []
         self.assemble_calls: list[dict] = []
+        self.extract_frame_calls: list[dict] = []
 
     def probe_duration_seconds(self, media_path: str) -> float:
         if self.fail:
@@ -118,12 +122,73 @@ class FakeVideoAssembler(VideoAssembler):
             f.write(b"FAKE VIDEO")
 
     def extract_frames(self, input_path, timestamps_seconds, output_dir, basename):
-        raise NotImplementedError("not exercised by pipeline workflow tests")
+        self.extract_frame_calls.append({"input_path": input_path, "timestamps_seconds": list(timestamps_seconds)})
+        os.makedirs(output_dir, exist_ok=True)
+        paths = []
+        for index, _ in enumerate(timestamps_seconds):
+            path = os.path.join(output_dir, f"{basename}-{index + 1:02d}.jpg")
+            with open(path, "wb") as f:
+                f.write(b"FAKE FRAME")
+            paths.append(path)
+        return paths
+
+
+class ExplodingVisualRelevanceEvaluator(VisualRelevanceEvaluator):
+    """Test double: evaluate_section always raises, to simulate a Gemini
+    vision outage - exercises VisualQCService's metadata-fallback path."""
+
+    @property
+    def name(self) -> str:
+        return "exploding"
+
+    async def evaluate_section(self, context):
+        raise RuntimeError("simulated vision QC outage")
+
+
+class AlwaysMisleadingEvaluator(VisualRelevanceEvaluator):
+    """Test double: every asset (including every bounded-replacement
+    attempt) is flagged misleading, regardless of its id - guarantees QC
+    exhausts replacement and ends with rejected_count > 0, so pipeline
+    tests can exercise the hard-QC-failure path deterministically."""
+
+    @property
+    def name(self) -> str:
+        return "always-misleading"
+
+    async def evaluate_section(self, context):
+        return [
+            RawAssetVerdict(
+                asset_id=asset.asset_id, relevance_score=0.9, misleading_or_conflicting=True, reason="always misleading"
+            )
+            for asset in context.assets
+        ]
+
+
+class FirstAttemptWeakEvaluator(VisualRelevanceEvaluator):
+    """Test double: the first evaluate_section call for a given section
+    marks its asset(s) weak (replacement recommended); every later call for
+    that same section (i.e. the replacement re-check) approves. Lets
+    pipeline tests deterministically exercise "QC replaced the asset, and
+    the replacement changed what reaches Video Assembly"."""
+
+    def __init__(self) -> None:
+        self.seen_sections: set = set()
+
+    @property
+    def name(self) -> str:
+        return "first-weak"
+
+    async def evaluate_section(self, context):
+        already_seen = context.section_index in self.seen_sections
+        self.seen_sections.add(context.section_index)
+        score = 0.95 if already_seen else 0.2
+        reason = "great replacement" if already_seen else "weak first try"
+        return [RawAssetVerdict(asset_id=a.asset_id, relevance_score=score, reason=reason) for a in context.assets]
 
 
 class TestPipelineWorkflow:
     """Tests for the combined Research -> Script -> Voice -> Visual Media ->
-    Video Assembly LangGraph pipeline."""
+    Visual QC -> Video Assembly LangGraph pipeline."""
 
     @pytest.fixture
     def providers(self, tmp_path):
@@ -135,6 +200,7 @@ class TestPipelineWorkflow:
             MockVoiceProvider(),
             MockMediaProvider(),
             FakeVideoAssembler(),
+            MockVisualRelevanceEvaluator(default_score=0.9),
             str(tmp_path / "audio"),
             str(tmp_path / "media"),
             str(tmp_path / "video"),
@@ -142,7 +208,17 @@ class TestPipelineWorkflow:
 
     @staticmethod
     def _run(providers, topic="Why do humans dream?", **overrides):
-        search_provider, llm_provider, voice_provider, media_provider, assembler, voice_dir, media_dir, video_dir = providers
+        (
+            search_provider,
+            llm_provider,
+            voice_provider,
+            media_provider,
+            assembler,
+            visual_relevance_evaluator,
+            voice_dir,
+            media_dir,
+            video_dir,
+        ) = providers
         return run_pipeline(
             topic,
             overrides.get("search_provider", search_provider),
@@ -151,6 +227,7 @@ class TestPipelineWorkflow:
             TEST_VOICE_NAME,
             overrides.get("media_provider", media_provider),
             overrides.get("assembler", assembler),
+            overrides.get("visual_relevance_evaluator", visual_relevance_evaluator),
             voice_dir,
             media_dir,
             video_dir,
@@ -158,10 +235,13 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_pipeline_builds_and_compiles(self, providers) -> None:
-        search_provider, llm_provider, voice_provider, media_provider, assembler, voice_dir, media_dir, video_dir = providers
+        (
+            search_provider, llm_provider, voice_provider, media_provider, assembler,
+            visual_relevance_evaluator, voice_dir, media_dir, video_dir,
+        ) = providers
         graph = build_pipeline_graph(
             search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
-            voice_dir, media_dir, video_dir,
+            visual_relevance_evaluator, voice_dir, media_dir, video_dir,
         )
         assert graph is not None
         compiled = graph.compile()
@@ -196,7 +276,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_voice_result_is_structured_and_stored_in_final_state(self, providers) -> None:
-        _, _, voice_provider, _, _, _, _, _ = providers
+        _, _, voice_provider, _, _, _, _, _, _ = providers
         state = await self._run(providers)
 
         assert isinstance(state.voice_result, VoiceResult)
@@ -225,7 +305,29 @@ class TestPipelineWorkflow:
         assert state.visual_result.semantic_planning_fallback_reason is not None
         assert state.status == "completed"
 
-    # ---- B. VideoAssemblyResult stored in final state ----------------------
+    # ---- B. VisualQCResult stored in final state ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_visual_qc_result_is_structured_and_stored_in_final_state(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert isinstance(state.visual_qc_result, VisualQCResult)
+        assert state.visual_qc_result.success is True
+        assert state.visual_qc_result.total_assets_checked > 0
+        assert state.visual_qc_result.rejected_count == 0
+        assert state.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_qc_approved_visual_result_stored_alongside_original(self, providers) -> None:
+        """The pre-QC VisualResult (visual_result) must never be silently
+        replaced - the post-QC one is a separate field."""
+        state = await self._run(providers)
+
+        assert isinstance(state.qc_approved_visual_result, VisualResult)
+        assert state.visual_result is not None
+        assert state.qc_approved_visual_result is not state.visual_result
+
+    # ---- C. VideoAssemblyResult stored in final state ----------------------
 
     @pytest.mark.asyncio
     async def test_video_assembly_result_is_structured_and_stored_in_final_state(self, providers) -> None:
@@ -237,17 +339,21 @@ class TestPipelineWorkflow:
         assert os.path.exists(state.video_assembly_result.output_path)
         assert state.video_assembly_result.section_count == len(state.script_result.sections)
 
-    # ---- C. Video Assembly receives the expected earlier-stage results -----
+    # ---- D. Video Assembly receives the QC-approved media mapping ----------
 
     @pytest.mark.asyncio
-    async def test_video_assembly_receives_expected_inputs(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _ = providers
+    async def test_video_assembly_receives_qc_approved_inputs(self, providers) -> None:
+        (
+            _, _, _, _, assembler, _, _, _, _,
+        ) = providers
         state = await self._run(providers)
 
-        # The assembler was called once per section, with the exact media
-        # files VisualMediaService downloaded for those sections.
+        # The assembler was called with the exact media files from the
+        # post-QC qc_approved_visual_result - not any other object.
         expected_paths = {
-            mapping.assets[0].local_file_path for mapping in state.visual_result.sections
+            asset.local_file_path
+            for mapping in state.qc_approved_visual_result.sections
+            for asset in mapping.assets
         }
         actual_paths = {call["input_path"] for call in assembler.build_calls}
         assert actual_paths == expected_paths
@@ -260,11 +366,35 @@ class TestPipelineWorkflow:
             assembler.audio_duration, abs=0.01
         )
 
-    # ---- D-G. Video Assembly not called on earlier-stage failure -----------
+    @pytest.mark.asyncio
+    async def test_qc_replacement_changes_media_passed_to_video_assembly(self, providers) -> None:
+        """When Visual QC replaces a weak asset, Video Assembly must
+        receive the replacement - not the originally-selected asset."""
+        _, _, _, _, assembler, _, _, _, _ = providers
+        state = await self._run(providers, visual_relevance_evaluator=FirstAttemptWeakEvaluator())
+
+        assert state.status == "completed"
+        assert state.visual_qc_result.replaced_count == len(state.script_result.sections)
+
+        original_ids = {
+            asset.provider_asset_id for m in state.visual_result.sections for asset in m.assets
+        }
+        approved_ids = {
+            asset.provider_asset_id for m in state.qc_approved_visual_result.sections for asset in m.assets
+        }
+        assert original_ids != approved_ids
+
+        # Video Assembly built clips from the replacement paths, not the
+        # originally-selected ones.
+        original_paths = {a.local_file_path for m in state.visual_result.sections for a in m.assets}
+        assembled_paths = {c["input_path"] for c in assembler.build_calls}
+        assert assembled_paths.isdisjoint(original_paths)
+
+    # ---- E. Visual QC not called on earlier-stage failure ------------------
 
     @pytest.mark.asyncio
-    async def test_video_assembly_not_called_when_research_fails(self, providers) -> None:
-        _, _, voice_provider, media_provider, assembler, _, _, _ = providers
+    async def test_visual_qc_not_called_when_research_fails(self, providers) -> None:
+        _, _, voice_provider, media_provider, assembler, _, _, _, _ = providers
         state = await self._run(providers, topic="")
 
         assert state.status == "failed"
@@ -272,27 +402,31 @@ class TestPipelineWorkflow:
         assert state.script_result is None
         assert state.voice_result is None
         assert state.visual_result is None
+        assert state.visual_qc_result is None
+        assert state.qc_approved_visual_result is None
         assert state.video_assembly_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
+        assert assembler.extract_frame_calls == []
 
     @pytest.mark.asyncio
-    async def test_video_assembly_not_called_when_script_fails(self, providers) -> None:
-        search_provider, _, voice_provider, media_provider, assembler, _, _, _ = providers
+    async def test_visual_qc_not_called_when_script_fails(self, providers) -> None:
+        _, _, voice_provider, media_provider, assembler, _, _, _, _ = providers
         state = await self._run(providers, llm_provider=ExplodingLLMProvider())
 
         assert state.status == "failed"
         assert state.script_result is None
+        assert state.visual_qc_result is None
         assert state.video_assembly_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
 
     @pytest.mark.asyncio
-    async def test_video_assembly_not_called_when_voice_fails(self, providers) -> None:
-        _, _, _, media_provider, assembler, _, _, _ = providers
+    async def test_visual_qc_not_called_when_voice_fails(self, providers) -> None:
+        _, _, _, media_provider, assembler, _, _, _, _ = providers
         state = await self._run(providers, voice_provider=ExplodingVoiceProvider())
 
         assert state.status == "failed"
@@ -302,13 +436,14 @@ class TestPipelineWorkflow:
         assert state.voice_result is not None
         assert state.voice_result.success is False
         assert state.visual_result is None
+        assert state.visual_qc_result is None
         assert state.video_assembly_result is None
         assert media_provider.calls == []
         assert assembler.build_calls == []
 
     @pytest.mark.asyncio
-    async def test_video_assembly_not_called_when_visual_media_fails(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _ = providers
+    async def test_visual_qc_not_called_when_visual_media_fails(self, providers) -> None:
+        _, _, _, _, assembler, _, _, _, _ = providers
         state = await self._run(providers, media_provider=ExplodingMediaProvider())
 
         assert state.status == "failed"
@@ -319,11 +454,75 @@ class TestPipelineWorkflow:
         assert state.voice_result.success is True
         assert state.visual_result is not None
         assert state.visual_result.success is False
+        assert state.visual_qc_result is None
+        assert state.video_assembly_result is None
+        assert assembler.build_calls == []
+        assert assembler.assemble_calls == []
+        assert assembler.extract_frame_calls == []
+
+    # ---- F. QC failure/fallback policy -------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_metadata_fallback_approval_continues_pipeline(self, providers) -> None:
+        """A vision-evaluator outage must not fail the pipeline - QC falls
+        back to the metadata filter's prior approval and continues."""
+        state = await self._run(providers, visual_relevance_evaluator=ExplodingVisualRelevanceEvaluator())
+
+        assert state.status == "completed"
+        assert state.visual_qc_result.success is True
+        assert state.visual_qc_result.fallback_used is True
+        assert state.visual_qc_result.rejected_count == 0
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
+
+        all_assets = [a for s in state.visual_qc_result.sections for a in s.assets]
+        assert all(a.evaluation_source == "metadata_fallback" for a in all_assets)
+
+    @pytest.mark.asyncio
+    async def test_qc_fallback_reason_preserved_in_state(self, providers) -> None:
+        state = await self._run(providers, visual_relevance_evaluator=ExplodingVisualRelevanceEvaluator())
+
+        assert state.visual_qc_result.fallback_reason is not None
+        assert "simulated vision QC outage" in state.visual_qc_result.fallback_reason
+
+    @pytest.mark.asyncio
+    async def test_video_assembly_not_called_after_hard_qc_failure(self, providers) -> None:
+        """An asset still flagged misleading after bounded replacement is
+        exhausted must stop the pipeline before Video Assembly - never
+        reaching the final video."""
+        _, _, _, _, assembler, _, _, _, _ = providers
+        state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
+
+        assert state.status == "failed"
+        assert "rejected" in state.error.lower()
         assert state.video_assembly_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
 
-    # ---- H. Video Assembly failure surfaced correctly ----------------------
+    @pytest.mark.asyncio
+    async def test_rejected_assets_not_passed_to_video_assembly(self, providers) -> None:
+        _, _, _, _, assembler, _, _, _, _ = providers
+        state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
+
+        assert state.visual_qc_result.rejected_count > 0
+        assert assembler.build_calls == []
+
+    @pytest.mark.asyncio
+    async def test_earlier_stage_results_preserved_after_hard_qc_failure(self, providers) -> None:
+        state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
+
+        assert state.status == "failed"
+        assert state.research_result is not None
+        assert state.script_result is not None
+        assert state.voice_result is not None
+        assert state.voice_result.success is True
+        assert state.visual_result is not None
+        assert state.visual_result.success is True
+        # QC's own results are preserved for inspection even on hard failure.
+        assert state.visual_qc_result is not None
+        assert state.qc_approved_visual_result is not None
+
+    # ---- G. Video Assembly not called on its own upstream failure ----------
 
     @pytest.mark.asyncio
     async def test_video_assembly_failure_is_surfaced_cleanly(self, providers) -> None:
@@ -339,13 +538,16 @@ class TestPipelineWorkflow:
         assert state.voice_result.success is True
         assert state.visual_result is not None
         assert state.visual_result.success is True
+        assert state.visual_qc_result is not None
+        assert state.visual_qc_result.success is True
+        assert state.qc_approved_visual_result is not None
         # VideoAssemblyService never raises for processing failures - it
         # returns a structured failed VideoAssemblyResult.
         assert state.video_assembly_result is not None
         assert state.video_assembly_result.success is False
         assert "simulated ffmpeg outage" in state.video_assembly_result.error
 
-    # ---- I. status only "completed" when video assembly succeeds -----------
+    # ---- H. status only "completed" when video assembly succeeds after QC -
 
     @pytest.mark.asyncio
     async def test_status_is_completed_only_when_video_assembly_succeeds(self, providers) -> None:
@@ -356,7 +558,13 @@ class TestPipelineWorkflow:
         failure_state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
         assert failure_state.status == "failed"
 
-    # ---- J. existing behavior preserved -------------------------------------
+    @pytest.mark.asyncio
+    async def test_status_is_failed_not_completed_after_hard_qc_failure(self, providers) -> None:
+        state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
+        assert state.status == "failed"
+        assert state.status != "completed"
+
+    # ---- I. existing behavior preserved -------------------------------------
 
     @pytest.mark.asyncio
     async def test_no_search_results_still_completes_through_video_assembly(self, providers) -> None:
@@ -378,7 +586,10 @@ class TestPipelineWorkflow:
         assert state.research_result is None
         assert state.script_result is None
         assert state.voice_result is None
+        assert state.visual_plan is None
         assert state.visual_result is None
+        assert state.visual_qc_result is None
+        assert state.qc_approved_visual_result is None
         assert state.video_assembly_result is None
         assert state.status == "pending"
         assert state.error is None

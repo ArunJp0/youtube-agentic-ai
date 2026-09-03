@@ -41,30 +41,29 @@ ruff format .
 
 ## MVP Scope
 
-The complete orchestration - Research → Script → Voice → Visual Context Planner → Duration-Aware Visual Media → Semantic Media Filtering → Video Assembly - is implemented and validated end-to-end with real providers. One command turns a topic into a final playable MP4:
+The complete orchestration - Research → Script → Voice → Visual Context Planner → Duration-Aware Visual Media → Visual QC → Video Assembly - is implemented and validated end-to-end with real providers, including real Gemini vision QC. One command turns a topic into a final playable MP4:
 
 ```
 Topic Input → Research Agent → Script Agent → Voice Service → Visual Context Planner
-            → Duration-Aware Visual Media Service → Semantic Media Filtering
+            → Duration-Aware Visual Media Service → Visual QC
             → Video Assembly Service → Final MP4
 ```
 
 - **Research Agent**: researches a topic (real Wikipedia search + Gemini LLM, with mock providers for offline dev) and produces a structured `ResearchResult` (summary, key points, sourced facts, source URLs).
 - **Script Agent**: converts a `ResearchResult` into a structured `ScriptResult` (title, hook, introduction, narrated sections, conclusion, call to action, estimated duration, source references) - natural spoken-style narration for YouTube, grounded only in the research.
 - **Voice Service**: converts a `ScriptResult` into narration audio (real Edge TTS, with a mock provider for offline dev), saved under `output/audio/`.
-- **Visual Context Planner**: one Gemini call for the entire script, producing a structured visual plan per section - what it's actually about (`semantic_summary`), concrete visual concepts (`visual_intents`), search queries, `avoid_concepts` (literal-but-wrong interpretations to steer away from, e.g. "constructs a narrative" ≠ construction), and neutral fallback queries. If the call fails or returns something unusable, it falls back cleanly to the same deterministic query generation used when no planner runs at all - the pipeline never breaks because of it.
+- **Visual Context Planner**: one Gemini call for the entire script, producing a structured visual plan per section - what it's actually about (`semantic_summary`), concrete visual concepts (`visual_intents`), search queries, `avoid_concepts` (literal-but-wrong interpretations to steer away from, e.g. "constructs a narrative" ≠ construction), and neutral fallback queries. If the call fails or returns something unusable, it falls back cleanly to the same deterministic query generation used when no planner runs at all - the pipeline never breaks because of it. Runs as an internal part of the Visual Media stage, not a separate top-level pipeline stage.
 - **Visual Media Service**: duration-aware - it derives how many distinct stock clips each section needs from that section's real share of the narration duration (not a fixed count), and consumes the visual plan (rather than isolated keywords) to search, filter, and select multiple ordered assets per section. A deterministic semantic filter rejects candidates whose available metadata matches an `avoid_concept`. Only the assets actually selected are downloaded (real Pexels, with a mock provider for offline dev), saved under `output/media/`. Selected assets are tracked globally across the whole video to avoid duplicates, with exact-asset reuse/looping used only as a controlled fallback when unique stock footage runs out.
-- **Video Assembly Service**: combines the narration audio with each section's one or more ordered clips into a final MP4 (FFmpeg: H.264 video, AAC audio, 1920x1080, 30 fps), saved under `output/video/`. Makes no semantic decisions - only timing, trimming, cropping, ordering, concatenation, and audio sync.
+- **Visual QC**: inspects real representative frames (not just text metadata) from every selected asset with a vision-capable evaluator (real Gemini vision, with a mock evaluator for offline dev) - one batched request per script section. Assets judged weak or misleading trigger a bounded replacement request back through the Visual Media Service (never an unbounded search); an asset still flagged misleading after replacement is exhausted stops the pipeline before Video Assembly rather than risk a misleading clip in the final video. A vision-provider outage falls back to the upstream metadata filter's prior approval instead of failing the pipeline.
+- **Video Assembly Service**: combines the narration audio with each section's one or more QC-approved ordered clips into a final MP4 (FFmpeg: H.264 video, AAC audio, 1920x1080, 30 fps), saved under `output/video/`. Makes no semantic decisions - only timing, trimming, cropping, ordering, concatenation, and audio sync.
 
-All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo "<topic>"`); a failure at any stage stops the pipeline before the next one runs, and the pipeline only reports `completed` once a real final MP4 exists. `output/audio/`, `output/media/`, and `output/video/` are all generated runtime artifacts and are Git-ignored - nothing under them is source.
+All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo "<topic>"`); a failure at any stage - including a hard Visual QC failure - stops the pipeline before the next one runs, and the pipeline only reports `completed` once a real final MP4 exists, assembled only from Visual QC-approved media. `output/audio/`, `output/media/`, and `output/video/` are all generated runtime artifacts and are Git-ignored - nothing under them is source.
 
-**Known limitation**: the semantic filter used during selection only judges a candidate by lightweight text metadata (a Pexels photo's alt text or a descriptive URL slug), not actual frame content - so a candidate with misleading or missing metadata can still pass through unfiltered *in the main pipeline*. This is a content-quality limitation, not a pipeline failure - videos are still produced complete and correctly timed.
-
-A **Visual QC** capability that inspects real representative frames from already-selected media with a vision model (`VisualQCService`, `src/visual_qc_demo.py`) has been implemented and validated standalone, but is **not yet wired into the main pipeline** above - integrating it as a stage between Visual Media Service and Video Assembly Service is the next planned milestone.
+**Known limitation**: perfect semantic stock-footage matching is not guaranteed - Pexels' inventory for a given query is finite, so even with duration-aware planning, semantic filtering, and vision QC, an occasional visual can still be only loosely related to its section, and controlled visual reuse may still occur in longer videos. Manual review of a real run found this acceptable (~80-90% of visuals semantically relevant) for the current MVP. The visual pipeline (planning → selection → QC → assembly) is considered feature-complete for now and is not planned for further optimization without a new concrete problem.
 
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 
-Subtitles, thumbnail, metadata generation, QC, copyright checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet.
+Subtitles/captions, background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. Subtitle/Caption processing (after Video Assembly) is the next planned milestone.
 
 ## Project Structure
 

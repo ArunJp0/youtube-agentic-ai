@@ -1,11 +1,12 @@
-# Full Research -> Script -> Voice -> Visual Media -> Video Assembly
-# pipeline using LangGraph.
+# Full Research -> Script -> Voice -> Visual Media -> Visual QC -> Video
+# Assembly pipeline using LangGraph.
 #
 # This module does not implement any research, scripting, voice-synthesis,
-# visual-media, or video-encoding logic itself - it only wires the existing
-# ResearchAgent, ScriptAgent, VoiceService, VisualMediaService, and
-# VideoAssemblyService together into a single LangGraph state machine,
-# passing each stage's output directly into the next stage's input.
+# visual-media, QC-evaluation, or video-encoding logic itself - it only
+# wires the existing ResearchAgent, ScriptAgent, VoiceService,
+# VisualMediaService, VisualQCService, and VideoAssemblyService together
+# into a single LangGraph state machine, passing each stage's output
+# directly into the next stage's input.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from src.models.media import VisualResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
 from src.models.video import VideoAssemblyResult
+from src.models.visual_plan import VisualPlan
+from src.models.visual_qc import VisualQCResult
 from src.models.voice import VoiceResult
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
@@ -31,24 +34,36 @@ from src.services.visual_media_service import (
     VisualMediaService,
     VisualMediaServiceError,
 )
+from src.services.visual_qc_service import VisualQCService, VisualQCServiceError
 from src.services.voice_service import DEFAULT_OUTPUT_DIR, VoiceService, VoiceServiceError
 from src.tools.ffmpeg_video_assembler import VideoAssembler
 from src.tools.media_provider import MediaProvider
+from src.tools.visual_relevance_evaluator import VisualRelevanceEvaluator
 from src.tools.voice_provider import VoiceProvider
 
 
 @dataclass
 class PipelineState:
     """Shared state for the Research -> Script -> Voice -> Visual Media ->
-    Video Assembly pipeline."""
+    Visual QC -> Video Assembly pipeline."""
 
     topic: str = ""
     research_result: Optional[ResearchResult] = None
     script_result: Optional[ScriptResult] = None
     voice_result: Optional[VoiceResult] = None
+    visual_plan: Optional[VisualPlan] = None
     visual_result: Optional[VisualResult] = None
+    visual_qc_result: Optional[VisualQCResult] = None
+    # The VisualResult Video Assembly actually consumes: visual_result
+    # (above) is never overwritten/silently replaced - it stays exactly
+    # what VisualMediaService produced, pre-QC - so this field is always
+    # populated separately once Visual QC completes acceptably, and it's
+    # the only one that may differ from visual_result (when QC replaced a
+    # weak/misleading asset).
+    qc_approved_visual_result: Optional[VisualResult] = None
     video_assembly_result: Optional[VideoAssemblyResult] = None
-    # pending -> researching -> researched -> scripted -> voiced -> visualized -> completed -> failed
+    # pending -> researching -> researched -> scripted -> voiced ->
+    # visualized -> qc_passed -> completed -> failed
     status: str = "pending"
     error: Optional[str] = None
 
@@ -60,27 +75,32 @@ def build_pipeline_graph(
     voice_name: str,
     media_provider: MediaProvider,
     assembler: VideoAssembler,
+    visual_relevance_evaluator: VisualRelevanceEvaluator,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
-    -> Visual Media -> Video Assembly.
+    -> Visual Media -> Visual QC -> Video Assembly.
 
     Reuses the existing ResearchAgent, ScriptAgent, VoiceService,
-    VisualMediaService, and VideoAssemblyService as-is (no duplicated
-    business logic, no reimplemented FFmpeg calls); this graph only wires
-    their existing async interfaces together and shares one PipelineState
-    across all five. VoiceService, VisualMediaService, and
+    VisualMediaService, VisualQCService, and VideoAssemblyService as-is (no
+    duplicated business logic, no reimplemented FFmpeg calls, no
+    re-implemented QC evaluation/replacement); this graph only wires their
+    existing async interfaces together and shares one PipelineState across
+    all six. VoiceService, VisualMediaService, VisualQCService, and
     VideoAssemblyService all remain deterministic services here - each is
-    invoked directly, not treated as a reasoning agent. VideoAssemblyService
-    receives the exact ScriptResult/VoiceResult/VisualResult already
-    produced earlier in this same run - nothing is regenerated or re-downloaded.
+    invoked directly, not treated as a reasoning agent (semantic judgment
+    stays inside VisualContextPlanner/VisualQCService's injected
+    evaluator). VideoAssemblyService receives the exact
+    ScriptResult/VoiceResult already produced earlier in this same run,
+    and the post-QC ``qc_approved_visual_result`` (never the raw,
+    pre-QC ``visual_result``) - nothing is regenerated or re-downloaded.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ video_assembly → END
-                    │                  │               │              │
-                    └──────(error)─────┴──────(error)───┴───(error)────┴──────(error)──→ END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly → END
+                    │                  │               │              │                │
+                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)──→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
@@ -88,7 +108,10 @@ def build_pipeline_graph(
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
-        assembler: VideoAssembler implementation for the Video Assembly Service
+        assembler: VideoAssembler implementation, shared by Visual QC (frame
+            extraction/probing) and the Video Assembly Service (encoding)
+        visual_relevance_evaluator: VisualRelevanceEvaluator implementation
+            for the Visual QC Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
@@ -108,6 +131,13 @@ def build_pipeline_graph(
     visual_planner = VisualContextPlanner(llm_provider=llm_provider)
     visual_service = VisualMediaService(
         media_provider=media_provider, visual_planner=visual_planner, output_dir=media_output_dir
+    )
+    # visual_media_service=visual_service lets Visual QC request bounded
+    # replacements through VisualMediaService's own existing selection
+    # logic (see visual_qc_node) - VisualQCService never re-implements
+    # candidate search itself.
+    visual_qc_service = VisualQCService(
+        evaluator=visual_relevance_evaluator, assembler=assembler, visual_media_service=visual_service
     )
     video_service = VideoAssemblyService(assembler=assembler, output_dir=video_output_dir)
 
@@ -172,15 +202,23 @@ def build_pipeline_graph(
             narration_duration = (
                 state.voice_result.duration_seconds or state.script_result.estimated_duration_seconds
             )
-            result = await visual_service.generate_visuals(state.script_result, narration_duration)
+            # Built once and threaded through (via visual_plan=) so Visual
+            # QC can reuse the exact same plan later - one Gemini planning
+            # call per run, never a second one for QC.
+            plan = visual_service.build_plan(state.script_result)
+            result = await visual_service.generate_visuals(
+                state.script_result, narration_duration, visual_plan=plan
+            )
         except VisualMediaServiceError as e:
             return {
+                "visual_plan": None,
                 "visual_result": None,
                 "status": "failed",
                 "error": f"Visual media generation failed: {e}",
             }
         except Exception as e:
             return {
+                "visual_plan": None,
                 "visual_result": None,
                 "status": "failed",
                 "error": f"Unexpected visual media error: {e}",
@@ -191,20 +229,81 @@ def build_pipeline_graph(
             # it reports them in VisualResult.error instead. Surface that in
             # pipeline state (and keep the VisualResult itself for inspection).
             return {
+                "visual_plan": plan,
                 "visual_result": result,
                 "status": "failed",
                 "error": f"Visual media generation failed: {result.error}",
             }
 
-        return {"visual_result": result, "status": "visualized", "error": None}
+        return {"visual_plan": plan, "visual_result": result, "status": "visualized", "error": None}
+
+    async def visual_qc_node(state: PipelineState) -> dict:
+        try:
+            # The exact VisualPlan/VisualResult already produced by the
+            # media stage are passed straight through - nothing is
+            # re-planned or re-selected except bounded, QC-driven
+            # replacements (via VisualMediaService.acquire_replacement_asset,
+            # VisualQCService's own existing mechanism - not duplicated here).
+            qc_result, qc_visual_result = await visual_qc_service.run_qc(
+                state.topic, state.script_result, state.visual_plan, state.visual_result
+            )
+        except VisualQCServiceError as e:
+            return {
+                "visual_qc_result": None,
+                "qc_approved_visual_result": None,
+                "status": "failed",
+                "error": f"Visual QC failed: {e}",
+            }
+        except Exception as e:
+            return {
+                "visual_qc_result": None,
+                "qc_approved_visual_result": None,
+                "status": "failed",
+                "error": f"Unexpected visual QC error: {e}",
+            }
+
+        if not qc_result.success:
+            # VisualQCService itself couldn't run (e.g. it was handed an
+            # already-unsuccessful VisualResult) - surfaced in
+            # VisualQCResult.error. Keep both results for inspection.
+            return {
+                "visual_qc_result": qc_result,
+                "qc_approved_visual_result": qc_visual_result,
+                "status": "failed",
+                "error": f"Visual QC failed: {qc_result.error}",
+            }
+
+        if qc_result.rejected_count > 0:
+            # At least one asset is still flagged misleading/conflicting
+            # after bounded replacement was exhausted - required media
+            # could not be safely approved or replaced. Stop before Video
+            # Assembly rather than risk a misleading clip reaching the
+            # final video; earlier-stage results are preserved below.
+            return {
+                "visual_qc_result": qc_result,
+                "qc_approved_visual_result": qc_visual_result,
+                "status": "failed",
+                "error": (
+                    f"Visual QC rejected {qc_result.rejected_count} asset(s) as misleading "
+                    "with no safe replacement available"
+                ),
+            }
+
+        return {
+            "visual_qc_result": qc_result,
+            "qc_approved_visual_result": qc_visual_result,
+            "status": "qc_passed",
+            "error": None,
+        }
 
     async def video_assembly_node(state: PipelineState) -> dict:
         try:
-            # The exact ScriptResult/VoiceResult/VisualResult already
-            # produced earlier in this run are passed straight through -
-            # nothing is regenerated, re-synthesized, or re-downloaded.
+            # ScriptResult/VoiceResult already produced earlier in this run
+            # are passed straight through, and Video Assembly consumes the
+            # post-QC qc_approved_visual_result (never the raw visual_result)
+            # - nothing is regenerated, re-synthesized, or re-downloaded.
             result = await video_service.assemble_video(
-                state.script_result, state.voice_result, state.visual_result
+                state.script_result, state.voice_result, state.qc_approved_visual_result
             )
         except VideoAssemblyServiceError as e:
             return {
@@ -245,26 +344,34 @@ def build_pipeline_graph(
         return "media" if state.voice_result is not None and state.voice_result.success else END
 
     def route_after_media(state: PipelineState) -> str:
-        """Only proceed to video assembly if visual media actually succeeded."""
+        """Only proceed to Visual QC if visual media actually succeeded."""
         return (
-            "video_assembly"
+            "visual_qc"
             if state.visual_result is not None and state.visual_result.success
             else END
         )
+
+    def route_after_visual_qc(state: PipelineState) -> str:
+        """Only proceed to video assembly once Visual QC has approved (or
+        safely replaced) every section's media - never after a hard QC
+        failure (see visual_qc_node's rejected_count policy above)."""
+        return "video_assembly" if state.status == "qc_passed" else END
 
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
     graph.add_node("voice", voice_node)
     graph.add_node("media", media_node)
+    graph.add_node("visual_qc", visual_qc_node)
     graph.add_node("video_assembly", video_assembly_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
     graph.add_conditional_edges("script", route_after_script, {"voice": "voice", END: END})
     graph.add_conditional_edges("voice", route_after_voice, {"media": "media", END: END})
+    graph.add_conditional_edges("media", route_after_media, {"visual_qc": "visual_qc", END: END})
     graph.add_conditional_edges(
-        "media", route_after_media, {"video_assembly": "video_assembly", END: END}
+        "visual_qc", route_after_visual_qc, {"video_assembly": "video_assembly", END: END}
     )
     graph.set_finish_point("video_assembly")
 
@@ -279,24 +386,29 @@ async def run_pipeline(
     voice_name: str,
     media_provider: MediaProvider,
     assembler: VideoAssembler,
+    visual_relevance_evaluator: VisualRelevanceEvaluator,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
 ) -> PipelineState:
-    """Run the full Research -> Script -> Voice -> Visual Media -> Video
-    Assembly pipeline and return the final state.
+    """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
+    -> Video Assembly pipeline and return the final state.
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
     can inspect ``status``/``error`` directly, including on partial failure
-    (e.g. research, scripting, voice, and visual media all succeeded but
-    video assembly failed).
+    (e.g. research, scripting, voice, visual media, and visual QC all
+    succeeded but video assembly failed).
 
     Each stage only runs if the previous one succeeded - a failure at any
     stage short-circuits the rest of the pipeline and it never silently
     continues (see route_after_research/route_after_script/route_after_voice/
-    route_after_media). Pipeline status only becomes "completed" once video
-    assembly itself succeeds and a real final MP4 exists.
+    route_after_media/route_after_visual_qc). Visual QC itself fails the
+    pipeline (status "failed", Video Assembly never runs) if any asset is
+    still flagged misleading/conflicting after bounded replacement is
+    exhausted - see visual_qc_node. Pipeline status only becomes "completed"
+    once video assembly itself succeeds (consuming the post-QC approved
+    media) and a real final MP4 exists.
 
     Args:
         topic: Research topic to investigate, script, narrate, illustrate, and assemble
@@ -305,7 +417,10 @@ async def run_pipeline(
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
-        assembler: VideoAssembler implementation for the Video Assembly Service
+        assembler: VideoAssembler implementation, shared by Visual QC and
+            the Video Assembly Service
+        visual_relevance_evaluator: VisualRelevanceEvaluator implementation
+            for the Visual QC Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
@@ -320,6 +435,7 @@ async def run_pipeline(
         voice_name,
         media_provider,
         assembler,
+        visual_relevance_evaluator,
         voice_output_dir,
         media_output_dir,
         video_output_dir,
@@ -333,7 +449,10 @@ async def run_pipeline(
         research_result=raw_result.get("research_result"),
         script_result=raw_result.get("script_result"),
         voice_result=raw_result.get("voice_result"),
+        visual_plan=raw_result.get("visual_plan"),
         visual_result=raw_result.get("visual_result"),
+        visual_qc_result=raw_result.get("visual_qc_result"),
+        qc_approved_visual_result=raw_result.get("qc_approved_visual_result"),
         video_assembly_result=raw_result.get("video_assembly_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),

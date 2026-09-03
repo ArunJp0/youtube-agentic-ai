@@ -138,24 +138,36 @@
 - `VideoAssemblyService` was not modified - Visual QC logic lives entirely in the new `VisualQCService`, never inside video assembly
 - 503/503 tests passing (mocked evaluator/assembler/replacement-provider throughout - no real Gemini or FFmpeg calls in the automated suite), covering QC model validation, frame-sampling timestamp selection, all four relevance-decision tiers, bounded replacement (including exhaustion and rejected-id exclusion), vision-vs-metadata-fallback distinction, repetition detection, section/asset ordering, and non-mutation of the original `VisualResult`
 - Real standalone run validated via `python -m src.visual_qc_demo "Why do humans dream?"`: real visual planning + real Pexels media (11 assets across 5 sections), then real Gemini vision QC - 5 vision calls (one per section), 10 assets highly relevant, 1 neutral/acceptable, 0 warnings, 0 rejected, 0 replacements needed, real Gemini vision succeeded for every section (metadata fallback never triggered)
-- Standalone Visual QC milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/visual_qc_demo.py` is a separate standalone runner for this milestone
+- Standalone Visual QC milestone marked **COMPLETE**
+- Visual QC Pipeline Integration implemented: `VisualQCService` is now wired into the main LangGraph pipeline as a `visual_qc` node, running after Visual Media succeeds and before Video Assembly - the current working orchestration is Topic → Research Agent → Script Agent → Voice Service → Visual Context Planner → Duration-Aware Visual Media Service → Visual QC → Video Assembly Service → Final MP4
+- `PipelineState` extended with `visual_plan` (the plan Visual Media built, reused by QC so it never triggers a second LLM planning call), `visual_qc_result` (the structured `VisualQCResult`), and `qc_approved_visual_result` (the post-QC media mapping) - the original `visual_result` field is preserved unchanged, never silently overwritten, so both the pre-QC and post-QC media are inspectable in the final state
+- Video Assembly now consumes `qc_approved_visual_result` exclusively - the raw, pre-QC `visual_result` never reaches `VideoAssemblyService`
+- Hard QC failure policy added at the pipeline level (not inside `VisualQCService`, which is reused unchanged): if any asset is still flagged misleading/conflicting after Visual QC's own bounded replacement is exhausted (`rejected_count > 0`), the pipeline stops before Video Assembly with status `failed`, preserving every earlier stage's results for inspection - Video Assembly never runs on rejected media
+- A vision-evaluator outage (metadata-fallback approval) does not fail the pipeline - QC falls back to the upstream metadata filter's prior approval and the pipeline continues to completion, with the fallback explicitly recorded on `VisualQCResult.fallback_used`/`fallback_reason`
+- Pipeline demo progress output updated to 6 top-level stages (`[1/6] Research` … `[6/6] Video Assembly`); the Visual Context Planner remains an internal part of the Visual Media stage rather than its own top-level stage, since it isn't separately observable from outside `VisualMediaService`
+- 512/512 tests passing (mocked evaluator/assembler throughout - no real Gemini, Pexels, or FFmpeg calls in the automated suite), covering the full 6-stage success path, `VisualQCResult`/`qc_approved_visual_result` stored in final state, Video Assembly receiving only QC-approved media, QC-driven replacement changing what reaches Video Assembly, Visual QC not running after any earlier-stage failure, hard-QC-failure blocking Video Assembly, metadata-fallback approval continuing the pipeline safely, and earlier-stage results preserved after a QC failure
+- Real end-to-end run validated in one command (`python -m src.pipeline_demo "Why do humans dream?"`): all 6 stages completed successfully; Visual QC checked 20 assets across 5 sections using real Gemini vision - 18 vision-approved, 2 neutral/acceptable, 0 warnings, 0 final rejected, 3 weak/unverifiable assets successfully replaced via bounded replacement, 8 total vision calls, metadata fallback not needed; Video Assembly consumed the post-QC approved media and produced a final MP4 (167.0s, 1920x1080 @ 30fps)
+- Final MP4 manually reviewed: approximately 80-90% of visuals judged semantically relevant, a small amount of visual repetition and 1-2 slightly weak visuals remained (judged acceptable for the current MVP), no black-screen, narration, or assembly issues observed
+- (Operational note, not a pipeline issue: a transient Claude Code/API DNS "ENOTFOUND" message appeared in the assistant's own tooling after the run had already completed successfully - it did not affect the completed pipeline run or the generated MP4)
+- Visual QC Pipeline Integration milestone marked **COMPLETE**
+- The visual pipeline (Visual Context Planner → Duration-Aware Visual Media → Visual QC → Video Assembly) is considered feature-complete for the current MVP; further optimization of visual selection/QC is not planned unless a new concrete problem is identified
 
 ## Known Limitations
 
 - Semantic relevance now depends on the quality of the LLM's contextual understanding (when the planner succeeds) or on deterministic keyword/concept mapping (when it falls back) combined with what stock footage Pexels actually has for a given query. The deterministic fallback path still has no contextual understanding of ambiguous wording - it exists only as a safe, previously-validated degradation path, not a semantic solution in its own right.
-- Visual QC now inspects actual frame content (not just text metadata), but only as a standalone capability - the main pipeline still assembles video from `VisualMediaService`'s output without QC in between until the next milestone integrates it.
+- Visual QC inspects actual frame content (not just text metadata) and now runs inside the main pipeline, but it samples a small, fixed number of representative frames rather than every frame - a clip that changes content between sampled frames could still be judged on an unrepresentative moment.
 - A QC-driven replacement re-evaluation is an additional vision call per attempt (bounded by `max_replacement_attempts`, not free).
-- Frame sampling inspects a small, fixed number of representative timestamps, not full scene detection - a clip that changes content between sampled frames could still be judged on an unrepresentative moment.
-- Repetition checking remains asset-ID/position based only, not frame-level computer-vision duplicate detection.
+- Repetition checking remains asset-ID/position based only, not frame-level computer-vision duplicate detection - controlled visual reuse may still occur.
+- Perfect semantic stock-footage matching is not guaranteed: Pexels' inventory for a given query is finite, so even with duration-aware planning, semantic filtering, and vision QC, an occasional visual can still be only loosely related to its section - real review found this acceptable (~80-90% relevance) for the current MVP, not eliminated.
 - For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.
 
 ## Current Next Milestone
 
-Integrate Visual QC into the main orchestration, between Visual Media and Video Assembly:
+Subtitle / Caption Service:
 
 ```
-Topic → Research → Script → Voice → Visual Context Planner → Visual Media Service
-      → Visual QC → Video Assembly → Final MP4
+Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
+      → Subtitle/Caption processing → Final MP4
 ```
 
-Not yet started, in no particular priority order: subtitles/captions, background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets (`output/audio/`, `output/media/`).
+Not yet started, in no particular priority order: background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets (`output/audio/`, `output/media/`).
