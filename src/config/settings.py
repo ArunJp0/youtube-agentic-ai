@@ -31,6 +31,12 @@ class Settings:
     media_provider: str = field(default_factory=lambda: os.environ.get("MEDIA_PROVIDER", "mock"))
     pexels_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("PEXELS_API_KEY") or None)
 
+    # Transcription Provider (for captions): "mock" or "whisper"
+    transcription_provider: str = field(
+        default_factory=lambda: os.environ.get("TRANSCRIPTION_PROVIDER", "mock")
+    )
+    whisper_model_size: str = field(default_factory=lambda: os.environ.get("WHISPER_MODEL_SIZE", "base"))
+
     # Gemini
     gemini_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY") or None)
     gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"))

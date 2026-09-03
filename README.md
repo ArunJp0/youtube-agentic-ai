@@ -63,7 +63,9 @@ All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo 
 
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 
-Subtitles/captions, background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. Subtitle/Caption processing (after Video Assembly) is the next planned milestone.
+A **Subtitle/Caption Service** has been implemented and validated standalone (`CaptionService`, `src/caption_demo.py`): it transcribes the real narration audio locally (Whisper via `faster-whisper` - free, no paid API) to get actual spoken-word timestamps (never estimated from script section durations), builds readable YouTube-style captions, writes an `.srt` file, and burns captions into a **copy** of the assembled MP4 (`output/video/<name>-captioned.mp4`) - the original MP4 is never overwritten. It is **not yet wired into the main pipeline** above; integrating it as a stage after Video Assembly is the next planned milestone.
+
+Background music/audio mixing, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet.
 
 ## Project Structure
 

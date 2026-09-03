@@ -101,12 +101,48 @@ class VideoAssembler(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def burn_subtitles(
+        self,
+        input_video_path: str,
+        srt_path: str,
+        output_path: str,
+        force_style: Optional[str] = None,
+    ) -> None:
+        """Hardcode (burn) subtitles from an .srt file into a copy of a video.
+
+        Re-encodes video (subtitles can't be burned via stream copy); the
+        audio track is copied unchanged. ``input_video_path`` is never
+        modified - the captioned result is always written to a separate
+        ``output_path``.
+
+        Args:
+            input_video_path: Source MP4 to caption
+            srt_path: Subtitle file to burn in
+            output_path: Local filesystem path for the captioned copy
+            force_style: Optional ASS ``force_style`` override string
+                (font/size/color/margins/etc.) for the subtitles filter -
+                styling policy belongs to the caller (CaptionService), not
+                this tool layer.
+        """
+        raise NotImplementedError
+
 
 def _require_binary(name: str) -> str:
     path = shutil.which(name)
     if path is None:
         raise VideoAssemblerError(_WINDOWS_INSTALL_HINT)
     return path
+
+
+def _escape_subtitles_filter_path(path: str) -> str:
+    """Escape a filesystem path for use inside FFmpeg's ``subtitles=`` filter.
+
+    FFmpeg's filtergraph parser treats ``:`` as an option separator, so a
+    Windows drive letter (``C:\\...``) breaks the filter unless escaped.
+    Forward slashes avoid a second layer of backslash-escaping.
+    """
+    return path.replace("\\", "/").replace(":", "\\:")
 
 
 class FFmpegVideoAssembler(VideoAssembler):
@@ -251,6 +287,28 @@ class FFmpegVideoAssembler(VideoAssembler):
             self._run(command)
             frame_paths.append(output_path)
         return frame_paths
+
+    def burn_subtitles(
+        self,
+        input_video_path: str,
+        srt_path: str,
+        output_path: str,
+        force_style: Optional[str] = None,
+    ) -> None:
+        subtitles_filter = f"subtitles='{_escape_subtitles_filter_path(srt_path)}'"
+        if force_style:
+            subtitles_filter += f":force_style='{force_style}'"
+
+        command = [
+            self.ffmpeg_path, "-y",
+            "-i", input_video_path,
+            "-vf", subtitles_filter,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            output_path,
+        ]
+        self._run(command)
 
     def _run(self, command: List[str]) -> subprocess.CompletedProcess:
         try:

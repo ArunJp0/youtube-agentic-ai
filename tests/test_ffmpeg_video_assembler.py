@@ -7,7 +7,11 @@ import subprocess
 
 import pytest
 
-from src.tools.ffmpeg_video_assembler import FFmpegVideoAssembler, VideoAssemblerError
+from src.tools.ffmpeg_video_assembler import (
+    FFmpegVideoAssembler,
+    VideoAssemblerError,
+    _escape_subtitles_filter_path,
+)
 
 
 class FakeCompletedProcess:
@@ -247,6 +251,82 @@ class TestFFmpegVideoAssemblerExtractFrames:
         )
         with pytest.raises(VideoAssemblerError, match="bad frame"):
             assembler.extract_frames("in.mp4", [1.0], str(tmp_path), "frame")
+
+
+class TestEscapeSubtitlesFilterPath:
+    def test_windows_drive_colon_escaped(self) -> None:
+        assert _escape_subtitles_filter_path("C:\\videos\\subs.srt") == "C\\:/videos/subs.srt"
+
+    def test_backslashes_converted_to_forward_slashes(self) -> None:
+        assert "\\" not in _escape_subtitles_filter_path("a\\b\\c.srt").replace("\\:", "")
+
+    def test_path_without_special_characters_unchanged(self) -> None:
+        assert _escape_subtitles_filter_path("output/subtitles/video.srt") == "output/subtitles/video.srt"
+
+
+class TestFFmpegVideoAssemblerBurnSubtitles:
+    def test_command_shape(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.burn_subtitles("in.mp4", "subs.srt", "out.mp4", force_style="FontName=Arial")
+
+        cmd = captured["cmd"]
+        assert "-i" in cmd and "in.mp4" in cmd
+        assert cmd[-1] == "out.mp4"
+        vf_value = cmd[cmd.index("-vf") + 1]
+        assert vf_value.startswith("subtitles='subs.srt'")
+        assert "force_style='FontName=Arial'" in vf_value
+        assert "-c:a" in cmd and "copy" in cmd
+        assert "libx264" in cmd
+
+    def test_no_force_style_omits_style_argument(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.burn_subtitles("in.mp4", "subs.srt", "out.mp4")
+
+        vf_value = captured["cmd"][captured["cmd"].index("-vf") + 1]
+        assert "force_style" not in vf_value
+
+    def test_windows_path_is_escaped_in_filter(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.burn_subtitles("in.mp4", "C:\\output\\subtitles\\video.srt", "out.mp4")
+
+        vf_value = captured["cmd"][captured["cmd"].index("-vf") + 1]
+        assert "C\\:/output/subtitles/video.srt" in vf_value
+
+    def test_ffmpeg_failure_raises_video_assembler_error(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: FakeCompletedProcess(returncode=1, stderr="bad subtitle filter")
+        )
+        with pytest.raises(VideoAssemblerError, match="bad subtitle filter"):
+            assembler.burn_subtitles("in.mp4", "subs.srt", "out.mp4")
 
 
 class TestFFmpegVideoAssemblerErrorHandling:

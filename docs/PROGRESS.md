@@ -151,6 +151,17 @@
 - (Operational note, not a pipeline issue: a transient Claude Code/API DNS "ENOTFOUND" message appeared in the assistant's own tooling after the run had already completed successfully - it did not affect the completed pipeline run or the generated MP4)
 - Visual QC Pipeline Integration milestone marked **COMPLETE**
 - The visual pipeline (Visual Context Planner → Duration-Aware Visual Media → Visual QC → Video Assembly) is considered feature-complete for the current MVP; further optimization of visual selection/QC is not planned unless a new concrete problem is identified
+- Standalone Subtitle/Caption Service implemented: `CaptionService` transcribes the real narration audio (never estimates timing from script section durations) and burns synchronized, readable subtitles into a copy of the already-assembled MP4
+- A new `TranscriptionProvider` abstraction (`src/tools/transcription_provider.py`) keeps captioning provider-agnostic, with a `MockTranscriptionProvider` for tests and a real `WhisperTranscriptionProvider` backed by `faster-whisper` running fully locally (CTranslate2-based, no PyTorch dependency, no paid API, model weights downloaded once and cached) - default model size `base`, configurable via `TRANSCRIPTION_PROVIDER`/`WHISPER_MODEL_SIZE`
+- Deterministic (non-LLM) caption segmentation (`src/services/caption_segmentation.py`) turns raw transcribed segments into professional, YouTube-style captions: split at sentence/word boundaries to roughly 1-2 lines of ≤42 characters, timestamps normalized to be monotonic and non-overlapping, minimum/maximum/reading-speed-driven display duration enforced, clamped to the real narration/video duration within a small tolerance
+- SRT generation (`src/services/srt_writer.py`) and subtitle burning are kept as separate concerns from transcription/segmentation; subtitle rendering reuses the existing FFmpeg infrastructure via a new `VideoAssembler.burn_subtitles` method (added to the same interface `VideoAssemblyService` and Visual QC already use) - no second video-processing stack
+- Captions are burned into a **copy** of the assembled MP4 (`output/video/<name>-captioned.mp4`); the original non-captioned MP4 is never overwritten or modified
+- Professional basic subtitle styling applied (readable sans-serif, white text with a black outline/shadow for contrast, bottom-center with a safe margin, no flashy animations) via a centralized default ASS style string, not scattered per-call styling
+- Generated `.srt` files are stored under `output/subtitles/`; all caption output artifacts remain Git-ignored under the project's existing `output/` policy
+- 618/618 tests passing (mocked transcription provider/assembler throughout - no real Whisper model, network, or FFmpeg process in the automated suite), covering caption model validation, timestamp ordering/overlap resolution, empty-transcription handling, sentence/word-level readable segmentation, punctuation cleaning, SRT formatting/special characters, missing-audio/missing-video/transcription-failure/rendering-failure handling, original-video-preservation, and deterministic segmentation behavior
+- Real standalone run validated via `python -m src.caption_demo` against the existing narration MP3 and assembled MP4 from a prior real pipeline run (Research/Script/Voice/Visual Media/Visual QC were **not** re-run): real Whisper (`base`) transcription produced 44 caption segments; captioned MP4 duration (166.968s) matched the original exactly; resolution/fps/codecs (1920x1080 @30fps, h264/aac) unchanged; the original MP4's file modification time confirmed it was untouched
+- Manual review confirmed subtitle synchronization with the spoken narration and overall readability were satisfactory
+- Standalone Subtitle/Caption Service milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/caption_demo.py` is a separate standalone runner for this milestone
 
 ## Known Limitations
 
@@ -160,14 +171,16 @@
 - Repetition checking remains asset-ID/position based only, not frame-level computer-vision duplicate detection - controlled visual reuse may still occur.
 - Perfect semantic stock-footage matching is not guaranteed: Pexels' inventory for a given query is finite, so even with duration-aware planning, semantic filtering, and vision QC, an occasional visual can still be only loosely related to its section - real review found this acceptable (~80-90% relevance) for the current MVP, not eliminated.
 - For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.
+- The Subtitle/Caption Service is implemented and validated but is **standalone only** - the main pipeline's final output (`python -m src.pipeline_demo`) does not currently include captions.
+- Background music / audio mixing is not implemented yet - captioning does not touch or introduce any audio track beyond copying the existing narration audio through unchanged.
 
 ## Current Next Milestone
 
-Subtitle / Caption Service:
+Integrate the Subtitle/Caption Service into the main orchestration, after Video Assembly:
 
 ```
-Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
-      → Subtitle/Caption processing → Final MP4
+Topic → Research → Script → Voice → Visual Context Planner → Visual Media → Visual QC
+      → Video Assembly → Subtitle/Caption Service → Captioned Final MP4
 ```
 
 Not yet started, in no particular priority order: background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets (`output/audio/`, `output/media/`).

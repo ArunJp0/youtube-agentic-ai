@@ -332,3 +332,50 @@ When the vision evaluator fails for a section (e.g. a Gemini outage), `VisualQCS
 - Repetition checking remains asset-ID/position based, not frame-level computer-vision duplicate detection - controlled visual reuse may still occur in longer videos.
 - For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.
 - The visual pipeline (planning → selection → QC → assembly) is considered complete for the current MVP; it is not planned to be further over-optimized without a new concrete problem to justify it.
+
+## Captions are timed from the real narration audio, never estimated from script section durations
+
+Script sections carry a deterministic `estimated_duration_seconds` (word-count-based), but that estimate is a planning input for visual slot counts - it is not accurate enough for subtitle sync, where even small drift is visibly wrong. `CaptionService` instead transcribes the actual generated narration MP3 (`VoiceResult.audio_file_path`) with real timestamps, so every caption's start/end reflects what was actually spoken and when, not a word-count projection.
+
+## Caption Service is a new standalone service, consuming VoiceResult/VideoAssemblyResult - not folded into Voice or Video Assembly
+
+Captioning is a distinct responsibility from narration synthesis (`VoiceService`) or visual assembly (`VideoAssemblyService`): it only needs their already-produced outputs (the narration audio file and the assembled MP4), not their internals. `CaptionService` (`src/services/caption_service.py`) was added as its own service consuming `VoiceResult`/`VideoAssemblyResult`, mirroring how `VisualQCService` consumes earlier stages' outputs without those stages gaining new logic. `VoiceService` and `VideoAssemblyService` were not modified.
+
+## faster-whisper chosen for local transcription: no PyTorch, no paid API
+
+The reference `openai-whisper` package pulls in PyTorch - a multi-GB install for what is otherwise a small local inference task. `faster-whisper` (CTranslate2-backed) does the same Whisper-model transcription with no PyTorch dependency (~90MB installed), supports CPU inference with int8 quantization out of the box, is actively maintained, and provides word-level timestamps. Model weights download once from Hugging Face and are cached locally - fully free, no per-request cost, consistent with "no paid API dependency for this MVP if local transcription works." The `base` model size is the default (configurable via `WHISPER_MODEL_SIZE`): narration audio is clean, single-speaker TTS output, not noisy real-world audio, so a larger model was judged unnecessary for this MVP.
+
+## TranscriptionProvider is a new abstraction, synchronous like LLMProvider - not folded into VoiceProvider
+
+Transcription is local CPU-bound inference, not network I/O, so `TranscriptionProvider.transcribe(audio_path) -> List[TranscribedSegment]` (`src/tools/transcription_provider.py`) is a plain synchronous method - mirroring `LLMProvider.generate_text`, not the async `VoiceProvider`/`MediaProvider` interfaces that wrap real async I/O. `CaptionService.generate_captions` itself stays async (matching every other service in this project, for eventual pipeline consistency) and simply calls the synchronous `transcribe()` as one blocking step, the same way `VisualContextPlanner.plan_visuals` (also synchronous) is already called from async pipeline code.
+
+## Caption readability segmentation is deterministic and separate from SRT formatting
+
+`src/services/caption_segmentation.py` turns raw transcribed segments into screen-ready captions using fixed rules only - no LLM call: split at sentence boundaries (or by word-level timestamps when available) when a segment exceeds `MAX_CHARS_PER_SEGMENT`, greedy word-wrap without ever breaking a word, minimum/maximum/reading-speed-driven duration bounds, and monotonic non-overlapping timestamps clamped to the real narration/video duration within `DURATION_TOLERANCE_SECONDS`. All thresholds are named module-level constants, not scattered magic numbers. SRT formatting itself (`src/services/srt_writer.py`) is a separate, even simpler module - it only knows how to render already-finalized `CaptionSegment`s as valid SRT text (always renumbering sequentially from list order, never trusting a stored index), so a future alternate subtitle format could be added without touching segmentation logic.
+
+## Word-level timestamps are preserved in the data model but not used for word-by-word captions yet
+
+`TranscribedWord`/`TranscribedSegment.words` carry word-level timing from Whisper when available, and caption segmentation uses them internally (to split a long segment at accurate word boundaries rather than only proportionally by character count). Karaoke/word-by-word caption rendering was explicitly out of scope for this milestone - the data is preserved for a possible future enhancement, but `CaptionSegment` (the rendered/burned unit) is always phrase/sentence-level.
+
+## Line-length limit takes priority over the 1-2 line-count target in a rare edge case
+
+Caption text is wrapped to ~2 lines of ≤42 characters via greedy word-wrapping. For the overwhelming majority of real narration (which has normal sentence punctuation), this reliably produces at most 2 lines. In the rare case of a very long run of words with no punctuation and unlucky word-length alignment, wrapping can need a third line; rather than forcibly merging the overflow into one over-long line to preserve a hard 2-line cap, the implementation allows the extra line - never exceeding the per-line character limit (the harder readability requirement: "avoid excessively long lines") takes priority over the softer "approximately 1-2 lines" target.
+
+## Subtitle burning extends the existing VideoAssembler interface, not a second FFmpeg wrapper
+
+Burning (hardcoding) subtitles into a video is FFmpeg work, and the project already has one thin FFmpeg wrapper (`VideoAssembler`/`FFmpegVideoAssembler`) with binary discovery, subprocess handling, and error types - reusing it (a new `burn_subtitles` method, following the same precedent as Visual QC's earlier `extract_frames` addition) avoids a second video-processing stack. `FFmpegVideoAssembler` stays styling-agnostic - it just runs the `subtitles` filter with whatever `force_style` string it's given; `CaptionService` owns the actual default styling (font, size, colors, margins, alignment) as centralized constants, keeping semantic/presentation decisions in the service layer and mechanical FFmpeg invocation in the tool layer.
+
+## Subtitles are always burned into a copy; the original assembled MP4 is never overwritten
+
+`CaptionService` derives the captioned output path as a sibling file (`<name>-captioned.mp4`) next to the original, and `FFmpegVideoAssembler.burn_subtitles` always writes to a new `output_path`, never in place. Every failure path (missing audio/video, transcription failure, empty segments, SRT-write failure, FFmpeg failure) returns a structured `CaptionResult(success=False, error=...)` before any write to the captioned path is attempted, so the original video is provably untouched on both success and failure - verified in tests and in the real validation run (original file's modification time and byte content unchanged after captioning).
+
+## Standalone-first: Caption Service is not yet wired into the main LangGraph pipeline
+
+Consistent with how Visual QC was validated standalone before integration, this milestone stops short of touching `src/workflows/pipeline_graph.py`. `src/caption_demo.py` is a separate standalone runner that auto-discovers the most recently generated narration MP3 and assembled MP4 under `output/audio/`/`output/video/` (skipping already-captioned copies) rather than requiring Research/Script/Voice/Visual Media/Visual QC to run again just to validate captioning. Wiring `CaptionService` in as a stage after Video Assembly is the next planned milestone.
+
+## Known limitations
+
+- The Subtitle/Caption Service is implemented and validated but not yet integrated into the main pipeline - `pipeline_demo.py`'s end-to-end run does not currently produce a captioned MP4.
+- Background music / audio mixing is not implemented - captioning only copies the existing audio track through unchanged (`-c:a copy`), it does not add, mix, or modify any audio.
+- Whisper transcription accuracy depends on the TTS narration's clarity; it has not been validated against noisy or multi-speaker audio, which this pipeline does not produce.
+- The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts (observed once in real validation: a stray space before a hyphen) - cosmetic, not a correctness issue for caption sync or meaning.

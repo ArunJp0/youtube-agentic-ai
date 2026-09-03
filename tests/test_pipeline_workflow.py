@@ -132,6 +132,9 @@ class FakeVideoAssembler(VideoAssembler):
             paths.append(path)
         return paths
 
+    def burn_subtitles(self, input_video_path, srt_path, output_path, force_style=None):
+        raise NotImplementedError("not exercised by pipeline workflow tests")
+
 
 class ExplodingVisualRelevanceEvaluator(VisualRelevanceEvaluator):
     """Test double: evaluate_section always raises, to simulate a Gemini

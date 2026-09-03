@@ -60,6 +60,9 @@ class FakeVideoAssembler(VideoAssembler):
     def extract_frames(self, input_path, timestamps_seconds, output_dir, basename):
         raise NotImplementedError("not exercised by VideoAssemblyService tests")
 
+    def burn_subtitles(self, input_video_path, srt_path, output_path, force_style=None):
+        raise NotImplementedError("not exercised by VideoAssemblyService tests")
+
 
 def _sample_script(**overrides) -> ScriptResult:
     defaults = dict(

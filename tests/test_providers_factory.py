@@ -9,12 +9,14 @@ from src.config.providers import (
     get_llm_provider,
     get_media_provider,
     get_search_provider,
+    get_transcription_provider,
     get_voice_provider,
 )
 from src.config.settings import Settings
 from src.llm.mock import MockLLMProvider
 from src.tools.media_provider import MockMediaProvider
 from src.tools.search_provider import MockSearchProvider
+from src.tools.transcription_provider import MockTranscriptionProvider
 from src.tools.voice_provider import MockVoiceProvider
 
 
@@ -151,3 +153,35 @@ class TestGetMediaProvider:
         monkeypatch.setenv("MEDIA_PROVIDER", "mock")
         provider = get_media_provider()
         assert isinstance(provider, MockMediaProvider)
+
+
+class TestGetTranscriptionProvider:
+    """Tests for transcription provider selection."""
+
+    def test_mock_provider_selected(self) -> None:
+        settings = Settings(transcription_provider="mock")
+        provider = get_transcription_provider(settings)
+        assert isinstance(provider, MockTranscriptionProvider)
+
+    def test_mock_provider_case_insensitive(self) -> None:
+        settings = Settings(transcription_provider="MOCK")
+        provider = get_transcription_provider(settings)
+        assert isinstance(provider, MockTranscriptionProvider)
+
+    def test_whisper_provider_selected(self) -> None:
+        from src.tools.whisper_transcription_provider import WhisperTranscriptionProvider
+
+        settings = Settings(transcription_provider="whisper", whisper_model_size="tiny")
+        provider = get_transcription_provider(settings)
+        assert isinstance(provider, WhisperTranscriptionProvider)
+        assert provider.model_size == "tiny"
+
+    def test_unknown_transcription_provider_raises_config_error(self) -> None:
+        settings = Settings(transcription_provider="not-a-real-provider")
+        with pytest.raises(ProviderConfigError):
+            get_transcription_provider(settings)
+
+    def test_default_settings_used_when_none_passed(self, monkeypatch) -> None:
+        monkeypatch.setenv("TRANSCRIPTION_PROVIDER", "mock")
+        provider = get_transcription_provider()
+        assert isinstance(provider, MockTranscriptionProvider)

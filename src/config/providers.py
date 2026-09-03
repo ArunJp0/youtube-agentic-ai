@@ -9,6 +9,7 @@ from src.llm.mock import MockLLMProvider
 from src.tools.search_provider import SearchProvider, MockSearchProvider
 from src.tools.voice_provider import VoiceProvider, MockVoiceProvider
 from src.tools.media_provider import MediaProvider, MockMediaProvider
+from src.tools.transcription_provider import MockTranscriptionProvider, TranscriptionProvider
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
 
 
@@ -142,4 +143,28 @@ def get_visual_relevance_evaluator(settings: Optional[Settings] = None) -> Visua
 
     raise ProviderConfigError(
         f"Unknown LLM_PROVIDER: '{settings.llm_provider}'. Expected 'mock' or 'gemini'."
+    )
+
+
+def get_transcription_provider(settings: Optional[Settings] = None) -> TranscriptionProvider:
+    """Build the configured TranscriptionProvider (Caption Service's speech-to-text).
+
+    faster-whisper-specific imports are done lazily so the mock path never
+    depends on it, matching every other provider factory here.
+
+    Raises:
+        ProviderConfigError: If TRANSCRIPTION_PROVIDER is not a recognized value.
+    """
+    settings = settings or Settings()
+    provider_name = (settings.transcription_provider or "mock").strip().lower()
+
+    if provider_name == "mock":
+        return MockTranscriptionProvider()
+    if provider_name == "whisper":
+        from src.tools.whisper_transcription_provider import WhisperTranscriptionProvider
+
+        return WhisperTranscriptionProvider(model_size=settings.whisper_model_size)
+
+    raise ProviderConfigError(
+        f"Unknown TRANSCRIPTION_PROVIDER: '{settings.transcription_provider}'. Expected 'mock' or 'whisper'."
     )
