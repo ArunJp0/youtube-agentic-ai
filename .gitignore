@@ -50,3 +50,6 @@ htmlcov/
 # Claude Code local overrides
 .claude/settings.local.json
 CLAUDE.local.md
+
+# Local BGM assets
+assets/bgm/tracks/

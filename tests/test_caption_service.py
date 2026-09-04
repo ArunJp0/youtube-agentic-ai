@@ -51,6 +51,9 @@ class FakeAssembler(VideoAssembler):
         with open(output_path, "wb") as f:
             f.write(b"FAKE CAPTIONED VIDEO")
 
+    def mix_background_audio(self, *args, **kwargs) -> None:
+        raise NotImplementedError("not exercised by Caption Service tests")
+
 
 def _voice_result(tmp_path, success=True, missing=False) -> VoiceResult:
     audio_path = str(tmp_path / "narration.mp3")

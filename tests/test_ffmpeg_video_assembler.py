@@ -329,6 +329,84 @@ class TestFFmpegVideoAssemblerBurnSubtitles:
             assembler.burn_subtitles("in.mp4", "subs.srt", "out.mp4")
 
 
+class TestFFmpegVideoAssemblerMixBackgroundAudio:
+    def test_command_shape_with_ducking(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.mix_background_audio(
+            "video.mp4", "music.mp3", "out.mp4", 100.0, -24.0, 2.0, 3.0, use_ducking=True
+        )
+
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("-i") + 1] == "video.mp4"
+        assert "-stream_loop" in cmd and "-1" in cmd
+        assert "music.mp3" in cmd
+        assert "-map" in cmd and "0:v:0" in cmd and "[aout]" in cmd
+        assert "-c:v" in cmd and "copy" in cmd
+        assert "-c:a" in cmd and "aac" in cmd
+        assert "-shortest" in cmd
+        assert cmd[-1] == "out.mp4"
+
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        assert "volume=-24.0dB" in filter_complex
+        assert "afade=t=in:st=0:d=2.000" in filter_complex
+        assert "afade=t=out:st=97.000:d=3.000" in filter_complex
+        assert "sidechaincompress" in filter_complex
+        assert "normalize=0" in filter_complex
+
+    def test_command_shape_without_ducking_omits_sidechain(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.mix_background_audio(
+            "video.mp4", "music.mp3", "out.mp4", 50.0, -20.0, 1.0, 2.0, use_ducking=False
+        )
+
+        filter_complex = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+        assert "sidechaincompress" not in filter_complex
+        assert "amix=inputs=2" in filter_complex
+
+    def test_fade_out_start_clamped_to_zero_for_short_duration(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return FakeCompletedProcess()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assembler.mix_background_audio("video.mp4", "music.mp3", "out.mp4", 2.0, -24.0, 1.0, 5.0, use_ducking=False)
+
+        filter_complex = captured["cmd"][captured["cmd"].index("-filter_complex") + 1]
+        assert "afade=t=out:st=0.000:d=5.000" in filter_complex
+
+    def test_ffmpeg_failure_raises_video_assembler_error(self, monkeypatch) -> None:
+        monkeypatch.setattr("shutil.which", _which_found)
+        assembler = FFmpegVideoAssembler()
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: FakeCompletedProcess(returncode=1, stderr="bad mix filter")
+        )
+        with pytest.raises(VideoAssemblerError, match="bad mix filter"):
+            assembler.mix_background_audio("video.mp4", "music.mp3", "out.mp4", 10.0, -24.0, 1.0, 1.0)
+
+
 class TestFFmpegVideoAssemblerErrorHandling:
     def test_ffmpeg_binary_disappears_between_check_and_run(self, monkeypatch) -> None:
         monkeypatch.setattr("shutil.which", _which_found)

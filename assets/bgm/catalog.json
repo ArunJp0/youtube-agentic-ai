@@ -1,0 +1,72 @@
+[
+  {
+    "track_id": "angry-music",
+    "file_path": "tracks/Angry Music.mp3",
+    "title": "Angry Music",
+    "source": "YouTube Audio Library",
+    "license_type": "youtube_audio_library_no_attribution",
+    "attribution_required": false,
+    "attribution_text": null,
+    "genre": null,
+    "mood_tags": ["angry"],
+    "energy_level": "high",
+    "instrumental": true,
+    "duration_seconds": 164.18
+  },
+  {
+    "track_id": "calm-music",
+    "file_path": "tracks/Calm Music.mp3",
+    "title": "Calm Music",
+    "source": "YouTube Audio Library",
+    "license_type": "youtube_audio_library_no_attribution",
+    "attribution_required": false,
+    "attribution_text": null,
+    "genre": null,
+    "mood_tags": ["calm"],
+    "energy_level": "low",
+    "instrumental": true,
+    "duration_seconds": 156.5
+  },
+  {
+    "track_id": "dark-music",
+    "file_path": "tracks/Dark Music.mp3",
+    "title": "Dark Music",
+    "source": "YouTube Audio Library",
+    "license_type": "youtube_audio_library_no_attribution",
+    "attribution_required": false,
+    "attribution_text": null,
+    "genre": null,
+    "mood_tags": ["dark"],
+    "energy_level": "medium",
+    "instrumental": true,
+    "duration_seconds": 171.02
+  },
+  {
+    "track_id": "inspiration-music",
+    "file_path": "tracks/Inspiration Music.mp3",
+    "title": "Inspiration Music",
+    "source": "YouTube Audio Library",
+    "license_type": "youtube_audio_library_no_attribution",
+    "attribution_required": false,
+    "attribution_text": null,
+    "genre": null,
+    "mood_tags": ["inspiration"],
+    "energy_level": "medium",
+    "instrumental": true,
+    "duration_seconds": 155.88
+  },
+  {
+    "track_id": "romantic-music",
+    "file_path": "tracks/Romantic Music.mp3",
+    "title": "Romantic Music",
+    "source": "YouTube Audio Library",
+    "license_type": "youtube_audio_library_no_attribution",
+    "attribution_required": false,
+    "attribution_text": null,
+    "genre": null,
+    "mood_tags": ["romantic"],
+    "energy_level": "medium",
+    "instrumental": true,
+    "duration_seconds": 160.0
+  }
+]

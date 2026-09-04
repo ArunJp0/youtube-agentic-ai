@@ -397,10 +397,48 @@ Each successful run now leaves both `output/video/<name>.mp4` (original, non-cap
 
 Manual review of this milestone's real end-to-end run found (a) some run-to-run variation in stock-footage relevance versus a previous run, still within the previously-accepted quality bar, and (b) occasional single-word caption segments caused by Whisper's own segment boundaries (not a `caption_segmentation.py` defect - that module only ever splits long segments, it never merges short adjacent ones). Both were judged acceptable for the current MVP and explicitly left untuned: the visual pipeline (planning → selection → QC → assembly) remains frozen unless a recurring, severe problem appears, and no caption-segmentation merge logic is planned unless a real readability problem is found in practice.
 
+## Background music selection is driven by actual video/narration mood, not random or hardcoded per topic
+
+`MusicContextPlanner` and `MusicSelectionService` exist specifically so BGM choice reflects what the video is actually about and how it feels (calm, energetic, serious, warm, etc.), the same "understand context, don't just match keywords" principle already applied to visual planning (`VisualContextPlanner`). Nothing in the selection path branches on a specific topic string - the mood/energy/genre profile is either inferred by the LLM from the real script/narration content, or a safe generic fallback profile, never a per-topic special case.
+
+## Narration always has priority over background music
+
+Every mixing decision in `AudioMixingService`/`FFmpegVideoAssembler.mix_background_audio` treats the narration track as fixed and the music track as the one shaped around it: a conservative default gain (`DEFAULT_BGM_GAIN_DB = -24.0`), sidechain ducking under speech, and a constructor-level guard rejecting any `bgm_gain_db > 0` (which would amplify music above its source level) so the service can't be misconfigured into overpowering narration.
+
+## Instrumental tracks are preferred for narrated video; vocal tracks excluded by default
+
+`MusicSelectionService.select_track` filters the catalog down to `instrumental=True` tracks before any mood/energy scoring runs - a track with vocals/lyrics would compete with narration for the listener's attention regardless of how well it otherwise matches the mood, so it's excluded by default rather than merely down-ranked.
+
+## Only an approved, curated local BGM catalog is used - never automatic "No Copyright Music" downloads
+
+Consistent with the project's "no paid APIs, nothing without known rights" posture, `MusicCatalogProvider`/`LocalMusicCatalogProvider` never search, scrape, or download music at runtime - they only return tracks a human has already placed in `assets/bgm/tracks/` with explicit source/license metadata in `assets/bgm/catalog.json` (see `assets/bgm/README.md`). The current MVP catalog is 5 tracks manually obtained from the YouTube Audio Library, each marked "Attribution not required".
+
+## MusicCatalogProvider is a new abstraction, extensible to a future licensed provider
+
+Music sourcing is defined behind a `MusicCatalogProvider` interface (`src/tools/music_catalog_provider.py`), with `LocalMusicCatalogProvider` as the free/local MVP implementation and a `MockMusicCatalogProvider` for tests - mirroring every other provider abstraction in this project (`SearchProvider`, `VoiceProvider`, `MediaProvider`, `TranscriptionProvider`). `AudioMixingService`/`MusicSelectionService` depend only on this interface, so a future approved provider (e.g. a licensed Mixkit catalog, or a managed licensed-music API) could be added later without changing either service.
+
+## BGM mixing reuses the existing FFmpeg infrastructure via a new VideoAssembler method, not a second audio stack
+
+`mix_background_audio` was added to `VideoAssembler`/`FFmpegVideoAssembler` (`src/tools/ffmpeg_video_assembler.py`), following the same precedent as `extract_frames` (Visual QC) and `burn_subtitles` (Captions): one thin FFmpeg wrapper, extended additively per milestone, never duplicated. The track is looped or trimmed to the video's exact duration using the same `-stream_loop -1` plus final-duration-capping strategy already used by `build_section_clip`; fades and ducking are built as one FFmpeg `filter_complex` (`volume`, `afade`, `sidechaincompress`, `amix` with `normalize=0` so mixing doesn't quietly attenuate narration).
+
+## The standalone BGM demo reconstructs narration context from the existing .srt transcript instead of re-running Research/Script
+
+No `ScriptResult` is persisted to disk anywhere in this project. An initial version of `src/bgm_demo.py` worked around this by re-running `run_research_workflow`/`run_script_workflow` for the given topic - real validation showed this was slow and unreliable under Gemini free-tier rate limiting, and wasteful: `AudioMixingService` only needs mood-planning-relevant text, and Video Assembly/Captions have already produced exactly that, as the real, timestamped `.srt` transcript `CaptionService` wrote for the same video. `bgm_demo.py` now locates that matching `.srt` file and reconstructs a minimal `ScriptResult` directly from its concatenated caption text (falling back to a topic-only context if no `.srt` exists) - Research/Script/Voice/Visual Media/Visual QC/Video Assembly are never re-run just to validate BGM.
+
+## Gemini mood planning is an optional single-call enhancement, not a hard dependency
+
+`AudioMixingService` only constructs a `MusicContextPlanner` when an `LLMProvider` is supplied, and `MusicContextPlanner.plan_music` never raises - any LLM failure (including the 429/503/timeout rate limiting hit during real validation) is caught internally and returns the same deterministic fallback `MusicPlan` used when no planner is configured at all. This mirrors `VisualContextPlanner`'s established fallback pattern: at most one LLM call per video, and its unavailability degrades mood quality (to a safe neutral/calm/subtle profile) rather than blocking track selection or mixing.
+
+## Standalone-first: Audio Mixing Service is not yet wired into the main LangGraph pipeline
+
+Consistent with how Visual QC and Captions were each validated standalone before integration, this milestone stops short of touching `src/workflows/pipeline_graph.py`. `src/bgm_demo.py` is a separate standalone runner. Wiring `AudioMixingService` in as a stage after Captions is the next planned milestone.
+
 ## Known limitations
 
+- The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
+- Gemini mood planning is a single optional call per video; real validation showed it can be unavailable under Gemini free-tier rate limiting (429/503/timeouts), in which case the deterministic fallback plan (neutral/calm, low energy, ambient/cinematic, neutral/subtle) is used automatically - mood selection is correspondingly generic whenever the LLM call doesn't succeed.
+- The Standalone BGM / Audio Mixing Service is implemented and validated but not yet integrated into the main pipeline - `pipeline_demo.py`'s end-to-end run does not currently include background music.
 - The main pipeline currently produces two MP4 files per run (original and captioned) rather than a single final output - see the two-video-output decision above; a future cleanup milestone may remove the intermediate file once it's no longer needed.
-- Background music / audio mixing is still not implemented - captioning only copies the existing audio track through unchanged (`-c:a copy`), it does not add, mix, or modify any audio.
 - Whisper transcription accuracy depends on the TTS narration's clarity; it has not been validated against noisy or multi-speaker audio, which this pipeline does not produce.
-- The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts and, per this milestone's real run, occasional single-word caption segments - both cosmetic, not correctness issues for caption sync or meaning, and not being tuned further at this stage.
+- The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts and occasional single-word caption segments - both cosmetic, not correctness issues for caption sync or meaning, and not being tuned further at this stage.
 - Stock footage semantic relevance can vary run-to-run with live Pexels results; the visual pipeline is considered feature-complete/frozen for the MVP and is not planned for further optimization without a new, recurring, concrete problem.

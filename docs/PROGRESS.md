@@ -172,6 +172,19 @@
 - Manual review of the real run confirmed subtitle accuracy, timing sync, readability, and end-of-video timing were all satisfactory
 - Manual review also found some run-to-run variation in stock footage relevance (a few mildly irrelevant visuals compared to a previous run) - judged acceptable for the current MVP; this is expected variation in live Pexels results, not a regression, and the visual pipeline is not being further tuned because of it (see Known Limitations)
 - Subtitle / Caption Pipeline Integration milestone marked **COMPLETE**
+- Standalone BGM / Audio Mixing Service implemented: given a video topic, its narration context, an existing captioned MP4, and a curated local BGM catalog, the service plans the video's mood, deterministically selects one approved track, and mixes it under the narration to produce a new BGM-mixed MP4
+- New typed models `BGMTrack`, `MusicPlan`, `AudioMixResult` (`src/models/music.py`)
+- `MusicCatalogProvider` abstraction (`src/tools/music_catalog_provider.py`) with `LocalMusicCatalogProvider` (reads a curated JSON catalog under `assets/bgm/`) and a `MockMusicCatalogProvider` for tests - the system only ever selects from tracks explicitly present in this catalog; nothing is downloaded, scraped, or guessed at runtime
+- `MusicContextPlanner` (`src/agents/music_context_planner.py`): at most one Gemini call for the whole video, producing music CHARACTERISTICS (mood, energy, genre, instrumentation, avoid-styles) - never a specific song; on any LLM failure it falls back to the same deterministic `MusicPlan` used when no planner is configured at all (neutral/calm, low energy, ambient/cinematic, neutral/subtle required)
+- `MusicSelectionService` (`src/services/music_selection_service.py`): deterministic ranking of only the approved catalog against the music plan - instrumental tracks strongly preferred (vocal tracks excluded by default), `avoid_styles` filtering, mood/genre/energy scoring, deterministic tie-breaking by `track_id`, and an optional configured neutral fallback track
+- `AudioMixingService` (`src/services/audio_mixing_service.py`): orchestrates plan → select → mix; narration always stays primary - conservative default BGM gain (-24 dB, with a constructor guard rejecting any positive/amplifying gain) plus sidechain ducking under narration, smooth fade-in/out, and looping/trimming the track to match the video's exact duration; never overwrites the source video, always writes a new `<name>-bgm.mp4` copy
+- `VideoAssembler`/`FFmpegVideoAssembler` extended with `mix_background_audio` (same reuse pattern as `extract_frames`/`burn_subtitles`) - no second audio-processing stack
+- Local approved BGM catalog scaffolded under `assets/bgm/` (`catalog.json` + `tracks/` + `README.md` documenting the required format and copyright/source policy)
+- Standalone demo `src/bgm_demo.py`: reuses the most recently generated captioned MP4, and - since no `ScriptResult` is ever persisted to disk - reconstructs narration context from that same video's own already-generated `.srt` transcript (the real spoken narration text) instead of re-running Research/Script/Voice/Visual Media/Visual QC/Video Assembly just to get context for mood planning
+- 709/709 tests passing
+- Real standalone validation: 5 real instrumental tracks added to the catalog from the YouTube Audio Library (all marked "Attribution not required"); the demo reused the existing captioned MP4 (`why-do-humans-dream-7c674e5c-captioned.mp4`) and its matching `.srt` transcript with no Research/Script rerun; the single Gemini mood-planning call hit real 429/503/timeout rate limiting, so the deterministic fallback `MusicPlan` activated automatically and the demo completed successfully instead of failing; `MusicSelectionService` selected "Calm Music" (YouTube Audio Library, no attribution required); mixed at -24 dB gain with ducking enabled; source video duration ~154.152s, output duration ~154.133s; the original captioned MP4 was confirmed untouched (modification time and byte content unchanged)
+- Manual review confirmed the mix sounds subtle and professional for the current MVP: narration stayed clearly dominant and clear, BGM was mild/subtle under speech and rose slightly during narration gaps (intentional ducking behavior), judged acceptable overall
+- Standalone BGM / Audio Mixing Service milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/bgm_demo.py` is a separate standalone runner for this milestone
 
 ## Known Limitations
 
@@ -184,21 +197,26 @@
 - The main pipeline currently produces **two** MP4 outputs per run (the original assembled MP4 and a separate captioned MP4) rather than one final file - intentional for now; a future storage/cleanup milestone may remove the intermediate uncaptioned MP4 once captioning/upload has succeeded.
 - Occasional very short, single-word caption segments can occur, driven by Whisper's own segment boundaries rather than `caption_segmentation.py`'s (split-only, never-merge) logic - manual review of the real integrated run found current readability acceptable, so no further caption segmentation tuning is planned unless a real problem is found.
 - Stock footage semantic relevance remains good-enough-but-not-perfect and can vary run-to-run with live Pexels results - the visual pipeline (planning → selection → QC → assembly) is considered frozen for the current MVP and will not be further tuned unless a recurring, severe relevance problem appears.
-- Background music / audio mixing is not implemented yet - captioning does not touch or introduce any audio track beyond copying the existing narration audio through unchanged.
+- The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
+- Gemini mood planning is a single optional call per video; real validation showed it can be unavailable under Gemini free-tier rate limiting (429/503/timeouts), in which case the deterministic fallback `MusicPlan` (neutral/calm, low energy, ambient/cinematic, neutral/subtle required) is used automatically - mood selection is correspondingly generic whenever the LLM call doesn't succeed.
+- The Standalone BGM / Audio Mixing Service is implemented and validated but is **standalone only** - the main pipeline's final output (`python -m src.pipeline_demo`) does not currently include background music.
 
 ## Current Next Milestone
 
-**Standalone BGM / Audio Mixing Service** - build and validate background music/audio mixing as its own standalone service first (same standalone-first pattern used for Visual QC and Captions), before wiring it into the main pipeline.
+**BGM / Audio Mixing Main Pipeline Integration** - wire the already-validated standalone `AudioMixingService` into the main orchestration as a stage after Captions:
+
+```
+Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
+      → Subtitles / Captions → BGM / Audio Mixing → Final Mixed MP4
+```
 
 Planned sequence after that, in order:
 
-1. Standalone BGM / Audio Mixing Service
-2. Manual audio quality review
-3. BGM pipeline integration
-4. Metadata Agent
-5. Thumbnail Agent
-6. Copyright / Compliance checks
-7. YouTube Upload + Scheduling
-8. Monitoring / Post-publish
-9. Topic Planner
-10. Final storage/cleanup hardening as appropriate (including the two-video-output cleanup noted above)
+1. BGM / Audio Mixing Main Pipeline Integration
+2. Metadata Agent
+3. Thumbnail Agent
+4. Copyright / Compliance checks
+5. YouTube Upload + Scheduling
+6. Monitoring / Post-publish
+7. Topic Planner
+8. Final storage/cleanup hardening as appropriate (including the two-video-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)

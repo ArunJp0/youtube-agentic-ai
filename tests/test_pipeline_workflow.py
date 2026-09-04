@@ -148,6 +148,9 @@ class FakeVideoAssembler(VideoAssembler):
         with open(output_path, "wb") as f:
             f.write(b"FAKE CAPTIONED VIDEO")
 
+    def mix_background_audio(self, *args, **kwargs):
+        raise NotImplementedError("not exercised by pipeline workflow tests")
+
 
 class ExplodingVisualRelevanceEvaluator(VisualRelevanceEvaluator):
     """Test double: evaluate_section always raises, to simulate a Gemini

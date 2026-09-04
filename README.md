@@ -66,9 +66,11 @@ All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo 
 
 **Two-video output**: each run currently produces both the original assembled MP4 and a separate captioned MP4, rather than one final file. This is intentional for the current MVP (the original is a useful development/debug fallback); a future storage/cleanup milestone may delete the intermediate uncaptioned MP4 once captioning/upload has succeeded.
 
+A **BGM / Audio Mixing Service** has been implemented and validated standalone (`AudioMixingService`, `src/bgm_demo.py`): given a topic, the video's narration context, an existing captioned MP4, and a curated local approved music catalog (`assets/bgm/` - YouTube Audio Library tracks marked "Attribution not required" for the current MVP), it plans the video's mood via a single optional Gemini call (falling back automatically to a safe deterministic mood profile if that call is unavailable), deterministically selects one instrumental track from the approved catalog, and mixes it under the narration at a conservative gain with sidechain ducking so narration stays clearly dominant and the music stays subtle. The track is looped or trimmed to match the video's exact duration with smooth fades, and mixed into a **copy** (`<name>-bgm.mp4`) - the source captioned MP4 is never overwritten. It is **not yet wired into the main pipeline** above; integrating it as a stage after Captions is the next planned milestone.
+
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 
-Background music/audio mixing, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is a standalone BGM/audio mixing service.
+Thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is BGM / Audio Mixing Main Pipeline Integration.
 
 ## Project Structure
 

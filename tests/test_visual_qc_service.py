@@ -60,6 +60,9 @@ class FakeAssembler(VideoAssembler):
     def burn_subtitles(self, input_video_path, srt_path, output_path, force_style=None):
         raise NotImplementedError("not exercised by Visual QC tests")
 
+    def mix_background_audio(self, *args, **kwargs):
+        raise NotImplementedError("not exercised by Visual QC tests")
+
 
 class FakeReplacementProvider:
     """Duck-typed stand-in for VisualMediaService's acquire_replacement_asset:

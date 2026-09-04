@@ -127,6 +127,51 @@ class VideoAssembler(ABC):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def mix_background_audio(
+        self,
+        input_video_path: str,
+        music_path: str,
+        output_path: str,
+        target_duration_seconds: float,
+        music_gain_db: float,
+        fade_in_seconds: float,
+        fade_out_seconds: float,
+        use_ducking: bool = True,
+    ) -> None:
+        """Mix a background music track underneath a video's existing
+        narration audio, writing a new file at ``output_path``.
+        ``input_video_path`` is never modified.
+
+        The music track is looped seamlessly if shorter than
+        ``target_duration_seconds``, or trimmed if longer - the same
+        ``-stream_loop -1`` plus final-duration-capping strategy already
+        used by ``build_section_clip``, so no gaps/clicks from manual
+        splicing. ``music_gain_db`` attenuates the music before mixing
+        (a negative value quietens it, keeping narration dominant);
+        ``fade_in_seconds``/``fade_out_seconds`` apply smooth fades so the
+        music never starts or stops abruptly, and never continues past the
+        video's own end. When ``use_ducking`` is True, the narration track
+        sidechain-compresses the music so it recedes further under speech
+        and returns to its base level during silence, instead of sitting
+        at one flat level throughout.
+
+        Args:
+            input_video_path: Source MP4 (already has narration audio)
+            music_path: Background music audio file
+            output_path: Local filesystem path for the mixed copy
+            target_duration_seconds: The source video's duration - the
+                output is capped to this length
+            music_gain_db: Gain applied to the music track, in dB
+                (negative attenuates)
+            fade_in_seconds: Music fade-in duration at the start
+            fade_out_seconds: Music fade-out duration, ending at
+                ``target_duration_seconds``
+            use_ducking: Whether to sidechain-compress the music under
+                narration
+        """
+        raise NotImplementedError
+
 
 def _require_binary(name: str) -> str:
     path = shutil.which(name)
@@ -306,6 +351,50 @@ class FFmpegVideoAssembler(VideoAssembler):
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-c:a", "copy",
+            output_path,
+        ]
+        self._run(command)
+
+    def mix_background_audio(
+        self,
+        input_video_path: str,
+        music_path: str,
+        output_path: str,
+        target_duration_seconds: float,
+        music_gain_db: float,
+        fade_in_seconds: float,
+        fade_out_seconds: float,
+        use_ducking: bool = True,
+    ) -> None:
+        fade_out_start = max(target_duration_seconds - fade_out_seconds, 0.0)
+        bgm_filter = (
+            f"[1:a]volume={music_gain_db}dB,"
+            f"afade=t=in:st=0:d={fade_in_seconds:.3f},"
+            f"afade=t=out:st={fade_out_start:.3f}:d={fade_out_seconds:.3f}[bgm]"
+        )
+        if use_ducking:
+            filter_complex = (
+                f"{bgm_filter};"
+                "[bgm][0:a]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=300[bgm_ducked];"
+                "[0:a][bgm_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+            )
+        else:
+            filter_complex = (
+                f"{bgm_filter};"
+                "[0:a][bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+            )
+
+        command = [
+            self.ffmpeg_path, "-y",
+            "-i", input_video_path,
+            "-stream_loop", "-1", "-i", music_path,
+            "-filter_complex", filter_complex,
+            "-map", "0:v:0",
+            "-map", "[aout]",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
             output_path,
         ]
         self._run(command)
