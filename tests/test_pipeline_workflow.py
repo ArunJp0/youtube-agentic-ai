@@ -1,7 +1,7 @@
 # Tests for the Research -> Script -> Voice -> Visual Media -> Visual QC ->
-# Video Assembly pipeline workflow (LangGraph). All tests use mock
-# providers/fake assembler/fake evaluator only - no real network/API/FFmpeg
-# calls.
+# Video Assembly -> Subtitle/Caption pipeline workflow (LangGraph). All
+# tests use mock providers/fake assembler/fake evaluator/fake transcription
+# only - no real network/API/FFmpeg/Whisper calls.
 from __future__ import annotations
 
 import os
@@ -10,6 +10,7 @@ import pytest
 
 from src.llm.mock import MockLLMProvider
 from src.llm.provider import LLMProvider
+from src.models.captions import CaptionResult
 from src.models.media import VisualResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
@@ -19,6 +20,7 @@ from src.models.voice import VoiceResult
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.search_provider import MockSearchProvider, SearchProvider
+from src.tools.transcription_provider import MockTranscriptionProvider, TranscriptionProviderError
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
 from src.tools.voice_provider import MockVoiceProvider, VoiceProvider
 from src.workflows.pipeline_graph import PipelineState, build_pipeline_graph, run_pipeline
@@ -94,15 +96,20 @@ class ExplodingMediaProvider(MediaProvider):
 
 class FakeVideoAssembler(VideoAssembler):
     """Test double: records calls and writes tiny placeholder files instead
-    of running real FFmpeg, so the pipeline's visual_qc/video_assembly
-    stages can be exercised without any real encoding/extraction process."""
+    of running real FFmpeg, so the pipeline's visual_qc/video_assembly/
+    captions stages can be exercised without any real encoding/extraction/
+    subtitle-burning process."""
 
-    def __init__(self, audio_duration: float = 30.0, fail: bool = False) -> None:
+    def __init__(
+        self, audio_duration: float = 30.0, fail: bool = False, fail_burn_subtitles: bool = False
+    ) -> None:
         self.audio_duration = audio_duration
         self.fail = fail
+        self.fail_burn_subtitles = fail_burn_subtitles
         self.build_calls: list[dict] = []
         self.assemble_calls: list[dict] = []
         self.extract_frame_calls: list[dict] = []
+        self.burn_subtitle_calls: list[dict] = []
 
     def probe_duration_seconds(self, media_path: str) -> float:
         if self.fail:
@@ -133,7 +140,13 @@ class FakeVideoAssembler(VideoAssembler):
         return paths
 
     def burn_subtitles(self, input_video_path, srt_path, output_path, force_style=None):
-        raise NotImplementedError("not exercised by pipeline workflow tests")
+        self.burn_subtitle_calls.append(
+            {"input_video_path": input_video_path, "srt_path": srt_path, "output_path": output_path}
+        )
+        if self.fail_burn_subtitles:
+            raise VideoAssemblerError("simulated ffmpeg subtitle burn failure")
+        with open(output_path, "wb") as f:
+            f.write(b"FAKE CAPTIONED VIDEO")
 
 
 class ExplodingVisualRelevanceEvaluator(VisualRelevanceEvaluator):
@@ -191,7 +204,7 @@ class FirstAttemptWeakEvaluator(VisualRelevanceEvaluator):
 
 class TestPipelineWorkflow:
     """Tests for the combined Research -> Script -> Voice -> Visual Media ->
-    Visual QC -> Video Assembly LangGraph pipeline."""
+    Visual QC -> Video Assembly -> Subtitle/Caption LangGraph pipeline."""
 
     @pytest.fixture
     def providers(self, tmp_path):
@@ -204,9 +217,11 @@ class TestPipelineWorkflow:
             MockMediaProvider(),
             FakeVideoAssembler(),
             MockVisualRelevanceEvaluator(default_score=0.9),
+            MockTranscriptionProvider(),
             str(tmp_path / "audio"),
             str(tmp_path / "media"),
             str(tmp_path / "video"),
+            str(tmp_path / "subtitles"),
         )
 
     @staticmethod
@@ -218,9 +233,11 @@ class TestPipelineWorkflow:
             media_provider,
             assembler,
             visual_relevance_evaluator,
+            transcription_provider,
             voice_dir,
             media_dir,
             video_dir,
+            subtitle_dir,
         ) = providers
         return run_pipeline(
             topic,
@@ -231,20 +248,23 @@ class TestPipelineWorkflow:
             overrides.get("media_provider", media_provider),
             overrides.get("assembler", assembler),
             overrides.get("visual_relevance_evaluator", visual_relevance_evaluator),
+            overrides.get("transcription_provider", transcription_provider),
             voice_dir,
             media_dir,
             video_dir,
+            subtitle_dir,
         )
 
     @pytest.mark.asyncio
     async def test_pipeline_builds_and_compiles(self, providers) -> None:
         (
             search_provider, llm_provider, voice_provider, media_provider, assembler,
-            visual_relevance_evaluator, voice_dir, media_dir, video_dir,
+            visual_relevance_evaluator, transcription_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
         ) = providers
         graph = build_pipeline_graph(
             search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
-            visual_relevance_evaluator, voice_dir, media_dir, video_dir,
+            visual_relevance_evaluator, transcription_provider, voice_dir, media_dir, video_dir, subtitle_dir,
         )
         assert graph is not None
         compiled = graph.compile()
@@ -279,7 +299,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_voice_result_is_structured_and_stored_in_final_state(self, providers) -> None:
-        _, _, voice_provider, _, _, _, _, _, _ = providers
+        _, _, voice_provider, _, _, _, _, _, _, _, _ = providers
         state = await self._run(providers)
 
         assert isinstance(state.voice_result, VoiceResult)
@@ -346,9 +366,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_video_assembly_receives_qc_approved_inputs(self, providers) -> None:
-        (
-            _, _, _, _, assembler, _, _, _, _,
-        ) = providers
+        _, _, _, _, assembler, _, _, _, _, _, _ = providers
         state = await self._run(providers)
 
         # The assembler was called with the exact media files from the
@@ -373,7 +391,7 @@ class TestPipelineWorkflow:
     async def test_qc_replacement_changes_media_passed_to_video_assembly(self, providers) -> None:
         """When Visual QC replaces a weak asset, Video Assembly must
         receive the replacement - not the originally-selected asset."""
-        _, _, _, _, assembler, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=FirstAttemptWeakEvaluator())
 
         assert state.status == "completed"
@@ -397,7 +415,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_research_fails(self, providers) -> None:
-        _, _, voice_provider, media_provider, assembler, _, _, _, _ = providers
+        _, _, voice_provider, media_provider, assembler, _, transcription_provider, _, _, _, _ = providers
         state = await self._run(providers, topic="")
 
         assert state.status == "failed"
@@ -408,28 +426,31 @@ class TestPipelineWorkflow:
         assert state.visual_qc_result is None
         assert state.qc_approved_visual_result is None
         assert state.video_assembly_result is None
+        assert state.caption_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
         assert assembler.extract_frame_calls == []
+        assert transcription_provider.calls == []
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_script_fails(self, providers) -> None:
-        _, _, voice_provider, media_provider, assembler, _, _, _, _ = providers
+        _, _, voice_provider, media_provider, assembler, _, _, _, _, _, _ = providers
         state = await self._run(providers, llm_provider=ExplodingLLMProvider())
 
         assert state.status == "failed"
         assert state.script_result is None
         assert state.visual_qc_result is None
         assert state.video_assembly_result is None
+        assert state.caption_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_voice_fails(self, providers) -> None:
-        _, _, _, media_provider, assembler, _, _, _, _ = providers
+        _, _, _, media_provider, assembler, _, _, _, _, _, _ = providers
         state = await self._run(providers, voice_provider=ExplodingVoiceProvider())
 
         assert state.status == "failed"
@@ -441,12 +462,13 @@ class TestPipelineWorkflow:
         assert state.visual_result is None
         assert state.visual_qc_result is None
         assert state.video_assembly_result is None
+        assert state.caption_result is None
         assert media_provider.calls == []
         assert assembler.build_calls == []
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_visual_media_fails(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _ = providers
         state = await self._run(providers, media_provider=ExplodingMediaProvider())
 
         assert state.status == "failed"
@@ -459,6 +481,7 @@ class TestPipelineWorkflow:
         assert state.visual_result.success is False
         assert state.visual_qc_result is None
         assert state.video_assembly_result is None
+        assert state.caption_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
         assert assembler.extract_frame_calls == []
@@ -492,19 +515,21 @@ class TestPipelineWorkflow:
     async def test_video_assembly_not_called_after_hard_qc_failure(self, providers) -> None:
         """An asset still flagged misleading after bounded replacement is
         exhausted must stop the pipeline before Video Assembly - never
-        reaching the final video."""
-        _, _, _, _, assembler, _, _, _, _ = providers
+        reaching the final video (or captions)."""
+        _, _, _, _, assembler, _, transcription_provider, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
 
         assert state.status == "failed"
         assert "rejected" in state.error.lower()
         assert state.video_assembly_result is None
+        assert state.caption_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
+        assert transcription_provider.calls == []
 
     @pytest.mark.asyncio
     async def test_rejected_assets_not_passed_to_video_assembly(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
 
         assert state.visual_qc_result.rejected_count > 0
@@ -549,14 +574,17 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is not None
         assert state.video_assembly_result.success is False
         assert "simulated ffmpeg outage" in state.video_assembly_result.error
+        # Captions never run on a failed/missing assembled video.
+        assert state.caption_result is None
 
-    # ---- H. status only "completed" when video assembly succeeds after QC -
+    # ---- H. status only "completed" when captioning succeeds after assembly -
 
     @pytest.mark.asyncio
-    async def test_status_is_completed_only_when_video_assembly_succeeds(self, providers) -> None:
+    async def test_status_is_completed_only_when_captioning_succeeds(self, providers) -> None:
         success_state = await self._run(providers)
         assert success_state.status == "completed"
         assert success_state.video_assembly_result.success is True
+        assert success_state.caption_result.success is True
 
         failure_state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
         assert failure_state.status == "failed"
@@ -570,10 +598,10 @@ class TestPipelineWorkflow:
     # ---- I. existing behavior preserved -------------------------------------
 
     @pytest.mark.asyncio
-    async def test_no_search_results_still_completes_through_video_assembly(self, providers) -> None:
+    async def test_no_search_results_still_completes_through_captions(self, providers) -> None:
         """MockSearchProvider returning [] is a valid (if sparse) research result,
         not an error - the pipeline should still complete all the way through
-        video assembly."""
+        captioning."""
         state = await self._run(providers, topic="obscure topic", search_provider=EmptySearchProvider())
 
         assert state.research_result is not None
@@ -581,6 +609,8 @@ class TestPipelineWorkflow:
         assert state.status == "completed"
         assert state.video_assembly_result is not None
         assert state.video_assembly_result.success is True
+        assert state.caption_result is not None
+        assert state.caption_result.success is True
 
     @pytest.mark.asyncio
     async def test_pipeline_state_defaults(self) -> None:
@@ -594,6 +624,7 @@ class TestPipelineWorkflow:
         assert state.visual_qc_result is None
         assert state.qc_approved_visual_result is None
         assert state.video_assembly_result is None
+        assert state.caption_result is None
         assert state.status == "pending"
         assert state.error is None
 
@@ -605,3 +636,120 @@ class TestPipelineWorkflow:
         assert state_a.topic == "Topic A"
         assert state_b.topic == "Topic B"
         assert state_a.research_result.topic != state_b.research_result.topic
+
+    # ---- J. CaptionResult stored / correct inputs ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_caption_result_is_structured_and_stored_in_final_state(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert isinstance(state.caption_result, CaptionResult)
+        assert state.caption_result.success is True
+        assert state.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_caption_service_receives_correct_voice_audio_path(self, providers) -> None:
+        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        state = await self._run(providers)
+
+        assert transcription_provider.calls == [state.voice_result.audio_file_path]
+
+    @pytest.mark.asyncio
+    async def test_caption_service_receives_correct_video_assembly_path(self, providers) -> None:
+        _, _, _, _, assembler, _, _, _, _, _, _ = providers
+        state = await self._run(providers)
+
+        assert len(assembler.burn_subtitle_calls) == 1
+        assert assembler.burn_subtitle_calls[0]["input_video_path"] == state.video_assembly_result.output_path
+
+    @pytest.mark.asyncio
+    async def test_original_video_assembly_result_preserved_after_captioning(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
+        assert os.path.exists(state.video_assembly_result.output_path)
+
+    @pytest.mark.asyncio
+    async def test_captioned_output_stored_separately_from_original(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.caption_result.captioned_video_path is not None
+        assert state.caption_result.captioned_video_path != state.video_assembly_result.output_path
+        assert os.path.exists(state.caption_result.captioned_video_path)
+        assert state.caption_result.srt_path is not None
+        assert os.path.exists(state.caption_result.srt_path)
+
+    # ---- K. Caption node not called on earlier failure -----------------------
+
+    @pytest.mark.asyncio
+    async def test_caption_node_not_called_when_video_assembly_fails(self, providers) -> None:
+        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
+
+        assert state.status == "failed"
+        assert state.caption_result is None
+        assert transcription_provider.calls == []
+
+    @pytest.mark.asyncio
+    async def test_caption_node_not_called_after_hard_qc_failure(self, providers) -> None:
+        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
+
+        assert state.status == "failed"
+        assert state.caption_result is None
+        assert transcription_provider.calls == []
+
+    @pytest.mark.asyncio
+    async def test_caption_node_not_called_when_research_fails(self, providers) -> None:
+        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        state = await self._run(providers, topic="")
+
+        assert state.caption_result is None
+        assert transcription_provider.calls == []
+
+    # ---- L. Caption failure behavior -----------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_caption_burn_failure_marks_pipeline_failed(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_burn_subtitles=True))
+
+        assert state.status == "failed"
+        assert "Caption generation failed" in state.error
+
+    @pytest.mark.asyncio
+    async def test_caption_burn_failure_preserves_original_mp4(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_burn_subtitles=True))
+
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
+        assert os.path.exists(state.video_assembly_result.output_path)
+
+    @pytest.mark.asyncio
+    async def test_caption_burn_failure_preserves_earlier_results_and_stores_failed_caption_result(
+        self, providers
+    ) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_burn_subtitles=True))
+
+        assert state.research_result is not None
+        assert state.script_result is not None
+        assert state.voice_result is not None
+        assert state.visual_result is not None
+        assert state.visual_qc_result is not None
+        assert state.qc_approved_visual_result is not None
+        assert state.video_assembly_result is not None
+        assert state.caption_result is not None
+        assert state.caption_result.success is False
+        assert state.caption_result.error is not None
+
+    @pytest.mark.asyncio
+    async def test_transcription_failure_marks_pipeline_failed_and_preserves_original_mp4(self, providers) -> None:
+        failing_provider = MockTranscriptionProvider(raise_error=TranscriptionProviderError("engine crashed"))
+        state = await self._run(providers, transcription_provider=failing_provider)
+
+        assert state.status == "failed"
+        assert "Caption generation failed" in state.error
+        assert state.caption_result is not None
+        assert state.caption_result.success is False
+        assert state.video_assembly_result.success is True
+        assert os.path.exists(state.video_assembly_result.output_path)

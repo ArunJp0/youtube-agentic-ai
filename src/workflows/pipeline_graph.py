@@ -1,12 +1,13 @@
 # Full Research -> Script -> Voice -> Visual Media -> Visual QC -> Video
-# Assembly pipeline using LangGraph.
+# Assembly -> Subtitle/Caption pipeline using LangGraph.
 #
 # This module does not implement any research, scripting, voice-synthesis,
-# visual-media, QC-evaluation, or video-encoding logic itself - it only
-# wires the existing ResearchAgent, ScriptAgent, VoiceService,
-# VisualMediaService, VisualQCService, and VideoAssemblyService together
-# into a single LangGraph state machine, passing each stage's output
-# directly into the next stage's input.
+# visual-media, QC-evaluation, video-encoding, transcription, or subtitle-
+# rendering logic itself - it only wires the existing ResearchAgent,
+# ScriptAgent, VoiceService, VisualMediaService, VisualQCService,
+# VideoAssemblyService, and CaptionService together into a single LangGraph
+# state machine, passing each stage's output directly into the next
+# stage's input.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from langgraph.graph import END, StateGraph
 from src.agents.research import ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent, ScriptAgentError
 from src.agents.visual_context_planner import VisualContextPlanner
+from src.models.captions import CaptionResult
 from src.models.media import VisualResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
@@ -24,6 +26,7 @@ from src.models.video import VideoAssemblyResult
 from src.models.visual_plan import VisualPlan
 from src.models.visual_qc import VisualQCResult
 from src.models.voice import VoiceResult
+from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR, CaptionService, CaptionServiceError
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
     VideoAssemblyService,
@@ -38,6 +41,7 @@ from src.services.visual_qc_service import VisualQCService, VisualQCServiceError
 from src.services.voice_service import DEFAULT_OUTPUT_DIR, VoiceService, VoiceServiceError
 from src.tools.ffmpeg_video_assembler import VideoAssembler
 from src.tools.media_provider import MediaProvider
+from src.tools.transcription_provider import TranscriptionProvider
 from src.tools.visual_relevance_evaluator import VisualRelevanceEvaluator
 from src.tools.voice_provider import VoiceProvider
 
@@ -62,8 +66,9 @@ class PipelineState:
     # weak/misleading asset).
     qc_approved_visual_result: Optional[VisualResult] = None
     video_assembly_result: Optional[VideoAssemblyResult] = None
+    caption_result: Optional[CaptionResult] = None
     # pending -> researching -> researched -> scripted -> voiced ->
-    # visualized -> qc_passed -> completed -> failed
+    # visualized -> qc_passed -> assembled -> completed -> failed
     status: str = "pending"
     error: Optional[str] = None
 
@@ -76,31 +81,38 @@ def build_pipeline_graph(
     media_provider: MediaProvider,
     assembler: VideoAssembler,
     visual_relevance_evaluator: VisualRelevanceEvaluator,
+    transcription_provider: TranscriptionProvider,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
+    subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
-    -> Visual Media -> Visual QC -> Video Assembly.
+    -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption.
 
     Reuses the existing ResearchAgent, ScriptAgent, VoiceService,
-    VisualMediaService, VisualQCService, and VideoAssemblyService as-is (no
-    duplicated business logic, no reimplemented FFmpeg calls, no
-    re-implemented QC evaluation/replacement); this graph only wires their
-    existing async interfaces together and shares one PipelineState across
-    all six. VoiceService, VisualMediaService, VisualQCService, and
-    VideoAssemblyService all remain deterministic services here - each is
-    invoked directly, not treated as a reasoning agent (semantic judgment
-    stays inside VisualContextPlanner/VisualQCService's injected
-    evaluator). VideoAssemblyService receives the exact
-    ScriptResult/VoiceResult already produced earlier in this same run,
-    and the post-QC ``qc_approved_visual_result`` (never the raw,
-    pre-QC ``visual_result``) - nothing is regenerated or re-downloaded.
+    VisualMediaService, VisualQCService, VideoAssemblyService, and
+    CaptionService as-is (no duplicated business logic, no reimplemented
+    FFmpeg calls, no re-implemented QC evaluation/replacement, no
+    re-implemented transcription/SRT/subtitle-rendering logic); this graph
+    only wires their existing async interfaces together and shares one
+    PipelineState across all seven. VoiceService, VisualMediaService,
+    VisualQCService, VideoAssemblyService, and CaptionService all remain
+    deterministic services here - each is invoked directly, not treated as
+    a reasoning agent (semantic judgment stays inside
+    VisualContextPlanner/VisualQCService's injected evaluator; speech-to-
+    text stays inside CaptionService's injected transcription provider).
+    VideoAssemblyService receives the exact ScriptResult/VoiceResult
+    already produced earlier in this same run, and the post-QC
+    ``qc_approved_visual_result`` (never the raw, pre-QC ``visual_result``).
+    CaptionService receives the exact VoiceResult/VideoAssemblyResult
+    already produced earlier in this same run - nothing is regenerated,
+    re-synthesized, re-downloaded, or re-assembled.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly → END
-                    │                  │               │              │                │
-                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)──→ END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions → END
+                    │                  │               │              │                │                  │
+                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)──→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
@@ -109,12 +121,16 @@ def build_pipeline_graph(
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
         assembler: VideoAssembler implementation, shared by Visual QC (frame
-            extraction/probing) and the Video Assembly Service (encoding)
+            extraction/probing), the Video Assembly Service (encoding), and
+            the Caption Service (subtitle burning)
         visual_relevance_evaluator: VisualRelevanceEvaluator implementation
             for the Visual QC Service
+        transcription_provider: TranscriptionProvider implementation for
+            the Caption Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
+        subtitle_output_dir: Directory the Caption Service writes .srt files into
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -140,6 +156,11 @@ def build_pipeline_graph(
         evaluator=visual_relevance_evaluator, assembler=assembler, visual_media_service=visual_service
     )
     video_service = VideoAssemblyService(assembler=assembler, output_dir=video_output_dir)
+    # Shares the same VideoAssembler as Visual QC/Video Assembly (subtitle
+    # burning reuses its burn_subtitles method) - no second FFmpeg wrapper.
+    caption_service = CaptionService(
+        transcription_provider=transcription_provider, assembler=assembler, output_dir=subtitle_output_dir
+    )
 
     async def research_node(state: PipelineState) -> dict:
         try:
@@ -329,7 +350,38 @@ def build_pipeline_graph(
                 "error": f"Video assembly failed: {result.error}",
             }
 
-        return {"video_assembly_result": result, "status": "completed", "error": None}
+        return {"video_assembly_result": result, "status": "assembled", "error": None}
+
+    async def caption_node(state: PipelineState) -> dict:
+        try:
+            # The exact VoiceResult/VideoAssemblyResult already produced
+            # earlier in this run are passed straight through - narration
+            # is never regenerated and video is never reassembled. Caption
+            # timing comes entirely from CaptionService's own transcription
+            # of the real narration audio, not from any script-derived estimate.
+            result = await caption_service.generate_captions(state.voice_result, state.video_assembly_result)
+        except CaptionServiceError as e:
+            return {"caption_result": None, "status": "failed", "error": f"Caption generation failed: {e}"}
+        except Exception as e:
+            return {
+                "caption_result": None,
+                "status": "failed",
+                "error": f"Unexpected caption error: {e}",
+            }
+
+        if not result.success:
+            # CaptionService never raises for transcription/rendering
+            # failures - it reports them in CaptionResult.error instead.
+            # Surface that in pipeline state (and keep the CaptionResult
+            # itself for inspection); the original assembled MP4 is
+            # untouched regardless (CaptionService never writes to it).
+            return {
+                "caption_result": result,
+                "status": "failed",
+                "error": f"Caption generation failed: {result.error}",
+            }
+
+        return {"caption_result": result, "status": "completed", "error": None}
 
     def route_after_research(state: PipelineState) -> str:
         """Only proceed to scripting if research actually produced a result."""
@@ -357,6 +409,15 @@ def build_pipeline_graph(
         failure (see visual_qc_node's rejected_count policy above)."""
         return "video_assembly" if state.status == "qc_passed" else END
 
+    def route_after_video_assembly(state: PipelineState) -> str:
+        """Only proceed to captioning if video assembly actually succeeded -
+        the caption node must never run on a missing/failed assembled MP4."""
+        return (
+            "captions"
+            if state.video_assembly_result is not None and state.video_assembly_result.success
+            else END
+        )
+
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
@@ -364,6 +425,7 @@ def build_pipeline_graph(
     graph.add_node("media", media_node)
     graph.add_node("visual_qc", visual_qc_node)
     graph.add_node("video_assembly", video_assembly_node)
+    graph.add_node("captions", caption_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
@@ -373,7 +435,10 @@ def build_pipeline_graph(
     graph.add_conditional_edges(
         "visual_qc", route_after_visual_qc, {"video_assembly": "video_assembly", END: END}
     )
-    graph.set_finish_point("video_assembly")
+    graph.add_conditional_edges(
+        "video_assembly", route_after_video_assembly, {"captions": "captions", END: END}
+    )
+    graph.set_finish_point("captions")
 
     return graph
 
@@ -387,28 +452,32 @@ async def run_pipeline(
     media_provider: MediaProvider,
     assembler: VideoAssembler,
     visual_relevance_evaluator: VisualRelevanceEvaluator,
+    transcription_provider: TranscriptionProvider,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
+    subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
-    -> Video Assembly pipeline and return the final state.
+    -> Video Assembly -> Subtitle/Caption pipeline and return the final state.
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
     can inspect ``status``/``error`` directly, including on partial failure
-    (e.g. research, scripting, voice, visual media, and visual QC all
-    succeeded but video assembly failed).
+    (e.g. research, scripting, voice, visual media, visual QC, and video
+    assembly all succeeded but captioning failed).
 
     Each stage only runs if the previous one succeeded - a failure at any
     stage short-circuits the rest of the pipeline and it never silently
     continues (see route_after_research/route_after_script/route_after_voice/
-    route_after_media/route_after_visual_qc). Visual QC itself fails the
-    pipeline (status "failed", Video Assembly never runs) if any asset is
-    still flagged misleading/conflicting after bounded replacement is
-    exhausted - see visual_qc_node. Pipeline status only becomes "completed"
-    once video assembly itself succeeds (consuming the post-QC approved
-    media) and a real final MP4 exists.
+    route_after_media/route_after_visual_qc/route_after_video_assembly).
+    Visual QC itself fails the pipeline (status "failed", Video Assembly
+    never runs) if any asset is still flagged misleading/conflicting after
+    bounded replacement is exhausted - see visual_qc_node. Pipeline status
+    only becomes "completed" once captioning itself succeeds (consuming the
+    real narration audio and the assembled MP4) and a real captioned final
+    MP4 exists; the original non-captioned MP4 (``video_assembly_result``)
+    is preserved unchanged either way.
 
     Args:
         topic: Research topic to investigate, script, narrate, illustrate, and assemble
@@ -417,13 +486,16 @@ async def run_pipeline(
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
-        assembler: VideoAssembler implementation, shared by Visual QC and
-            the Video Assembly Service
+        assembler: VideoAssembler implementation, shared by Visual QC, the
+            Video Assembly Service, and the Caption Service
         visual_relevance_evaluator: VisualRelevanceEvaluator implementation
             for the Visual QC Service
+        transcription_provider: TranscriptionProvider implementation for
+            the Caption Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
+        subtitle_output_dir: Directory the Caption Service writes .srt files into
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -436,9 +508,11 @@ async def run_pipeline(
         media_provider,
         assembler,
         visual_relevance_evaluator,
+        transcription_provider,
         voice_output_dir,
         media_output_dir,
         video_output_dir,
+        subtitle_output_dir,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
@@ -454,6 +528,7 @@ async def run_pipeline(
         visual_qc_result=raw_result.get("visual_qc_result"),
         qc_approved_visual_result=raw_result.get("qc_approved_visual_result"),
         video_assembly_result=raw_result.get("video_assembly_result"),
+        caption_result=raw_result.get("caption_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )

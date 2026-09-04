@@ -373,9 +373,34 @@ Burning (hardcoding) subtitles into a video is FFmpeg work, and the project alre
 
 Consistent with how Visual QC was validated standalone before integration, this milestone stops short of touching `src/workflows/pipeline_graph.py`. `src/caption_demo.py` is a separate standalone runner that auto-discovers the most recently generated narration MP3 and assembled MP4 under `output/audio/`/`output/video/` (skipping already-captioned copies) rather than requiring Research/Script/Voice/Visual Media/Visual QC to run again just to validate captioning. Wiring `CaptionService` in as a stage after Video Assembly is the next planned milestone.
 
+## Caption Service integration reuses CaptionService as-is; the pipeline only adds routing and state-plumbing
+
+Consistent with how Visual QC's integration milestone worked, `build_pipeline_graph`'s new `caption_node` calls `CaptionService.generate_captions(voice_result, video_assembly_result)` exactly as `caption_demo.py` already did - same transcription/segmentation/SRT/burn logic, unchanged. The only new code is a thin node function, a new `PipelineState.caption_result` field, and conditional routing - `CaptionService` and every module beneath it (`transcription_provider`, `caption_segmentation`, `srt_writer`, `FFmpegVideoAssembler.burn_subtitles`) remain unaware of whether they're called standalone or from the graph.
+
+## Captions run after Video Assembly, gated on VideoAssemblyResult.success rather than the status string
+
+`route_after_video_assembly` decides whether to run `captions` by checking `state.video_assembly_result is not None and state.video_assembly_result.success` - the same result-object-based routing style used by `route_after_media`/`route_after_voice`/etc. elsewhere in the graph (as opposed to `route_after_visual_qc`, which checks the special policy-driven `status == "qc_passed"` string). This keeps the new routing consistent with the graph's established convention: check the actual result, not a derived status string, except where a dedicated pipeline-level policy status already exists.
+
+## Pipeline "completed" status moved from Video Assembly to Captions
+
+With captions now the final stage, `video_assembly_node`'s own success status was renamed from `"completed"` to `"assembled"` (an intermediate status, matching the pattern of `"qc_passed"` before it), and only `caption_node`'s success path sets `status="completed"`. This keeps the same principle used when Video Assembly was added as the final stage in an earlier milestone: "completed" should only ever mean the pipeline's actual final deliverable exists - now the captioned MP4, not the intermediate assembled one.
+
+## Caption failure marks the pipeline failed but preserves every earlier successful result, including the original MP4
+
+If transcription or subtitle burning fails, `caption_node` sets `status="failed"` and records the error on a `CaptionResult(success=False, ...)`, but does not clear or overwrite `research_result`/`script_result`/`voice_result`/`visual_result`/`visual_qc_result`/`video_assembly_result` - all remain inspectable in the final `PipelineState`, and critically the original non-captioned MP4 on disk is untouched (captions are always burned into a copy, a property already guaranteed by the standalone `CaptionService`/`FFmpegVideoAssembler.burn_subtitles`, not something the pipeline layer had to re-implement).
+
+## Two-video output (original + captioned MP4) is an intentional, temporary MVP behavior
+
+Each successful run now leaves both `output/video/<name>.mp4` (original, non-captioned) and `output/video/<name>-captioned.mp4` (final, captioned) on disk. This is deliberate for the current MVP: keeping the original around is a useful development/debugging fallback, and removing it is a storage/cleanup concern, not a captioning concern. A future storage/cleanup milestone may delete the intermediate uncaptioned MP4 once captioning (and eventually upload) has succeeded - this integration milestone explicitly left that behavior unchanged rather than adding cleanup logic prematurely.
+
+## Visual pipeline is frozen for the MVP; occasional single-word captions are accepted, not tuned
+
+Manual review of this milestone's real end-to-end run found (a) some run-to-run variation in stock-footage relevance versus a previous run, still within the previously-accepted quality bar, and (b) occasional single-word caption segments caused by Whisper's own segment boundaries (not a `caption_segmentation.py` defect - that module only ever splits long segments, it never merges short adjacent ones). Both were judged acceptable for the current MVP and explicitly left untuned: the visual pipeline (planning → selection → QC → assembly) remains frozen unless a recurring, severe problem appears, and no caption-segmentation merge logic is planned unless a real readability problem is found in practice.
+
 ## Known limitations
 
-- The Subtitle/Caption Service is implemented and validated but not yet integrated into the main pipeline - `pipeline_demo.py`'s end-to-end run does not currently produce a captioned MP4.
-- Background music / audio mixing is not implemented - captioning only copies the existing audio track through unchanged (`-c:a copy`), it does not add, mix, or modify any audio.
+- The main pipeline currently produces two MP4 files per run (original and captioned) rather than a single final output - see the two-video-output decision above; a future cleanup milestone may remove the intermediate file once it's no longer needed.
+- Background music / audio mixing is still not implemented - captioning only copies the existing audio track through unchanged (`-c:a copy`), it does not add, mix, or modify any audio.
 - Whisper transcription accuracy depends on the TTS narration's clarity; it has not been validated against noisy or multi-speaker audio, which this pipeline does not produce.
-- The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts (observed once in real validation: a stray space before a hyphen) - cosmetic, not a correctness issue for caption sync or meaning.
+- The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts and, per this milestone's real run, occasional single-word caption segments - both cosmetic, not correctness issues for caption sync or meaning, and not being tuned further at this stage.
+- Stock footage semantic relevance can vary run-to-run with live Pexels results; the visual pipeline is considered feature-complete/frozen for the MVP and is not planned for further optimization without a new, recurring, concrete problem.

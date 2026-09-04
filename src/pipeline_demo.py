@@ -1,24 +1,27 @@
 # Live demo runner for the complete Research -> Script -> Voice -> Visual
-# Media -> Visual QC -> Video Assembly pipeline.
+# Media -> Visual QC -> Video Assembly -> Subtitle/Caption pipeline.
 #
 # Uses the existing provider factory (src.config.providers / Settings), so
 # with the current .env configuration (LLM_PROVIDER=gemini,
-# SEARCH_PROVIDER=wikipedia, VOICE_PROVIDER=edge, MEDIA_PROVIDER=pexels)
-# this calls real Wikipedia search, real Gemini LLM processing (including
-# its existing retry/backoff/fallback-model behavior, untouched by this
-# module), real Edge TTS narration synthesis, real Pexels stock media
-# retrieval, real Gemini vision QC, and real FFmpeg video assembly.
+# SEARCH_PROVIDER=wikipedia, VOICE_PROVIDER=edge, MEDIA_PROVIDER=pexels,
+# TRANSCRIPTION_PROVIDER=whisper) this calls real Wikipedia search, real
+# Gemini LLM processing (including its existing retry/backoff/fallback-
+# model behavior, untouched by this module), real Edge TTS narration
+# synthesis, real Pexels stock media retrieval, real Gemini vision QC, real
+# FFmpeg video assembly, and real local Whisper transcription/captioning.
 from __future__ import annotations
 
 import asyncio
 import dataclasses
 import sys
 
+from src.caption_demo import print_caption_result
 from src.config.providers import (
     ProviderConfigError,
     get_llm_provider,
     get_media_provider,
     get_search_provider,
+    get_transcription_provider,
     get_visual_relevance_evaluator,
     get_voice_provider,
 )
@@ -27,6 +30,7 @@ from src.main import print_research_result
 from src.media_demo import print_visual_result
 from src.script_demo import print_script_result
 from src.visual_qc_demo import print_qc_result
+from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR
 from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.services.visual_media_service import DEFAULT_MEDIA_OUTPUT_DIR
 from src.services.voice_service import DEFAULT_OUTPUT_DIR
@@ -40,12 +44,13 @@ DEFAULT_TOPIC = "Why do humans dream?"
 # top-level progress stage - it isn't a separately observable pipeline step
 # from the outside, just an internal part of how Visual Media selects assets.
 _STAGE_LABELS = {
-    "research": "[1/6] Research",
-    "script": "[2/6] Script",
-    "voice": "[3/6] Voice",
-    "media": "[4/6] Visual Media",
-    "visual_qc": "[5/6] Visual QC",
-    "video_assembly": "[6/6] Video Assembly",
+    "research": "[1/7] Research",
+    "script": "[2/7] Script",
+    "voice": "[3/7] Voice",
+    "media": "[4/7] Visual Media",
+    "visual_qc": "[5/7] Visual QC",
+    "video_assembly": "[6/7] Video Assembly",
+    "captions": "[7/7] Subtitles / Captions",
 }
 
 
@@ -58,7 +63,7 @@ def _ensure_utf8_stdout() -> None:
 
 
 async def run_pipeline_demo(topic: str) -> PipelineState:
-    """Run the full 6-stage pipeline, printing progress as each stage completes.
+    """Run the full 7-stage pipeline, printing progress as each stage completes.
 
     Provider selection comes entirely from Settings/.env via the existing
     provider factory (src.config.providers) - this function does not
@@ -88,12 +93,14 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
     voice_provider = get_voice_provider(settings)
     media_provider = get_media_provider(settings)
     visual_relevance_evaluator = get_visual_relevance_evaluator(settings)
+    transcription_provider = get_transcription_provider(settings)
 
     print(f"Pipeline: {topic}")
     print(
         f"   LLM: {settings.llm_provider} | Search: {settings.search_provider} "
         f"| Voice: {settings.voice_provider} ({settings.voice_name}) "
-        f"| Media: {settings.media_provider} | Visual QC: {visual_relevance_evaluator.name} | Video: ffmpeg"
+        f"| Media: {settings.media_provider} | Visual QC: {visual_relevance_evaluator.name} "
+        f"| Captions: {transcription_provider.name} | Video: ffmpeg"
     )
     print("=" * 60)
 
@@ -105,9 +112,11 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         media_provider,
         assembler,
         visual_relevance_evaluator,
+        transcription_provider,
         DEFAULT_OUTPUT_DIR,
         DEFAULT_MEDIA_OUTPUT_DIR,
         DEFAULT_VIDEO_OUTPUT_DIR,
+        DEFAULT_SUBTITLE_OUTPUT_DIR,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
@@ -131,6 +140,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         visual_qc_result=accumulated.get("visual_qc_result"),
         qc_approved_visual_result=accumulated.get("qc_approved_visual_result"),
         video_assembly_result=accumulated.get("video_assembly_result"),
+        caption_result=accumulated.get("caption_result"),
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
     )
@@ -182,13 +192,29 @@ def _print_final_summary(state: PipelineState) -> None:
         result = state.video_assembly_result
         print(f"Video Assembly success: {result.success}")
         if result.success:
-            print(f"Final MP4:  {result.output_path}")
+            print(f"Assembled MP4 (non-captioned): {result.output_path}")
             print(f"Duration:   {result.duration_seconds:.1f}s")
             print(f"Resolution: {result.width}x{result.height} @ {result.fps}fps")
         else:
             print(f"Video Assembly error: {result.error}")
     else:
         print("Video Assembly success: False")
+
+    if state.caption_result:
+        caption = state.caption_result
+        print(f"Captions success: {caption.success}")
+        if caption.success:
+            print(f"Caption segments: {len(caption.segments)}")
+            print(f"SRT file:        {caption.srt_path}")
+            print(f"Captioned MP4:   {caption.captioned_video_path}")
+            print(
+                f"Duration (original vs captioned): "
+                f"{caption.video_duration_seconds} vs {caption.captioned_duration_seconds}"
+            )
+        else:
+            print(f"Captions error: {caption.error}")
+    else:
+        print("Captions success: False")
 
 
 async def main() -> None:
@@ -264,6 +290,12 @@ async def main() -> None:
             print(f"Sections:   {result.section_count}")
         else:
             print(f"Error: {result.error}")
+
+    if state.caption_result:
+        print("\n" + "#" * 60)
+        print("# CAPTION RESULT")
+        print("#" * 60)
+        print_caption_result(state.caption_result)
 
     _print_final_summary(state)
 

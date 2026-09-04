@@ -41,12 +41,12 @@ ruff format .
 
 ## MVP Scope
 
-The complete orchestration - Research → Script → Voice → Visual Context Planner → Duration-Aware Visual Media → Visual QC → Video Assembly - is implemented and validated end-to-end with real providers, including real Gemini vision QC. One command turns a topic into a final playable MP4:
+The complete orchestration - Research → Script → Voice → Visual Context Planner → Duration-Aware Visual Media → Visual QC → Video Assembly → Subtitles/Captions - is implemented and validated end-to-end with real providers, including real Gemini vision QC and real local Whisper transcription. One command turns a topic into a final captioned, playable MP4:
 
 ```
 Topic Input → Research Agent → Script Agent → Voice Service → Visual Context Planner
             → Duration-Aware Visual Media Service → Visual QC
-            → Video Assembly Service → Final MP4
+            → Video Assembly Service → Subtitle/Caption Service → Captioned Final MP4
 ```
 
 - **Research Agent**: researches a topic (real Wikipedia search + Gemini LLM, with mock providers for offline dev) and produces a structured `ResearchResult` (summary, key points, sourced facts, source URLs).
@@ -56,16 +56,19 @@ Topic Input → Research Agent → Script Agent → Voice Service → Visual Con
 - **Visual Media Service**: duration-aware - it derives how many distinct stock clips each section needs from that section's real share of the narration duration (not a fixed count), and consumes the visual plan (rather than isolated keywords) to search, filter, and select multiple ordered assets per section. A deterministic semantic filter rejects candidates whose available metadata matches an `avoid_concept`. Only the assets actually selected are downloaded (real Pexels, with a mock provider for offline dev), saved under `output/media/`. Selected assets are tracked globally across the whole video to avoid duplicates, with exact-asset reuse/looping used only as a controlled fallback when unique stock footage runs out.
 - **Visual QC**: inspects real representative frames (not just text metadata) from every selected asset with a vision-capable evaluator (real Gemini vision, with a mock evaluator for offline dev) - one batched request per script section. Assets judged weak or misleading trigger a bounded replacement request back through the Visual Media Service (never an unbounded search); an asset still flagged misleading after replacement is exhausted stops the pipeline before Video Assembly rather than risk a misleading clip in the final video. A vision-provider outage falls back to the upstream metadata filter's prior approval instead of failing the pipeline.
 - **Video Assembly Service**: combines the narration audio with each section's one or more QC-approved ordered clips into a final MP4 (FFmpeg: H.264 video, AAC audio, 1920x1080, 30 fps), saved under `output/video/`. Makes no semantic decisions - only timing, trimming, cropping, ordering, concatenation, and audio sync.
+- **Subtitle/Caption Service**: runs after Video Assembly succeeds. Transcribes the real narration audio locally (Whisper via `faster-whisper` - free, no paid API) to get actual spoken-word timestamps (never estimated from script section durations), builds readable YouTube-style captions, writes an `.srt` file under `output/subtitles/`, and burns captions into a **copy** of the assembled MP4 (`output/video/<name>-captioned.mp4`) - the original MP4 is never overwritten.
 
-All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo "<topic>"`); a failure at any stage - including a hard Visual QC failure - stops the pipeline before the next one runs, and the pipeline only reports `completed` once a real final MP4 exists, assembled only from Visual QC-approved media. `output/audio/`, `output/media/`, and `output/video/` are all generated runtime artifacts and are Git-ignored - nothing under them is source.
+All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo "<topic>"`); a failure at any stage - including a hard Visual QC failure or a caption/transcription failure - stops the pipeline before the next one runs (or before completion), preserving every earlier stage's successful results. The pipeline only reports `completed` once the final captioned MP4 exists. `output/audio/`, `output/media/`, `output/video/`, and `output/subtitles/` are all generated runtime artifacts and are Git-ignored - nothing under them is source.
 
-**Known limitation**: perfect semantic stock-footage matching is not guaranteed - Pexels' inventory for a given query is finite, so even with duration-aware planning, semantic filtering, and vision QC, an occasional visual can still be only loosely related to its section, and controlled visual reuse may still occur in longer videos. Manual review of a real run found this acceptable (~80-90% of visuals semantically relevant) for the current MVP. The visual pipeline (planning → selection → QC → assembly) is considered feature-complete for now and is not planned for further optimization without a new concrete problem.
+**Known limitation (visual)**: perfect semantic stock-footage matching is not guaranteed - Pexels' inventory for a given query is finite, so even with duration-aware planning, semantic filtering, and vision QC, an occasional visual can still be only loosely related to its section, and controlled visual reuse may still occur in longer videos; relevance can also vary somewhat run-to-run with live Pexels results. Manual review of real runs has found this acceptable for the current MVP. The visual pipeline (planning → selection → QC → assembly) is considered feature-complete/frozen for now and is not planned for further optimization without a new, recurring, concrete problem.
+
+**Known limitation (captions)**: occasional very short, single-word captions can occur due to Whisper's own segmentation, since caption segmentation only ever splits long segments and never merges short adjacent ones. Manual review found current readability acceptable, so no further segmentation tuning is planned at this stage.
+
+**Two-video output**: each run currently produces both the original assembled MP4 and a separate captioned MP4, rather than one final file. This is intentional for the current MVP (the original is a useful development/debug fallback); a future storage/cleanup milestone may delete the intermediate uncaptioned MP4 once captioning/upload has succeeded.
 
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 
-A **Subtitle/Caption Service** has been implemented and validated standalone (`CaptionService`, `src/caption_demo.py`): it transcribes the real narration audio locally (Whisper via `faster-whisper` - free, no paid API) to get actual spoken-word timestamps (never estimated from script section durations), builds readable YouTube-style captions, writes an `.srt` file, and burns captions into a **copy** of the assembled MP4 (`output/video/<name>-captioned.mp4`) - the original MP4 is never overwritten. It is **not yet wired into the main pipeline** above; integrating it as a stage after Video Assembly is the next planned milestone.
-
-Background music/audio mixing, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet.
+Background music/audio mixing, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is a standalone BGM/audio mixing service.
 
 ## Project Structure
 

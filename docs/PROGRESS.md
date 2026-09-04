@@ -162,6 +162,16 @@
 - Real standalone run validated via `python -m src.caption_demo` against the existing narration MP3 and assembled MP4 from a prior real pipeline run (Research/Script/Voice/Visual Media/Visual QC were **not** re-run): real Whisper (`base`) transcription produced 44 caption segments; captioned MP4 duration (166.968s) matched the original exactly; resolution/fps/codecs (1920x1080 @30fps, h264/aac) unchanged; the original MP4's file modification time confirmed it was untouched
 - Manual review confirmed subtitle synchronization with the spoken narration and overall readability were satisfactory
 - Standalone Subtitle/Caption Service milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/caption_demo.py` is a separate standalone runner for this milestone
+- Subtitle/Caption Service integrated into the main LangGraph orchestration as a `captions` node running after Video Assembly - the pipeline is now 7 stages: Research → Script → Voice → Visual Media → Visual QC → Video Assembly → Subtitles/Captions
+- Only 3 files were changed to wire it in: `src/workflows/pipeline_graph.py`, `src/pipeline_demo.py`, `tests/test_pipeline_workflow.py` - the existing standalone `CaptionService` and every caption sub-module (transcription, segmentation, SRT writing, FFmpeg subtitle burning) were reused exactly as validated in the standalone milestone, with no duplicated logic introduced
+- `PipelineState.caption_result` added; pipeline `status` only becomes `completed` once captioning itself succeeds (`video_assembly_node`'s own success status was renamed to `assembled`); a caption failure marks the pipeline `failed` while preserving every earlier stage's successful results, including the original non-captioned MP4
+- Captions run only after Video Assembly succeeds; subtitle timing is taken from the real narration transcription (via the reused `CaptionService`/Whisper path), never from estimated script-section durations
+- The captioned MP4 is produced as a separate file alongside the original assembled MP4 (two-video output) - this is intentional for the current MVP; a future storage/cleanup milestone may delete the intermediate uncaptioned MP4 once captioning/upload has succeeded, but that change is deliberately out of scope for now
+- 630/630 tests passing
+- Real end-to-end run validated via `python -m src.pipeline_demo "Why do humans dream?"`: all 7 stages completed with final status `completed` - narration ~154s, Visual Media produced 19 slots, Visual QC approved the full set with 2 weak/unverifiable visuals replaced and 0 final rejected (fallback not needed), Video Assembly produced the original MP4, and Captions produced an SRT file plus a captioned MP4 with matching duration; the original non-captioned MP4 remained untouched
+- Manual review of the real run confirmed subtitle accuracy, timing sync, readability, and end-of-video timing were all satisfactory
+- Manual review also found some run-to-run variation in stock footage relevance (a few mildly irrelevant visuals compared to a previous run) - judged acceptable for the current MVP; this is expected variation in live Pexels results, not a regression, and the visual pipeline is not being further tuned because of it (see Known Limitations)
+- Subtitle / Caption Pipeline Integration milestone marked **COMPLETE**
 
 ## Known Limitations
 
@@ -171,16 +181,24 @@
 - Repetition checking remains asset-ID/position based only, not frame-level computer-vision duplicate detection - controlled visual reuse may still occur.
 - Perfect semantic stock-footage matching is not guaranteed: Pexels' inventory for a given query is finite, so even with duration-aware planning, semantic filtering, and vision QC, an occasional visual can still be only loosely related to its section - real review found this acceptable (~80-90% relevance) for the current MVP, not eliminated.
 - For long videos where Pexels lacks enough unique matching stock footage, controlled asset reuse (and, as a last resort, looping) remains an accepted fallback rather than a hard failure.
-- The Subtitle/Caption Service is implemented and validated but is **standalone only** - the main pipeline's final output (`python -m src.pipeline_demo`) does not currently include captions.
+- The main pipeline currently produces **two** MP4 outputs per run (the original assembled MP4 and a separate captioned MP4) rather than one final file - intentional for now; a future storage/cleanup milestone may remove the intermediate uncaptioned MP4 once captioning/upload has succeeded.
+- Occasional very short, single-word caption segments can occur, driven by Whisper's own segment boundaries rather than `caption_segmentation.py`'s (split-only, never-merge) logic - manual review of the real integrated run found current readability acceptable, so no further caption segmentation tuning is planned unless a real problem is found.
+- Stock footage semantic relevance remains good-enough-but-not-perfect and can vary run-to-run with live Pexels results - the visual pipeline (planning → selection → QC → assembly) is considered frozen for the current MVP and will not be further tuned unless a recurring, severe relevance problem appears.
 - Background music / audio mixing is not implemented yet - captioning does not touch or introduce any audio track beyond copying the existing narration audio through unchanged.
 
 ## Current Next Milestone
 
-Integrate the Subtitle/Caption Service into the main orchestration, after Video Assembly:
+**Standalone BGM / Audio Mixing Service** - build and validate background music/audio mixing as its own standalone service first (same standalone-first pattern used for Visual QC and Captions), before wiring it into the main pipeline.
 
-```
-Topic → Research → Script → Voice → Visual Context Planner → Visual Media → Visual QC
-      → Video Assembly → Subtitle/Caption Service → Captioned Final MP4
-```
+Planned sequence after that, in order:
 
-Not yet started, in no particular priority order: background music, thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention of intermediate assets (`output/audio/`, `output/media/`).
+1. Standalone BGM / Audio Mixing Service
+2. Manual audio quality review
+3. BGM pipeline integration
+4. Metadata Agent
+5. Thumbnail Agent
+6. Copyright / Compliance checks
+7. YouTube Upload + Scheduling
+8. Monitoring / Post-publish
+9. Topic Planner
+10. Final storage/cleanup hardening as appropriate (including the two-video-output cleanup noted above)
