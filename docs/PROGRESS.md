@@ -185,6 +185,15 @@
 - Real standalone validation: 5 real instrumental tracks added to the catalog from the YouTube Audio Library (all marked "Attribution not required"); the demo reused the existing captioned MP4 (`why-do-humans-dream-7c674e5c-captioned.mp4`) and its matching `.srt` transcript with no Research/Script rerun; the single Gemini mood-planning call hit real 429/503/timeout rate limiting, so the deterministic fallback `MusicPlan` activated automatically and the demo completed successfully instead of failing; `MusicSelectionService` selected "Calm Music" (YouTube Audio Library, no attribution required); mixed at -24 dB gain with ducking enabled; source video duration ~154.152s, output duration ~154.133s; the original captioned MP4 was confirmed untouched (modification time and byte content unchanged)
 - Manual review confirmed the mix sounds subtle and professional for the current MVP: narration stayed clearly dominant and clear, BGM was mild/subtle under speech and rose slightly during narration gaps (intentional ducking behavior), judged acceptable overall
 - Standalone BGM / Audio Mixing Service milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/bgm_demo.py` is a separate standalone runner for this milestone
+- BGM / Audio Mixing Main Pipeline Integration implemented: `AudioMixingService` is now wired into the main LangGraph orchestration as a `bgm` node running after Subtitles/Captions - the pipeline is now 8 stages: Research → Script → Voice → Visual Media → Visual QC → Video Assembly → Subtitles/Captions → BGM/Audio Mixing
+- Only 3 files were changed to wire it in: `src/workflows/pipeline_graph.py`, `src/pipeline_demo.py`, `tests/test_pipeline_workflow.py` - the existing standalone `AudioMixingService`, `MusicContextPlanner`, `MusicSelectionService`, `MusicCatalogProvider`/`LocalMusicCatalogProvider`, and FFmpeg background-audio mixing were reused exactly as validated in the standalone milestone, with no duplicated planning/selection/catalog/mixing logic introduced
+- `PipelineState.audio_mix_result` added; pipeline `status` only becomes `completed` once BGM mixing itself succeeds (`caption_node`'s own success status was renamed to `captioned`); a BGM failure marks the pipeline `failed` while preserving every earlier stage's successful results, including the captioned MP4
+- BGM runs only after Captions succeeds, and reuses the exact `ScriptResult` already present in `PipelineState` for mood planning and the captioned MP4 from `CaptionResult` as the file it mixes onto - Research/Script/Voice/Visual Media/Visual QC/Video Assembly/Captions are never re-run inside the BGM node
+- A semantic mood-planning failure (429/503/timeout/malformed response) does not fail the pipeline - `MusicContextPlanner`'s existing deterministic fallback `MusicPlan` activates automatically, track selection and mixing continue, and the pipeline still reaches `completed`; only a real hard BGM failure (empty approved catalog, missing selected track file, or an FFmpeg mixing failure) marks the pipeline `failed`, with the captioned MP4 and all earlier successful results preserved
+- The final pipeline output is now the captioned-and-BGM-mixed MP4; the original assembled MP4, the captioned MP4, and the `.srt` file all remain as intermediate/development outputs on disk (no storage cleanup implemented yet)
+- 727/727 tests passing (18 new BGM pipeline-integration tests), all using mocked LLM/catalog/assembler doubles - no real Gemini, Pexels, Whisper, or FFmpeg calls in the automated suite
+- Real full 8-stage end-to-end validation was intentionally **not** attempted for this milestone - the configured Gemini free-tier models were unstable/rate-limited at the time, and running the full real pipeline was explicitly out of scope; automated pytest coverage (including the fallback/failure routing tests above) was used instead
+- BGM / Audio Mixing Main Pipeline Integration milestone marked **COMPLETE**
 
 ## Known Limitations
 
@@ -199,24 +208,20 @@
 - Stock footage semantic relevance remains good-enough-but-not-perfect and can vary run-to-run with live Pexels results - the visual pipeline (planning → selection → QC → assembly) is considered frozen for the current MVP and will not be further tuned unless a recurring, severe relevance problem appears.
 - The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
 - Gemini mood planning is a single optional call per video; real validation showed it can be unavailable under Gemini free-tier rate limiting (429/503/timeouts), in which case the deterministic fallback `MusicPlan` (neutral/calm, low energy, ambient/cinematic, neutral/subtle required) is used automatically - mood selection is correspondingly generic whenever the LLM call doesn't succeed.
-- The Standalone BGM / Audio Mixing Service is implemented and validated but is **standalone only** - the main pipeline's final output (`python -m src.pipeline_demo`) does not currently include background music.
+- Gemini free-tier models (`gemini-3.5-flash-lite`/`gemini-3.6-flash`) have recently returned sustained 429/503/timeouts during real validation attempts - BGM mood planning tolerates this via its deterministic fallback, but a real full 8-stage end-to-end run (Research through BGM, all real providers together) has not yet been re-validated under current API conditions.
+- The main pipeline now produces **three** MP4-related outputs per run on disk (the original assembled MP4, the captioned MP4, and the final BGM-mixed MP4), plus the `.srt` file, rather than a single final output - intentional for now as development/debug fallbacks; a future storage/cleanup milestone may remove the intermediate files once the final mixed MP4 has been used/uploaded successfully.
 
 ## Current Next Milestone
 
-**BGM / Audio Mixing Main Pipeline Integration** - wire the already-validated standalone `AudioMixingService` into the main orchestration as a stage after Captions:
-
-```
-Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
-      → Subtitles / Captions → BGM / Audio Mixing → Final Mixed MP4
-```
+**LLM / Gemini Reliability Strategy + Real 8-Stage End-to-End Validation** - address the Gemini free-tier instability (429/503/timeouts) observed during BGM validation attempts, then run and validate one complete real end-to-end pipeline execution (Research → Script → Voice → Visual Media → Visual QC → Video Assembly → Subtitles/Captions → BGM/Audio Mixing, all real providers together) - no model/provider changes were made as part of this integration milestone; that reliability work is deliberately deferred to its own milestone rather than rushed in alongside orchestration changes.
 
 Planned sequence after that, in order:
 
-1. BGM / Audio Mixing Main Pipeline Integration
+1. LLM / Gemini Reliability Strategy + Real 8-Stage End-to-End Validation
 2. Metadata Agent
 3. Thumbnail Agent
 4. Copyright / Compliance checks
 5. YouTube Upload + Scheduling
 6. Monitoring / Post-publish
 7. Topic Planner
-8. Final storage/cleanup hardening as appropriate (including the two-video-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)
+8. Final storage/cleanup hardening as appropriate (including the multi-file-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)

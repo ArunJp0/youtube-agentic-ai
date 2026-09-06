@@ -15,6 +15,7 @@ import asyncio
 import dataclasses
 import sys
 
+from src.bgm_demo import print_mix_result
 from src.caption_demo import print_caption_result
 from src.config.providers import (
     ProviderConfigError,
@@ -35,6 +36,7 @@ from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.services.visual_media_service import DEFAULT_MEDIA_OUTPUT_DIR
 from src.services.voice_service import DEFAULT_OUTPUT_DIR
 from src.tools.ffmpeg_video_assembler import FFmpegVideoAssembler, VideoAssemblerError
+from src.tools.music_catalog_provider import LocalMusicCatalogProvider
 from src.workflows.pipeline_graph import PipelineState, build_pipeline_graph
 
 DEFAULT_TOPIC = "Why do humans dream?"
@@ -44,13 +46,14 @@ DEFAULT_TOPIC = "Why do humans dream?"
 # top-level progress stage - it isn't a separately observable pipeline step
 # from the outside, just an internal part of how Visual Media selects assets.
 _STAGE_LABELS = {
-    "research": "[1/7] Research",
-    "script": "[2/7] Script",
-    "voice": "[3/7] Voice",
-    "media": "[4/7] Visual Media",
-    "visual_qc": "[5/7] Visual QC",
-    "video_assembly": "[6/7] Video Assembly",
-    "captions": "[7/7] Subtitles / Captions",
+    "research": "[1/8] Research",
+    "script": "[2/8] Script",
+    "voice": "[3/8] Voice",
+    "media": "[4/8] Visual Media",
+    "visual_qc": "[5/8] Visual QC",
+    "video_assembly": "[6/8] Video Assembly",
+    "captions": "[7/8] Subtitles / Captions",
+    "bgm": "[8/8] BGM / Audio Mixing",
 }
 
 
@@ -63,7 +66,7 @@ def _ensure_utf8_stdout() -> None:
 
 
 async def run_pipeline_demo(topic: str) -> PipelineState:
-    """Run the full 7-stage pipeline, printing progress as each stage completes.
+    """Run the full 8-stage pipeline, printing progress as each stage completes.
 
     Provider selection comes entirely from Settings/.env via the existing
     provider factory (src.config.providers) - this function does not
@@ -94,13 +97,19 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
     media_provider = get_media_provider(settings)
     visual_relevance_evaluator = get_visual_relevance_evaluator(settings)
     transcription_provider = get_transcription_provider(settings)
+    # No mock/real toggle for this one (unlike the providers above) - the
+    # approved local BGM catalog is always the local curated one for real
+    # demo runs, the same way FFmpegVideoAssembler above has no mock
+    # counterpart in this demo either; only the automated test suite needs
+    # a mock catalog, injected directly where it calls build_pipeline_graph.
+    music_catalog_provider = LocalMusicCatalogProvider()
 
     print(f"Pipeline: {topic}")
     print(
         f"   LLM: {settings.llm_provider} | Search: {settings.search_provider} "
         f"| Voice: {settings.voice_provider} ({settings.voice_name}) "
         f"| Media: {settings.media_provider} | Visual QC: {visual_relevance_evaluator.name} "
-        f"| Captions: {transcription_provider.name} | Video: ffmpeg"
+        f"| Captions: {transcription_provider.name} | BGM: {music_catalog_provider.name} | Video: ffmpeg"
     )
     print("=" * 60)
 
@@ -113,6 +122,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         assembler,
         visual_relevance_evaluator,
         transcription_provider,
+        music_catalog_provider,
         DEFAULT_OUTPUT_DIR,
         DEFAULT_MEDIA_OUTPUT_DIR,
         DEFAULT_VIDEO_OUTPUT_DIR,
@@ -141,6 +151,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         qc_approved_visual_result=accumulated.get("qc_approved_visual_result"),
         video_assembly_result=accumulated.get("video_assembly_result"),
         caption_result=accumulated.get("caption_result"),
+        audio_mix_result=accumulated.get("audio_mix_result"),
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
     )
@@ -215,6 +226,21 @@ def _print_final_summary(state: PipelineState) -> None:
             print(f"Captions error: {caption.error}")
     else:
         print("Captions success: False")
+
+    if state.audio_mix_result:
+        mix = state.audio_mix_result
+        print(f"BGM/Audio Mix success: {mix.success}")
+        if mix.success:
+            plan = mix.music_plan
+            planner_status = "LLM semantic plan" if plan and plan.used_semantic_planning else "deterministic fallback"
+            track_title = mix.selected_track.title if mix.selected_track else None
+            print(f"Mood planning: {planner_status} | Selected track: {track_title}")
+            print(f"BGM gain: {mix.bgm_gain_db}dB | Ducking: {mix.ducking_used} | Looped: {mix.looped}")
+            print(f"Final mixed MP4: {mix.output_path}")
+        else:
+            print(f"BGM/Audio Mix error: {mix.error}")
+    else:
+        print("BGM/Audio Mix success: False")
 
 
 async def main() -> None:
@@ -296,6 +322,12 @@ async def main() -> None:
         print("# CAPTION RESULT")
         print("#" * 60)
         print_caption_result(state.caption_result)
+
+    if state.audio_mix_result:
+        print("\n" + "#" * 60)
+        print("# AUDIO MIX RESULT")
+        print("#" * 60)
+        print_mix_result(state.audio_mix_result)
 
     _print_final_summary(state)
 

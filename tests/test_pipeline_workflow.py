@@ -1,9 +1,11 @@
 # Tests for the Research -> Script -> Voice -> Visual Media -> Visual QC ->
-# Video Assembly -> Subtitle/Caption pipeline workflow (LangGraph). All
-# tests use mock providers/fake assembler/fake evaluator/fake transcription
-# only - no real network/API/FFmpeg/Whisper calls.
+# Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing pipeline workflow
+# (LangGraph). All tests use mock providers/fake assembler/fake evaluator/
+# fake transcription/mock BGM catalog only - no real network/API/FFmpeg/
+# Whisper/Gemini calls.
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -12,6 +14,7 @@ from src.llm.mock import MockLLMProvider
 from src.llm.provider import LLMProvider
 from src.models.captions import CaptionResult
 from src.models.media import VisualResult
+from src.models.music import AudioMixResult, BGMTrack
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
 from src.models.video import VideoAssemblyResult
@@ -19,6 +22,7 @@ from src.models.visual_qc import RawAssetVerdict, VisualQCResult
 from src.models.voice import VoiceResult
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
+from src.tools.music_catalog_provider import MockMusicCatalogProvider
 from src.tools.search_provider import MockSearchProvider, SearchProvider
 from src.tools.transcription_provider import MockTranscriptionProvider, TranscriptionProviderError
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
@@ -27,12 +31,32 @@ from src.workflows.pipeline_graph import PipelineState, build_pipeline_graph, ru
 
 TEST_VOICE_NAME = "test-voice"
 
+# MusicContextPlanner's prompt always opens with this line (see
+# src/agents/music_context_planner.py) - a unique marker that lets test
+# doubles distinguish the BGM mood-planning call from Research/Script
+# prompts sharing the same LLMProvider.
+_MUSIC_PROMPT_MARKER = "BACKGROUND MUSIC CHARACTERISTICS"
+
 
 class EmptySearchProvider(SearchProvider):
     """Test double: search always returns no results."""
 
     async def search(self, query: str, num_results: int = 5):
         return []
+
+
+class RecordingSearchProvider(SearchProvider):
+    """Wraps MockSearchProvider and records every query - lets tests prove
+    Research is never re-triggered by a later stage (e.g. BGM mood
+    planning), since ResearchAgent is the only caller of SearchProvider."""
+
+    def __init__(self) -> None:
+        self._delegate = MockSearchProvider()
+        self.calls: list[str] = []
+
+    async def search(self, query: str, num_results: int = 5):
+        self.calls.append(query)
+        return await self._delegate.search(query, num_results)
 
 
 class ExplodingLLMProvider(LLMProvider):
@@ -53,6 +77,11 @@ class ResearchMockWithVariedSections(LLMProvider):
     different section points apart enough to clear ScriptAgent's near-
     duplicate threshold - unsuitable for testing a full pipeline with real
     section-distinctness requirements.
+
+    Never returns valid JSON for MusicContextPlanner's mood-planning
+    prompt either, so the default pipeline fixture exercises BGM's
+    deterministic fallback path (see MusicPlanningLLMProvider below for
+    the successful-semantic-planning counterpart).
     """
 
     def __init__(self) -> None:
@@ -63,6 +92,49 @@ class ResearchMockWithVariedSections(LLMProvider):
             point = prompt.split("Point to expand on: '", 1)[1].split("'.", 1)[0]
             return f"{point}. A distinct detail worth covering on its own."
         return self._mock.generate_text(prompt)
+
+
+class RecordingLLMProvider(LLMProvider):
+    """Wraps ResearchMockWithVariedSections and records every prompt seen -
+    lets tests inspect exactly what was sent to the shared LLMProvider
+    (e.g. to confirm the BGM mood-planning prompt reflects the real,
+    already-produced ScriptResult) without needing a fully scripted fake."""
+
+    def __init__(self) -> None:
+        self._delegate = ResearchMockWithVariedSections()
+        self.calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        return self._delegate.generate_text(prompt)
+
+
+class MusicPlanningLLMProvider(LLMProvider):
+    """Delegates Research/Script prompts to ResearchMockWithVariedSections
+    (unchanged, realistic behavior), but returns a valid structured
+    MusicPlan JSON response for MusicContextPlanner's distinctive prompt -
+    exercising the successful semantic mood-planning path deterministically."""
+
+    def __init__(self) -> None:
+        self._delegate = ResearchMockWithVariedSections()
+        self.music_plan_calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        if _MUSIC_PROMPT_MARKER in prompt:
+            self.music_plan_calls.append(prompt)
+            return json.dumps(
+                {
+                    "primary_mood": "thoughtful",
+                    "secondary_mood": "calm",
+                    "energy_level": "low",
+                    "preferred_genres": ["ambient"],
+                    "preferred_instrumentation": ["piano"],
+                    "avoid_styles": ["aggressive"],
+                    "requires_neutral_subtle": True,
+                    "reasoning_summary": "test reasoning",
+                }
+            )
+        return self._delegate.generate_text(prompt)
 
 
 class ExplodingVoiceProvider(VoiceProvider):
@@ -97,19 +169,25 @@ class ExplodingMediaProvider(MediaProvider):
 class FakeVideoAssembler(VideoAssembler):
     """Test double: records calls and writes tiny placeholder files instead
     of running real FFmpeg, so the pipeline's visual_qc/video_assembly/
-    captions stages can be exercised without any real encoding/extraction/
-    subtitle-burning process."""
+    captions/bgm stages can be exercised without any real encoding/
+    extraction/subtitle-burning/audio-mixing process."""
 
     def __init__(
-        self, audio_duration: float = 30.0, fail: bool = False, fail_burn_subtitles: bool = False
+        self,
+        audio_duration: float = 30.0,
+        fail: bool = False,
+        fail_burn_subtitles: bool = False,
+        fail_mix_background_audio: bool = False,
     ) -> None:
         self.audio_duration = audio_duration
         self.fail = fail
         self.fail_burn_subtitles = fail_burn_subtitles
+        self.fail_mix_background_audio = fail_mix_background_audio
         self.build_calls: list[dict] = []
         self.assemble_calls: list[dict] = []
         self.extract_frame_calls: list[dict] = []
         self.burn_subtitle_calls: list[dict] = []
+        self.mix_background_audio_calls: list[dict] = []
 
     def probe_duration_seconds(self, media_path: str) -> float:
         if self.fail:
@@ -148,8 +226,31 @@ class FakeVideoAssembler(VideoAssembler):
         with open(output_path, "wb") as f:
             f.write(b"FAKE CAPTIONED VIDEO")
 
-    def mix_background_audio(self, *args, **kwargs):
-        raise NotImplementedError("not exercised by pipeline workflow tests")
+    def mix_background_audio(
+        self,
+        input_video_path,
+        music_path,
+        output_path,
+        target_duration_seconds,
+        music_gain_db,
+        fade_in_seconds,
+        fade_out_seconds,
+        use_ducking=True,
+    ) -> None:
+        self.mix_background_audio_calls.append(
+            {
+                "input_video_path": input_video_path,
+                "music_path": music_path,
+                "output_path": output_path,
+                "target_duration_seconds": target_duration_seconds,
+                "music_gain_db": music_gain_db,
+                "use_ducking": use_ducking,
+            }
+        )
+        if self.fail_mix_background_audio:
+            raise VideoAssemblerError("simulated ffmpeg BGM mixing failure")
+        with open(output_path, "wb") as f:
+            f.write(b"FAKE BGM MIXED VIDEO")
 
 
 class ExplodingVisualRelevanceEvaluator(VisualRelevanceEvaluator):
@@ -205,9 +306,34 @@ class FirstAttemptWeakEvaluator(VisualRelevanceEvaluator):
         return [RawAssetVerdict(asset_id=a.asset_id, relevance_score=score, reason=reason) for a in context.assets]
 
 
+def _music_catalog_provider(tmp_path, track_id: str = "calm-test-track", write_file: bool = True) -> MockMusicCatalogProvider:
+    """One approved, instrumental, neutral-tagged test track - passes the
+    deterministic fallback MusicPlan's avoid_styles filter by construction
+    (see src/services/music_planning.py's FALLBACK_AVOID_STYLES)."""
+    track_path = tmp_path / "bgm-tracks" / f"{track_id}.mp3"
+    track_path.parent.mkdir(parents=True, exist_ok=True)
+    if write_file:
+        track_path.write_bytes(b"FAKE BGM TRACK AUDIO")
+    return MockMusicCatalogProvider(
+        tracks=[
+            BGMTrack(
+                track_id=track_id,
+                file_path=str(track_path),
+                title="Calm Test Track",
+                source="Test Fixture",
+                license_type="test_license",
+                instrumental=True,
+                mood_tags=["calm", "neutral", "subtle"],
+                energy_level="low",
+            )
+        ]
+    )
+
+
 class TestPipelineWorkflow:
     """Tests for the combined Research -> Script -> Voice -> Visual Media ->
-    Visual QC -> Video Assembly -> Subtitle/Caption LangGraph pipeline."""
+    Visual QC -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing
+    LangGraph pipeline."""
 
     @pytest.fixture
     def providers(self, tmp_path):
@@ -221,6 +347,7 @@ class TestPipelineWorkflow:
             FakeVideoAssembler(),
             MockVisualRelevanceEvaluator(default_score=0.9),
             MockTranscriptionProvider(),
+            _music_catalog_provider(tmp_path),
             str(tmp_path / "audio"),
             str(tmp_path / "media"),
             str(tmp_path / "video"),
@@ -237,6 +364,7 @@ class TestPipelineWorkflow:
             assembler,
             visual_relevance_evaluator,
             transcription_provider,
+            music_catalog_provider,
             voice_dir,
             media_dir,
             video_dir,
@@ -252,6 +380,7 @@ class TestPipelineWorkflow:
             overrides.get("assembler", assembler),
             overrides.get("visual_relevance_evaluator", visual_relevance_evaluator),
             overrides.get("transcription_provider", transcription_provider),
+            overrides.get("music_catalog_provider", music_catalog_provider),
             voice_dir,
             media_dir,
             video_dir,
@@ -262,12 +391,13 @@ class TestPipelineWorkflow:
     async def test_pipeline_builds_and_compiles(self, providers) -> None:
         (
             search_provider, llm_provider, voice_provider, media_provider, assembler,
-            visual_relevance_evaluator, transcription_provider,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
             voice_dir, media_dir, video_dir, subtitle_dir,
         ) = providers
         graph = build_pipeline_graph(
             search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
-            visual_relevance_evaluator, transcription_provider, voice_dir, media_dir, video_dir, subtitle_dir,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
         )
         assert graph is not None
         compiled = graph.compile()
@@ -302,7 +432,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_voice_result_is_structured_and_stored_in_final_state(self, providers) -> None:
-        _, _, voice_provider, _, _, _, _, _, _, _, _ = providers
+        _, _, voice_provider, _, _, _, _, _, _, _, _, _ = providers
         state = await self._run(providers)
 
         assert isinstance(state.voice_result, VoiceResult)
@@ -369,7 +499,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_video_assembly_receives_qc_approved_inputs(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _, _ = providers
         state = await self._run(providers)
 
         # The assembler was called with the exact media files from the
@@ -394,7 +524,7 @@ class TestPipelineWorkflow:
     async def test_qc_replacement_changes_media_passed_to_video_assembly(self, providers) -> None:
         """When Visual QC replaces a weak asset, Video Assembly must
         receive the replacement - not the originally-selected asset."""
-        _, _, _, _, assembler, _, _, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=FirstAttemptWeakEvaluator())
 
         assert state.status == "completed"
@@ -418,7 +548,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_research_fails(self, providers) -> None:
-        _, _, voice_provider, media_provider, assembler, _, transcription_provider, _, _, _, _ = providers
+        _, _, voice_provider, media_provider, assembler, _, transcription_provider, _, _, _, _, _ = providers
         state = await self._run(providers, topic="")
 
         assert state.status == "failed"
@@ -430,6 +560,7 @@ class TestPipelineWorkflow:
         assert state.qc_approved_visual_result is None
         assert state.video_assembly_result is None
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
@@ -439,7 +570,7 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_script_fails(self, providers) -> None:
-        _, _, voice_provider, media_provider, assembler, _, _, _, _, _, _ = providers
+        _, _, voice_provider, media_provider, assembler, _, _, _, _, _, _, _ = providers
         state = await self._run(providers, llm_provider=ExplodingLLMProvider())
 
         assert state.status == "failed"
@@ -447,13 +578,14 @@ class TestPipelineWorkflow:
         assert state.visual_qc_result is None
         assert state.video_assembly_result is None
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_voice_fails(self, providers) -> None:
-        _, _, _, media_provider, assembler, _, _, _, _, _, _ = providers
+        _, _, _, media_provider, assembler, _, _, _, _, _, _, _ = providers
         state = await self._run(providers, voice_provider=ExplodingVoiceProvider())
 
         assert state.status == "failed"
@@ -466,12 +598,13 @@ class TestPipelineWorkflow:
         assert state.visual_qc_result is None
         assert state.video_assembly_result is None
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert media_provider.calls == []
         assert assembler.build_calls == []
 
     @pytest.mark.asyncio
     async def test_visual_qc_not_called_when_visual_media_fails(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _, _ = providers
         state = await self._run(providers, media_provider=ExplodingMediaProvider())
 
         assert state.status == "failed"
@@ -485,6 +618,7 @@ class TestPipelineWorkflow:
         assert state.visual_qc_result is None
         assert state.video_assembly_result is None
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
         assert assembler.extract_frame_calls == []
@@ -518,21 +652,22 @@ class TestPipelineWorkflow:
     async def test_video_assembly_not_called_after_hard_qc_failure(self, providers) -> None:
         """An asset still flagged misleading after bounded replacement is
         exhausted must stop the pipeline before Video Assembly - never
-        reaching the final video (or captions)."""
-        _, _, _, _, assembler, _, transcription_provider, _, _, _, _ = providers
+        reaching the final video (or captions, or BGM)."""
+        _, _, _, _, assembler, _, transcription_provider, _, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
 
         assert state.status == "failed"
         assert "rejected" in state.error.lower()
         assert state.video_assembly_result is None
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
         assert transcription_provider.calls == []
 
     @pytest.mark.asyncio
     async def test_rejected_assets_not_passed_to_video_assembly(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
 
         assert state.visual_qc_result.rejected_count > 0
@@ -577,17 +712,19 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is not None
         assert state.video_assembly_result.success is False
         assert "simulated ffmpeg outage" in state.video_assembly_result.error
-        # Captions never run on a failed/missing assembled video.
+        # Captions/BGM never run on a failed/missing assembled video.
         assert state.caption_result is None
+        assert state.audio_mix_result is None
 
-    # ---- H. status only "completed" when captioning succeeds after assembly -
+    # ---- H. status only "completed" when BGM mixing succeeds after captioning -
 
     @pytest.mark.asyncio
-    async def test_status_is_completed_only_when_captioning_succeeds(self, providers) -> None:
+    async def test_status_is_completed_only_when_bgm_mixing_succeeds(self, providers) -> None:
         success_state = await self._run(providers)
         assert success_state.status == "completed"
         assert success_state.video_assembly_result.success is True
         assert success_state.caption_result.success is True
+        assert success_state.audio_mix_result.success is True
 
         failure_state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
         assert failure_state.status == "failed"
@@ -601,10 +738,10 @@ class TestPipelineWorkflow:
     # ---- I. existing behavior preserved -------------------------------------
 
     @pytest.mark.asyncio
-    async def test_no_search_results_still_completes_through_captions(self, providers) -> None:
+    async def test_no_search_results_still_completes_through_bgm(self, providers) -> None:
         """MockSearchProvider returning [] is a valid (if sparse) research result,
         not an error - the pipeline should still complete all the way through
-        captioning."""
+        BGM mixing."""
         state = await self._run(providers, topic="obscure topic", search_provider=EmptySearchProvider())
 
         assert state.research_result is not None
@@ -614,6 +751,8 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result.success is True
         assert state.caption_result is not None
         assert state.caption_result.success is True
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
 
     @pytest.mark.asyncio
     async def test_pipeline_state_defaults(self) -> None:
@@ -628,6 +767,7 @@ class TestPipelineWorkflow:
         assert state.qc_approved_visual_result is None
         assert state.video_assembly_result is None
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert state.status == "pending"
         assert state.error is None
 
@@ -652,14 +792,14 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_caption_service_receives_correct_voice_audio_path(self, providers) -> None:
-        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        _, _, _, _, _, _, transcription_provider, _, _, _, _, _ = providers
         state = await self._run(providers)
 
         assert transcription_provider.calls == [state.voice_result.audio_file_path]
 
     @pytest.mark.asyncio
     async def test_caption_service_receives_correct_video_assembly_path(self, providers) -> None:
-        _, _, _, _, assembler, _, _, _, _, _, _ = providers
+        _, _, _, _, assembler, _, _, _, _, _, _, _ = providers
         state = await self._run(providers)
 
         assert len(assembler.burn_subtitle_calls) == 1
@@ -687,28 +827,31 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_caption_node_not_called_when_video_assembly_fails(self, providers) -> None:
-        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        _, _, _, _, _, _, transcription_provider, _, _, _, _, _ = providers
         state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
 
         assert state.status == "failed"
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert transcription_provider.calls == []
 
     @pytest.mark.asyncio
     async def test_caption_node_not_called_after_hard_qc_failure(self, providers) -> None:
-        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        _, _, _, _, _, _, transcription_provider, _, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
 
         assert state.status == "failed"
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert transcription_provider.calls == []
 
     @pytest.mark.asyncio
     async def test_caption_node_not_called_when_research_fails(self, providers) -> None:
-        _, _, _, _, _, _, transcription_provider, _, _, _, _ = providers
+        _, _, _, _, _, _, transcription_provider, _, _, _, _, _ = providers
         state = await self._run(providers, topic="")
 
         assert state.caption_result is None
+        assert state.audio_mix_result is None
         assert transcription_provider.calls == []
 
     # ---- L. Caption failure behavior -----------------------------------------
@@ -719,6 +862,7 @@ class TestPipelineWorkflow:
 
         assert state.status == "failed"
         assert "Caption generation failed" in state.error
+        assert state.audio_mix_result is None
 
     @pytest.mark.asyncio
     async def test_caption_burn_failure_preserves_original_mp4(self, providers) -> None:
@@ -756,3 +900,191 @@ class TestPipelineWorkflow:
         assert state.caption_result.success is False
         assert state.video_assembly_result.success is True
         assert os.path.exists(state.video_assembly_result.output_path)
+        assert state.audio_mix_result is None
+
+    # ---- M. AudioMixResult stored / correct inputs ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_audio_mix_result_is_structured_and_stored_in_final_state(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert isinstance(state.audio_mix_result, AudioMixResult)
+        assert state.audio_mix_result.success is True
+        assert state.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_bgm_node_receives_existing_script_result_from_state(self, providers) -> None:
+        """The BGM mood-planning prompt must reflect the SAME ScriptResult
+        the pipeline actually produced earlier - proving the existing
+        PipelineState.script_result is what's passed through, not a
+        freshly (re)generated one."""
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, llm_provider=recording_llm)
+
+        music_prompts = [c for c in recording_llm.calls if _MUSIC_PROMPT_MARKER in c]
+        assert len(music_prompts) == 1
+        assert state.script_result.video_title in music_prompts[0]
+        assert state.script_result.sections[0].heading in music_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_bgm_node_receives_correct_captioned_mp4(self, providers) -> None:
+        _, _, _, _, assembler, _, _, _, _, _, _, _ = providers
+        state = await self._run(providers)
+
+        assert len(assembler.mix_background_audio_calls) == 1
+        assert (
+            assembler.mix_background_audio_calls[0]["input_video_path"]
+            == state.caption_result.captioned_video_path
+        )
+        # BGM mixes onto the captioned MP4, never the pre-caption assembly.
+        assert (
+            assembler.mix_background_audio_calls[0]["input_video_path"]
+            != state.video_assembly_result.output_path
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_research_or_script_regeneration_inside_bgm_node(self, providers) -> None:
+        recording_search = RecordingSearchProvider()
+        await self._run(providers, search_provider=recording_search)
+
+        # ResearchAgent is the only caller of SearchProvider.search() in the
+        # whole pipeline - if BGM (or anything else) re-ran Research, this
+        # would be > 1.
+        assert len(recording_search.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_caption_result_remains_preserved_after_bgm_stage(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.caption_result is not None
+        assert state.caption_result.success is True
+        assert os.path.exists(state.caption_result.captioned_video_path)
+
+    # ---- N. Semantic MusicPlan / deterministic fallback ----------------------
+
+    @pytest.mark.asyncio
+    async def test_successful_semantic_music_plan_path(self, providers) -> None:
+        llm_provider = MusicPlanningLLMProvider()
+        state = await self._run(providers, llm_provider=llm_provider)
+
+        assert len(llm_provider.music_plan_calls) == 1
+        assert state.audio_mix_result.success is True
+        assert state.audio_mix_result.music_plan.used_semantic_planning is True
+        assert state.audio_mix_result.music_plan.primary_mood == "thoughtful"
+        assert state.audio_mix_result.music_plan.fallback_reason is None
+
+    @pytest.mark.asyncio
+    async def test_semantic_planner_failure_falls_back_and_pipeline_still_succeeds(self, providers) -> None:
+        """The default fixture's LLM never returns valid JSON for the BGM
+        mood-planning prompt - MusicContextPlanner must fall back to the
+        deterministic MusicPlan, and mixing/the pipeline must still succeed."""
+        state = await self._run(providers)
+
+        assert state.status == "completed"
+        assert state.audio_mix_result.success is True
+        assert state.audio_mix_result.music_plan.used_semantic_planning is False
+        assert state.audio_mix_result.music_plan.fallback_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_fallback_used_recorded_in_music_plan(self, providers) -> None:
+        state = await self._run(providers)
+
+        plan = state.audio_mix_result.music_plan
+        assert plan.used_semantic_planning is False
+        assert plan.fallback_reason is not None
+        assert plan.primary_mood  # fallback plan is still fully usable
+
+    @pytest.mark.asyncio
+    async def test_correct_approved_track_passed_to_audio_mixing_service(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.audio_mix_result.selected_track is not None
+        assert state.audio_mix_result.selected_track.track_id == "calm-test-track"
+        assert state.audio_mix_result.selected_track.instrumental is True
+
+    @pytest.mark.asyncio
+    async def test_final_mixed_mp4_becomes_final_pipeline_output(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.audio_mix_result.output_path is not None
+        assert os.path.exists(state.audio_mix_result.output_path)
+        assert state.audio_mix_result.output_path != state.caption_result.captioned_video_path
+
+    # ---- O. BGM node not called after earlier hard failure -------------------
+
+    @pytest.mark.asyncio
+    async def test_bgm_node_not_called_when_caption_fails(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_burn_subtitles=True))
+
+        assert state.status == "failed"
+        assert state.audio_mix_result is None
+
+    @pytest.mark.asyncio
+    async def test_bgm_node_not_called_after_hard_qc_failure(self, providers) -> None:
+        state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
+
+        assert state.status == "failed"
+        assert state.audio_mix_result is None
+
+    @pytest.mark.asyncio
+    async def test_bgm_node_not_called_when_video_assembly_fails(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
+
+        assert state.status == "failed"
+        assert state.audio_mix_result is None
+
+    # ---- P. BGM failure behavior ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_empty_music_catalog_marks_pipeline_failed(self, providers) -> None:
+        state = await self._run(providers, music_catalog_provider=MockMusicCatalogProvider(tracks=[]))
+
+        assert state.status == "failed"
+        assert "BGM mixing failed" in state.error
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is False
+
+    @pytest.mark.asyncio
+    async def test_missing_music_file_marks_pipeline_failed(self, providers, tmp_path) -> None:
+        missing_catalog = _music_catalog_provider(tmp_path, track_id="missing-track", write_file=False)
+        state = await self._run(providers, music_catalog_provider=missing_catalog)
+
+        assert state.status == "failed"
+        assert "BGM mixing failed" in state.error
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is False
+        assert state.audio_mix_result.selected_track is not None
+
+    @pytest.mark.asyncio
+    async def test_mixing_ffmpeg_failure_marks_pipeline_failed(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_mix_background_audio=True))
+
+        assert state.status == "failed"
+        assert "BGM mixing failed" in state.error
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is False
+
+    @pytest.mark.asyncio
+    async def test_bgm_failure_preserves_captioned_mp4(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_mix_background_audio=True))
+
+        assert state.caption_result is not None
+        assert state.caption_result.success is True
+        assert os.path.exists(state.caption_result.captioned_video_path)
+
+    @pytest.mark.asyncio
+    async def test_earlier_stage_state_preserved_after_bgm_failure(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_mix_background_audio=True))
+
+        assert state.status == "failed"
+        assert state.research_result is not None
+        assert state.script_result is not None
+        assert state.voice_result is not None
+        assert state.voice_result.success is True
+        assert state.visual_result is not None
+        assert state.visual_qc_result is not None
+        assert state.qc_approved_visual_result is not None
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
+        assert state.caption_result is not None
+        assert state.caption_result.success is True

@@ -433,12 +433,40 @@ No `ScriptResult` is persisted to disk anywhere in this project. An initial vers
 
 Consistent with how Visual QC and Captions were each validated standalone before integration, this milestone stops short of touching `src/workflows/pipeline_graph.py`. `src/bgm_demo.py` is a separate standalone runner. Wiring `AudioMixingService` in as a stage after Captions is the next planned milestone.
 
+## BGM pipeline integration reuses AudioMixingService as-is; the pipeline only adds routing and a caption-to-video adapter
+
+Consistent with how Visual QC's and Captions' integration milestones worked, `build_pipeline_graph`'s new `bgm_node` calls `AudioMixingService.generate_mix(...)` exactly as `bgm_demo.py` already did - same mood-planning/selection/mixing logic, unchanged. `AudioMixingService` is constructed once inside `build_pipeline_graph` from the same shared `llm_provider` (for `MusicContextPlanner`) and the same shared `assembler` (for `mix_background_audio`) already used elsewhere, plus one new injected `music_catalog_provider` argument - no new provider type, no duplicated business logic. The only genuinely new code is a thin node function, a new `PipelineState.audio_mix_result` field, conditional routing, and a small `_captioned_video_result` adapter (below).
+
+## BGM mixes onto the captioned MP4, adapted from CaptionResult - not the pre-caption assembly
+
+`AudioMixingService.generate_mix` expects a `VideoAssemblyResult`-shaped source video (the same shape the standalone demo already builds for its own captioned-MP4 target). Since the pipeline's real `VideoAssemblyResult` describes the pre-caption assembly, `_captioned_video_result(caption_result)` adapts `CaptionResult.captioned_video_path`/`captioned_duration_seconds` into that shape before calling `generate_mix` - a thin adapter, not new mixing/selection logic. This ensures BGM is always mixed onto what viewers will actually see (the captioned video), matching exactly what real standalone validation already targeted.
+
+## BGM node reuses the pipeline's existing ScriptResult; Research/Script are never re-run for mood planning
+
+Unlike the standalone `bgm_demo.py` (which has no `PipelineState` to read a `ScriptResult` from, and so reconstructs one from an existing `.srt` transcript), the pipeline's `bgm_node` passes `state.script_result` - the exact object Research/Script already produced earlier in the same run - directly into `AudioMixingService.generate_mix`. This was the entire reason the standalone demo's SRT-reconstruction approach was explicitly kept out of the main pipeline: inside a live pipeline run, the real `ScriptResult` is already sitting in state, so reconstructing one from a transcript would be pure redundancy, not a workaround for a real gap.
+
+## Pipeline "completed" status moved from Captions to BGM/Audio Mixing
+
+With BGM now the final stage, `caption_node`'s own success status was renamed from `"completed"` to `"captioned"` (an intermediate status, matching the pattern of `"assembled"`/`"qc_passed"` before it), and only `bgm_node`'s success path sets `status="completed"`. This is the same principle applied each time a new final stage was added: "completed" should only ever mean the pipeline's actual final deliverable - now the captioned-and-BGM-mixed MP4 - exists.
+
+## A semantic mood-planning failure inside BGM does not fail the pipeline; only a real mixing/selection/catalog failure does
+
+`AudioMixingService`/`MusicContextPlanner` already guarantee that an LLM failure (429/503/timeout/malformed response) falls back to a deterministic `MusicPlan` and returns `success=True` from `generate_mix` if selection/mixing then succeed - `bgm_node` doesn't need (and doesn't add) any special-case handling for this at the pipeline level, unlike the hard-QC-failure policy Visual QC needed. `bgm_node` fails the pipeline only when `AudioMixResult.success` is `False`, which `AudioMixingService` reserves for real failures: an empty approved catalog, no eligible/fallback track, a missing/corrupt selected track file, or an FFmpeg mixing failure - never a mood-planning outage alone. This mirrors `VisualContextPlanner`'s established distinction between "the LLM enhancement degraded" and "the stage itself failed."
+
+## BGM failure marks the pipeline failed but preserves every earlier successful result, including the captioned MP4
+
+If catalog/selection/mixing fails, `bgm_node` sets `status="failed"` and records the error on an `AudioMixResult(success=False, ...)`, but does not clear or overwrite `research_result`/`script_result`/`voice_result`/`visual_result`/`visual_qc_result`/`video_assembly_result`/`caption_result` - all remain inspectable in the final `PipelineState`, and the captioned MP4 on disk is untouched (BGM mixing is always written to a new copy, a property already guaranteed by the standalone `AudioMixingService`/`FFmpegVideoAssembler.mix_background_audio`, not something the pipeline layer had to re-implement).
+
+## Real end-to-end validation was deferred, not skipped, for this integration milestone
+
+Real Gemini free-tier instability (429/503/timeouts) observed during the standalone BGM milestone was still present at integration time. Rather than repeatedly retrying a real full pipeline run against an unreliable API - or changing models/providers mid-integration-milestone to work around it - this milestone's validation relied entirely on the automated pytest suite against mocked LLM/catalog/assembler doubles (including dedicated tests for the fallback-continues and hard-failure-fails paths). Real 8-stage end-to-end validation is deliberately the next milestone's job, once LLM/provider reliability is addressed on its own terms.
+
 ## Known limitations
 
 - The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
 - Gemini mood planning is a single optional call per video; real validation showed it can be unavailable under Gemini free-tier rate limiting (429/503/timeouts), in which case the deterministic fallback plan (neutral/calm, low energy, ambient/cinematic, neutral/subtle) is used automatically - mood selection is correspondingly generic whenever the LLM call doesn't succeed.
-- The Standalone BGM / Audio Mixing Service is implemented and validated but not yet integrated into the main pipeline - `pipeline_demo.py`'s end-to-end run does not currently include background music.
-- The main pipeline currently produces two MP4 files per run (original and captioned) rather than a single final output - see the two-video-output decision above; a future cleanup milestone may remove the intermediate file once it's no longer needed.
+- BGM/Audio Mixing is now integrated into the main pipeline, but a real full 8-stage end-to-end run (all real providers together, through BGM) has not yet been re-validated under current Gemini free-tier conditions - automated pytest coverage (mocked throughout) was used for this integration milestone instead; real validation is the next planned milestone.
+- The main pipeline currently produces three MP4-related outputs per run (original assembled, captioned, and BGM-mixed) plus an `.srt` file, rather than a single final output - intentional for now; a future cleanup milestone may remove the intermediate files once the final mixed MP4 has been used/uploaded successfully.
 - Whisper transcription accuracy depends on the TTS narration's clarity; it has not been validated against noisy or multi-speaker audio, which this pipeline does not produce.
 - The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts and occasional single-word caption segments - both cosmetic, not correctness issues for caption sync or meaning, and not being tuned further at this stage.
 - Stock footage semantic relevance can vary run-to-run with live Pexels results; the visual pipeline is considered feature-complete/frozen for the MVP and is not planned for further optimization without a new, recurring, concrete problem.

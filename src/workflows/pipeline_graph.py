@@ -1,11 +1,12 @@
 # Full Research -> Script -> Voice -> Visual Media -> Visual QC -> Video
-# Assembly -> Subtitle/Caption pipeline using LangGraph.
+# Assembly -> Subtitle/Caption -> BGM/Audio Mixing pipeline using LangGraph.
 #
 # This module does not implement any research, scripting, voice-synthesis,
-# visual-media, QC-evaluation, video-encoding, transcription, or subtitle-
-# rendering logic itself - it only wires the existing ResearchAgent,
-# ScriptAgent, VoiceService, VisualMediaService, VisualQCService,
-# VideoAssemblyService, and CaptionService together into a single LangGraph
+# visual-media, QC-evaluation, video-encoding, transcription, subtitle-
+# rendering, or music-planning/selection/mixing logic itself - it only
+# wires the existing ResearchAgent, ScriptAgent, VoiceService,
+# VisualMediaService, VisualQCService, VideoAssemblyService,
+# CaptionService, and AudioMixingService together into a single LangGraph
 # state machine, passing each stage's output directly into the next
 # stage's input.
 from __future__ import annotations
@@ -20,12 +21,14 @@ from src.agents.script import ScriptAgent, ScriptAgentError
 from src.agents.visual_context_planner import VisualContextPlanner
 from src.models.captions import CaptionResult
 from src.models.media import VisualResult
+from src.models.music import AudioMixResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
 from src.models.video import VideoAssemblyResult
 from src.models.visual_plan import VisualPlan
 from src.models.visual_qc import VisualQCResult
 from src.models.voice import VoiceResult
+from src.services.audio_mixing_service import AudioMixingService, AudioMixingServiceError
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR, CaptionService, CaptionServiceError
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
@@ -41,9 +44,29 @@ from src.services.visual_qc_service import VisualQCService, VisualQCServiceError
 from src.services.voice_service import DEFAULT_OUTPUT_DIR, VoiceService, VoiceServiceError
 from src.tools.ffmpeg_video_assembler import VideoAssembler
 from src.tools.media_provider import MediaProvider
+from src.tools.music_catalog_provider import MusicCatalogProvider
 from src.tools.transcription_provider import TranscriptionProvider
 from src.tools.visual_relevance_evaluator import VisualRelevanceEvaluator
 from src.tools.voice_provider import VoiceProvider
+
+
+def _captioned_video_result(caption_result: CaptionResult) -> VideoAssemblyResult:
+    """Adapt CaptionService's captioned MP4 into the VideoAssemblyResult
+    shape AudioMixingService already expects as its source video.
+
+    BGM is mixed onto the captioned output (what viewers will actually
+    see), not the pre-caption assembly - the same file the standalone
+    ``bgm_demo.py`` targets for real validation. This is a thin adapter,
+    not new business logic: AudioMixingService itself only reads
+    ``output_path``/``success`` off whatever VideoAssemblyResult-shaped
+    object it's given.
+    """
+    return VideoAssemblyResult(
+        success=True,
+        output_path=caption_result.captioned_video_path,
+        duration_seconds=caption_result.captioned_duration_seconds,
+        format="mp4",
+    )
 
 
 @dataclass
@@ -67,8 +90,14 @@ class PipelineState:
     qc_approved_visual_result: Optional[VisualResult] = None
     video_assembly_result: Optional[VideoAssemblyResult] = None
     caption_result: Optional[CaptionResult] = None
+    # AudioMixResult already carries the mood plan (.music_plan), the
+    # selected track (.selected_track), and the final mixed MP4 path
+    # (.output_path) - no separate top-level fields for those, consistent
+    # with how VisualQCResult/CaptionResult are each the single source of
+    # truth for their own stage's structured data.
+    audio_mix_result: Optional[AudioMixResult] = None
     # pending -> researching -> researched -> scripted -> voiced ->
-    # visualized -> qc_passed -> assembled -> completed -> failed
+    # visualized -> qc_passed -> assembled -> captioned -> completed -> failed
     status: str = "pending"
     error: Optional[str] = None
 
@@ -82,51 +111,62 @@ def build_pipeline_graph(
     assembler: VideoAssembler,
     visual_relevance_evaluator: VisualRelevanceEvaluator,
     transcription_provider: TranscriptionProvider,
+    music_catalog_provider: MusicCatalogProvider,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
-    -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption.
+    -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
+    BGM/Audio Mixing.
 
     Reuses the existing ResearchAgent, ScriptAgent, VoiceService,
-    VisualMediaService, VisualQCService, VideoAssemblyService, and
-    CaptionService as-is (no duplicated business logic, no reimplemented
-    FFmpeg calls, no re-implemented QC evaluation/replacement, no
-    re-implemented transcription/SRT/subtitle-rendering logic); this graph
-    only wires their existing async interfaces together and shares one
-    PipelineState across all seven. VoiceService, VisualMediaService,
-    VisualQCService, VideoAssemblyService, and CaptionService all remain
-    deterministic services here - each is invoked directly, not treated as
-    a reasoning agent (semantic judgment stays inside
-    VisualContextPlanner/VisualQCService's injected evaluator; speech-to-
-    text stays inside CaptionService's injected transcription provider).
+    VisualMediaService, VisualQCService, VideoAssemblyService,
+    CaptionService, and AudioMixingService as-is (no duplicated business
+    logic, no reimplemented FFmpeg calls, no re-implemented QC evaluation/
+    replacement, no re-implemented transcription/SRT/subtitle-rendering or
+    music-planning/selection/mixing logic); this graph only wires their
+    existing async interfaces together and shares one PipelineState across
+    all eight. VoiceService, VisualMediaService, VisualQCService,
+    VideoAssemblyService, CaptionService, and AudioMixingService all remain
+    deterministic orchestration here - each is invoked directly, not
+    treated as a reasoning agent (semantic judgment stays inside
+    VisualContextPlanner/VisualQCService's injected evaluator and
+    AudioMixingService's injected MusicContextPlanner; speech-to-text stays
+    inside CaptionService's injected transcription provider).
     VideoAssemblyService receives the exact ScriptResult/VoiceResult
     already produced earlier in this same run, and the post-QC
     ``qc_approved_visual_result`` (never the raw, pre-QC ``visual_result``).
     CaptionService receives the exact VoiceResult/VideoAssemblyResult
-    already produced earlier in this same run - nothing is regenerated,
+    already produced earlier in this same run. AudioMixingService receives
+    the exact ScriptResult already produced earlier in this same run
+    (Research/Script are never re-run for BGM mood planning) and the
+    captioned MP4 CaptionService just produced - nothing is regenerated,
     re-synthesized, re-downloaded, or re-assembled.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions → END
-                    │                  │               │              │                │                  │
-                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)──→ END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm → END
+                    │                  │               │              │                │                  │                  │
+                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
-        llm_provider: LLMProvider implementation shared by Research and Script agents
+        llm_provider: LLMProvider implementation shared by Research, Script,
+            Visual Context Planning, Visual QC, and BGM mood planning
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
         assembler: VideoAssembler implementation, shared by Visual QC (frame
-            extraction/probing), the Video Assembly Service (encoding), and
-            the Caption Service (subtitle burning)
+            extraction/probing), the Video Assembly Service (encoding), the
+            Caption Service (subtitle burning), and Audio Mixing (background
+            music mixing)
         visual_relevance_evaluator: VisualRelevanceEvaluator implementation
             for the Visual QC Service
         transcription_provider: TranscriptionProvider implementation for
             the Caption Service
+        music_catalog_provider: MusicCatalogProvider implementation (the
+            approved BGM catalog) for the Audio Mixing Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
@@ -160,6 +200,13 @@ def build_pipeline_graph(
     # burning reuses its burn_subtitles method) - no second FFmpeg wrapper.
     caption_service = CaptionService(
         transcription_provider=transcription_provider, assembler=assembler, output_dir=subtitle_output_dir
+    )
+    # Reuses the same LLMProvider (MusicContextPlanner's single optional
+    # mood-planning call per run) and the same VideoAssembler (background-
+    # audio mixing reuses its mix_background_audio method) - no new
+    # provider/setting and no second FFmpeg wrapper.
+    audio_mixing_service = AudioMixingService(
+        catalog_provider=music_catalog_provider, assembler=assembler, llm_provider=llm_provider
     )
 
     async def research_node(state: PipelineState) -> dict:
@@ -381,7 +428,46 @@ def build_pipeline_graph(
                 "error": f"Caption generation failed: {result.error}",
             }
 
-        return {"caption_result": result, "status": "completed", "error": None}
+        return {"caption_result": result, "status": "captioned", "error": None}
+
+    async def bgm_node(state: PipelineState) -> dict:
+        try:
+            # The exact ScriptResult already produced earlier in this run is
+            # passed straight through for mood planning - Research/Script
+            # are never re-run just to get BGM context (unlike the
+            # standalone demo, which has no PipelineState to read a
+            # ScriptResult from and must reconstruct one from an existing
+            # .srt transcript instead). BGM mixes onto the captioned MP4
+            # CaptionService just produced, not the pre-caption assembly.
+            result = await audio_mixing_service.generate_mix(
+                state.topic, state.script_result, _captioned_video_result(state.caption_result)
+            )
+        except AudioMixingServiceError as e:
+            return {"audio_mix_result": None, "status": "failed", "error": f"BGM mixing failed: {e}"}
+        except Exception as e:
+            return {
+                "audio_mix_result": None,
+                "status": "failed",
+                "error": f"Unexpected BGM mixing error: {e}",
+            }
+
+        if not result.success:
+            # AudioMixingService never raises for catalog/selection/mixing
+            # failures - it reports them in AudioMixResult.error instead
+            # (including a semantic mood-planning failure, which is NOT a
+            # mixing failure: MusicContextPlanner already fell back to a
+            # deterministic MusicPlan internally and mixing still would
+            # have been attempted - see AudioMixResult.music_plan.fallback_reason
+            # for that case). Surface the actual failure here; the
+            # captioned MP4 is untouched regardless (AudioMixingService
+            # never writes to it, always to a new copy).
+            return {
+                "audio_mix_result": result,
+                "status": "failed",
+                "error": f"BGM mixing failed: {result.error}",
+            }
+
+        return {"audio_mix_result": result, "status": "completed", "error": None}
 
     def route_after_research(state: PipelineState) -> str:
         """Only proceed to scripting if research actually produced a result."""
@@ -418,6 +504,11 @@ def build_pipeline_graph(
             else END
         )
 
+    def route_after_captions(state: PipelineState) -> str:
+        """Only proceed to BGM mixing if captioning actually succeeded - the
+        bgm node must never run on a missing/failed captioned MP4."""
+        return "bgm" if state.caption_result is not None and state.caption_result.success else END
+
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
@@ -426,6 +517,7 @@ def build_pipeline_graph(
     graph.add_node("visual_qc", visual_qc_node)
     graph.add_node("video_assembly", video_assembly_node)
     graph.add_node("captions", caption_node)
+    graph.add_node("bgm", bgm_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
@@ -438,7 +530,8 @@ def build_pipeline_graph(
     graph.add_conditional_edges(
         "video_assembly", route_after_video_assembly, {"captions": "captions", END: END}
     )
-    graph.set_finish_point("captions")
+    graph.add_conditional_edges("captions", route_after_captions, {"bgm": "bgm", END: END})
+    graph.set_finish_point("bgm")
 
     return graph
 
@@ -453,45 +546,52 @@ async def run_pipeline(
     assembler: VideoAssembler,
     visual_relevance_evaluator: VisualRelevanceEvaluator,
     transcription_provider: TranscriptionProvider,
+    music_catalog_provider: MusicCatalogProvider,
     voice_output_dir: str = DEFAULT_OUTPUT_DIR,
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
-    -> Video Assembly -> Subtitle/Caption pipeline and return the final state.
+    -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing pipeline and
+    return the final state.
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
     can inspect ``status``/``error`` directly, including on partial failure
-    (e.g. research, scripting, voice, visual media, visual QC, and video
-    assembly all succeeded but captioning failed).
+    (e.g. every stage through captioning succeeded but BGM mixing failed).
 
     Each stage only runs if the previous one succeeded - a failure at any
     stage short-circuits the rest of the pipeline and it never silently
     continues (see route_after_research/route_after_script/route_after_voice/
-    route_after_media/route_after_visual_qc/route_after_video_assembly).
-    Visual QC itself fails the pipeline (status "failed", Video Assembly
-    never runs) if any asset is still flagged misleading/conflicting after
-    bounded replacement is exhausted - see visual_qc_node. Pipeline status
-    only becomes "completed" once captioning itself succeeds (consuming the
-    real narration audio and the assembled MP4) and a real captioned final
-    MP4 exists; the original non-captioned MP4 (``video_assembly_result``)
-    is preserved unchanged either way.
+    route_after_media/route_after_visual_qc/route_after_video_assembly/
+    route_after_captions). Visual QC itself fails the pipeline (status
+    "failed", Video Assembly never runs) if any asset is still flagged
+    misleading/conflicting after bounded replacement is exhausted - see
+    visual_qc_node. Pipeline status only becomes "completed" once BGM
+    mixing itself succeeds and a final captioned-and-mixed MP4 exists; a
+    semantic mood-planning failure inside that stage does not itself fail
+    the pipeline (AudioMixingService falls back to a deterministic
+    MusicPlan and mixing proceeds) - only an actual mixing/selection/
+    catalog failure does. The captioned MP4 (``caption_result``) and every
+    earlier-stage result are preserved unchanged either way.
 
     Args:
         topic: Research topic to investigate, script, narrate, illustrate, and assemble
         search_provider: SearchProvider implementation for the Research Agent
-        llm_provider: LLMProvider implementation shared by Research and Script agents
+        llm_provider: LLMProvider implementation shared by Research, Script,
+            Visual Context Planning, Visual QC, and BGM mood planning
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation for the Visual Media Service
         assembler: VideoAssembler implementation, shared by Visual QC, the
-            Video Assembly Service, and the Caption Service
+            Video Assembly Service, the Caption Service, and Audio Mixing
         visual_relevance_evaluator: VisualRelevanceEvaluator implementation
             for the Visual QC Service
         transcription_provider: TranscriptionProvider implementation for
             the Caption Service
+        music_catalog_provider: MusicCatalogProvider implementation (the
+            approved BGM catalog) for the Audio Mixing Service
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
@@ -509,6 +609,7 @@ async def run_pipeline(
         assembler,
         visual_relevance_evaluator,
         transcription_provider,
+        music_catalog_provider,
         voice_output_dir,
         media_output_dir,
         video_output_dir,
@@ -529,6 +630,7 @@ async def run_pipeline(
         qc_approved_visual_result=raw_result.get("qc_approved_visual_result"),
         video_assembly_result=raw_result.get("video_assembly_result"),
         caption_result=raw_result.get("caption_result"),
+        audio_mix_result=raw_result.get("audio_mix_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )
