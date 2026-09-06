@@ -10,8 +10,14 @@ import httpx
 from src.llm.provider import LLMProvider
 
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
-DEFAULT_FALLBACK_MODEL = "gemini-3.5-flash-lite"
+# Chosen via a real health check (src/gemini_health_check.py) during the
+# LLM/Gemini Reliability Audit milestone: gemini-3.6-flash (the prior
+# fallback default) was timing out under real load, while both of these
+# lite-tier models responded successfully in ~1.2-1.3s. Kept as two
+# distinct pinned model generations (not two aliases of the same one) so a
+# primary outage doesn't likely take the fallback down with it.
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
 # Transient failures worth retrying: rate limiting, request timeout, server-side.
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}

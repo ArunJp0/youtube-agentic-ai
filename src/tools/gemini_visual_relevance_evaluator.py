@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from src.llm.gemini import GEMINI_API_BASE
+from src.llm.gemini import DEFAULT_GEMINI_MODEL, GEMINI_API_BASE
 from src.models.visual_qc import RawAssetVerdict
 from src.services.llm_json import JsonExtractionError, extract_json_object
 from src.tools.visual_relevance_evaluator import (
@@ -25,7 +25,12 @@ from src.tools.visual_relevance_evaluator import (
     VisualRelevanceEvaluatorError,
 )
 
-DEFAULT_VISION_MODEL = "gemini-3.6-flash"
+# Reuses GeminiLLMProvider's own default model constant (this module
+# already depends on src.llm.gemini for GEMINI_API_BASE) rather than a
+# second hardcoded literal - one source of truth for "the default Gemini
+# text/vision model", chosen via a real health check (see
+# src/gemini_health_check.py and src/llm/gemini.py's DEFAULT_GEMINI_MODEL).
+DEFAULT_VISION_MODEL = DEFAULT_GEMINI_MODEL
 
 
 class GeminiVisualRelevanceEvaluator(VisualRelevanceEvaluator):

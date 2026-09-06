@@ -194,6 +194,17 @@
 - 727/727 tests passing (18 new BGM pipeline-integration tests), all using mocked LLM/catalog/assembler doubles - no real Gemini, Pexels, Whisper, or FFmpeg calls in the automated suite
 - Real full 8-stage end-to-end validation was intentionally **not** attempted for this milestone - the configured Gemini free-tier models were unstable/rate-limited at the time, and running the full real pipeline was explicitly out of scope; automated pytest coverage (including the fallback/failure routing tests above) was used instead
 - BGM / Audio Mixing Main Pipeline Integration milestone marked **COMPLETE**
+- LLM / Gemini Reliability Audit and Safe Model Migration completed: audited the exact currently-configured primary/fallback models, retry/backoff behavior, which pipeline stages are LLM-hard-dependent (Research, Script) versus already have deterministic fallback (Visual Context Planner, Visual QC's vision evaluator, BGM's `MusicContextPlanner`), and where model names were hardcoded across the codebase
+- New isolated `src/gemini_health_check.py` tool added: discovers real candidate models via the Gemini `ListModels` endpoint (never invents model names), sends one minimal low-token probe per candidate with no retries of its own, and reports success/failure, latency, and an explicit HTTP/error category (`429`, `503`, `timeout`, `malformed`, `error`) - runs Research/Script/Voice/Visual Media/Visual QC/Pexels/Whisper/FFmpeg for none of this
+- Real health check run against 40 real candidate models: confirmed the prior fallback, `gemini-3.6-flash`, was timing out (~15s) under real load, while the primary `gemini-3.5-flash-lite` and several other lite-tier models responded successfully in ~1.2-1.3s
+- Fallback model changed from `gemini-3.6-flash` to `gemini-3.1-flash-lite` (confirmed healthy) - primary `gemini-3.5-flash-lite` left unchanged since it was already confirmed healthy; no second fallback slot was added since one healthy fallback already satisfies the provider's existing single-fallback architecture
+- Model-name duplication cleaned up: `src/llm/gemini.py`'s `DEFAULT_GEMINI_MODEL`/`DEFAULT_FALLBACK_MODEL` are now the source of truth for the previously-hardcoded default, `src/config/settings.py`'s field defaults were corrected to match (they had been reversed relative to the actual `.env` configuration), and `src/tools/gemini_visual_relevance_evaluator.py` now imports `DEFAULT_GEMINI_MODEL` from `src.llm.gemini` instead of duplicating a second hardcoded literal
+- `.env` and `.env.example` updated with the new fallback model value; the existing `GEMINI_API_KEY` was reused as-is - no key replacement, no billing/account configuration change was required
+- Retry/backoff policy (5 attempts/model, exponential backoff with jitter, retryable-status-code set) left unchanged - the root cause was an unhealthy fallback model choice, not the retry mechanism itself
+- 744/744 tests passing (17 new tests for the health-check tool, 1 existing Gemini provider test updated for the new default model values), all using mocked HTTP/provider doubles - no real Gemini calls in the automated suite
+- Real validation: `python -m src.gemini_health_check gemini-3.5-flash-lite gemini-3.1-flash-lite` - both succeeded (~1.60s and ~1.31s respectively), 2/2 healthy
+- No second external LLM provider was added; no full real 8-stage pipeline run was performed in this milestone (deliberately deferred to the next milestone)
+- LLM / Gemini Reliability Audit and Safe Model Migration milestone marked **COMPLETE**
 
 ## Known Limitations
 
@@ -208,16 +219,21 @@
 - Stock footage semantic relevance remains good-enough-but-not-perfect and can vary run-to-run with live Pexels results - the visual pipeline (planning → selection → QC → assembly) is considered frozen for the current MVP and will not be further tuned unless a recurring, severe relevance problem appears.
 - The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
 - Gemini mood planning is a single optional call per video; real validation showed it can be unavailable under Gemini free-tier rate limiting (429/503/timeouts), in which case the deterministic fallback `MusicPlan` (neutral/calm, low energy, ambient/cinematic, neutral/subtle required) is used automatically - mood selection is correspondingly generic whenever the LLM call doesn't succeed.
-- Gemini free-tier models (`gemini-3.5-flash-lite`/`gemini-3.6-flash`) have recently returned sustained 429/503/timeouts during real validation attempts - BGM mood planning tolerates this via its deterministic fallback, but a real full 8-stage end-to-end run (Research through BGM, all real providers together) has not yet been re-validated under current API conditions.
+- The Gemini fallback model has been changed from `gemini-3.6-flash` (confirmed unhealthy - timing out under real load) to `gemini-3.1-flash-lite` (confirmed healthy via a real minimal health check); a real full 8-stage end-to-end run with this new configuration (Research through BGM, all real providers together) has not yet been performed - that is the next planned milestone.
 - The main pipeline now produces **three** MP4-related outputs per run on disk (the original assembled MP4, the captioned MP4, and the final BGM-mixed MP4), plus the `.srt` file, rather than a single final output - intentional for now as development/debug fallbacks; a future storage/cleanup milestone may remove the intermediate files once the final mixed MP4 has been used/uploaded successfully.
 
 ## Current Next Milestone
 
-**LLM / Gemini Reliability Strategy + Real 8-Stage End-to-End Validation** - address the Gemini free-tier instability (429/503/timeouts) observed during BGM validation attempts, then run and validate one complete real end-to-end pipeline execution (Research → Script → Voice → Visual Media → Visual QC → Video Assembly → Subtitles/Captions → BGM/Audio Mixing, all real providers together) - no model/provider changes were made as part of this integration milestone; that reliability work is deliberately deferred to its own milestone rather than rushed in alongside orchestration changes.
+**Real 8-Stage End-to-End Pipeline Validation** - now that the Gemini fallback model has been changed to a confirmed-healthy one, run and validate one complete real end-to-end pipeline execution with all real providers together:
+
+```
+Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
+      → Subtitles / Captions → BGM / Audio Mixing → Final Mixed MP4
+```
 
 Planned sequence after that, in order:
 
-1. LLM / Gemini Reliability Strategy + Real 8-Stage End-to-End Validation
+1. Real 8-Stage End-to-End Pipeline Validation
 2. Metadata Agent
 3. Thumbnail Agent
 4. Copyright / Compliance checks

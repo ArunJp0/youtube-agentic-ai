@@ -37,11 +37,15 @@ class Settings:
     )
     whisper_model_size: str = field(default_factory=lambda: os.environ.get("WHISPER_MODEL_SIZE", "base"))
 
-    # Gemini
+    # Gemini. Defaults mirror src/llm/gemini.py's DEFAULT_GEMINI_MODEL/
+    # DEFAULT_FALLBACK_MODEL (chosen via a real health check during the
+    # LLM/Gemini Reliability Audit milestone - not duplicated by accident,
+    # kept in sync deliberately since Settings has no import dependency on
+    # the llm/ layer).
     gemini_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY") or None)
-    gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"))
+    gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"))
     gemini_fallback_model: Optional[str] = field(
-        default_factory=lambda: os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite") or None
+        default_factory=lambda: os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite") or None
     )
 
     # Database

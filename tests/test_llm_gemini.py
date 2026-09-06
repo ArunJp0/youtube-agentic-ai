@@ -55,8 +55,8 @@ class TestGeminiLLMProviderInit:
     def test_valid_api_key_constructs_with_defaults(self) -> None:
         provider = GeminiLLMProvider(api_key="test-key")
         assert provider.api_key == "test-key"
-        assert provider.model == "gemini-3.6-flash"
-        assert provider.fallback_model == "gemini-3.5-flash-lite"
+        assert provider.model == "gemini-3.5-flash-lite"
+        assert provider.fallback_model == "gemini-3.1-flash-lite"
         assert provider.max_attempts == 5
 
 
@@ -76,7 +76,7 @@ class TestGeminiLLMProviderGenerateText:
 
         assert result == "Dreams help consolidate memories."
         assert len(calls) == 1
-        assert provider.last_model_used == "gemini-3.6-flash"
+        assert provider.last_model_used == "gemini-3.5-flash-lite"
         assert provider.last_attempt_count == 1
         assert provider.last_used_fallback is False
         assert no_real_sleep == []  # no retry -> no sleep

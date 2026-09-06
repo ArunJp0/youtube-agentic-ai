@@ -50,7 +50,7 @@ Topic Input → Research Agent → Script Agent → Voice Service → Visual Con
             → BGM / Audio Mixing Service → Final Captioned + BGM Mixed MP4
 ```
 
-**Validation status**: every stage through Captions has been validated end-to-end with real providers (real Gemini, real Wikipedia, real Edge TTS, real Pexels, real Whisper). BGM/Audio Mixing has been validated as a standalone service with real providers, and its pipeline integration has been validated with the automated test suite (mocked throughout) - a real full 8-stage end-to-end run has not yet been re-validated, since the configured Gemini free-tier models were unstable/rate-limited (429/503/timeouts) at integration time. Addressing that reliability and completing real 8-stage validation is the next planned milestone.
+**Validation status**: every stage through Captions has been validated end-to-end with real providers (real Gemini, real Wikipedia, real Edge TTS, real Pexels, real Whisper). BGM/Audio Mixing has been validated as a standalone service with real providers, and its pipeline integration has been validated with the automated test suite (mocked throughout). The Gemini fallback model was subsequently changed (`gemini-3.6-flash` → `gemini-3.1-flash-lite`) after a real health check (`python -m src.gemini_health_check`) found the old fallback timing out under real load while the new one responded reliably - see `docs/DECISIONS.md`. A real full 8-stage end-to-end run with this corrected configuration has not yet been performed; that is the next planned milestone.
 
 - **Research Agent**: researches a topic (real Wikipedia search + Gemini LLM, with mock providers for offline dev) and produces a structured `ResearchResult` (summary, key points, sourced facts, source URLs).
 - **Script Agent**: converts a `ResearchResult` into a structured `ScriptResult` (title, hook, introduction, narrated sections, conclusion, call to action, estimated duration, source references) - natural spoken-style narration for YouTube, grounded only in the research.
@@ -74,7 +74,7 @@ All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo 
 
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 
-Thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is an LLM/Gemini reliability strategy followed by real 8-stage end-to-end validation.
+Thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is a real 8-stage end-to-end pipeline validation using the corrected Gemini model configuration, followed by a Metadata Agent.
 
 ## Project Structure
 
