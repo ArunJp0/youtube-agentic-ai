@@ -25,17 +25,20 @@ from __future__ import annotations
 import asyncio
 import glob
 import os
-import re
 import sys
 from typing import Optional
 
 from src.config.providers import ProviderConfigError, get_llm_provider
 from src.config.settings import Settings
 from src.models.music import AudioMixResult
-from src.models.script import ScriptResult, ScriptSection
 from src.models.video import VideoAssemblyResult
 from src.services.audio_mixing_service import AudioMixingService, AudioMixingServiceError
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR
+from src.services.script_context_reconstruction import (
+    build_context_from_srt,
+    build_topic_only_context,
+    find_matching_srt,
+)
 from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.tools.ffmpeg_video_assembler import FFmpegVideoAssembler, VideoAssemblerError
 from src.tools.music_catalog_provider import (
@@ -47,13 +50,6 @@ from src.tools.music_catalog_provider import (
 DEFAULT_TOPIC = "Why do humans dream?"
 CAPTIONED_SUFFIX = "-captioned.mp4"
 BGM_SUFFIX = "-bgm.mp4"
-
-# VideoAssemblyService names output files "<slug>-<8-char-hex>.mp4" (see
-# DEFAULT_VIDEO_OUTPUT_DIR's producer) - stripped to recover a readable
-# title when no real ScriptResult.video_title is available.
-_ID_SUFFIX_RE = re.compile(r"-[0-9a-f]{8}$")
-
-_RECONSTRUCTED_PLACEHOLDER = "(reconstructed for standalone BGM validation - not part of the real script)"
 
 CATALOG_SETUP_INSTRUCTIONS = f"""
 No approved BGM tracks were found in the local catalog.
@@ -96,73 +92,6 @@ def _find_latest_video(directory: str) -> Optional[str]:
     if not plain:
         return None
     return max(plain, key=os.path.getmtime)
-
-
-def _original_base_name(video_path: str) -> str:
-    """The base filename CaptionService derived its .srt/-captioned.mp4
-    names from, regardless of whether ``video_path`` is itself the plain
-    or the captioned variant."""
-    base = os.path.splitext(os.path.basename(video_path))[0]
-    if base.endswith("-captioned"):
-        base = base[: -len("-captioned")]
-    return base
-
-
-def _find_matching_srt(video_path: str, subtitle_dir: str) -> Optional[str]:
-    """Locate the .srt transcript CaptionService produced for this same
-    video, if any (see CaptionService._build_srt_filename)."""
-    srt_path = os.path.join(subtitle_dir, f"{_original_base_name(video_path)}.srt")
-    return srt_path if os.path.exists(srt_path) else None
-
-
-def _extract_narration_from_srt(srt_path: str) -> str:
-    """Concatenate every caption's text into one narration string, in
-    chronological order - ignores block indices/timestamps entirely."""
-    with open(srt_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    narration_parts = []
-    for block in re.split(r"\n\s*\n", content.strip()):
-        lines = [line.strip() for line in block.strip().splitlines() if line.strip()]
-        if len(lines) < 2:
-            continue
-        text_lines = lines[2:] if "-->" in lines[1] else lines[1:]
-        if text_lines:
-            narration_parts.append(" ".join(text_lines))
-    return " ".join(narration_parts).strip()
-
-
-def _derive_title_from_base_name(base_name: str) -> str:
-    slug = _ID_SUFFIX_RE.sub("", base_name)
-    words = [w for w in slug.replace("_", "-").split("-") if w]
-    return " ".join(w.capitalize() for w in words) if words else base_name
-
-
-def _build_context_from_srt(topic: str, srt_path: str, video_path: str) -> ScriptResult:
-    narration = _extract_narration_from_srt(srt_path) or topic
-    title = _derive_title_from_base_name(_original_base_name(video_path))
-    hook = narration[:200].rsplit(" ", 1)[0] if len(narration) > 200 else narration
-    return ScriptResult(
-        topic=topic,
-        video_title=title,
-        hook=hook or topic,
-        introduction=_RECONSTRUCTED_PLACEHOLDER,
-        sections=[ScriptSection(heading="Full narration (from existing captions)", narration=narration)],
-        conclusion=_RECONSTRUCTED_PLACEHOLDER,
-        call_to_action=_RECONSTRUCTED_PLACEHOLDER,
-    )
-
-
-def _build_topic_only_context(topic: str) -> ScriptResult:
-    return ScriptResult(
-        topic=topic,
-        video_title=topic,
-        hook=topic,
-        introduction=_RECONSTRUCTED_PLACEHOLDER,
-        sections=[ScriptSection(heading="Topic only (no existing narration context found)", narration=topic)],
-        conclusion=_RECONSTRUCTED_PLACEHOLDER,
-        call_to_action=_RECONSTRUCTED_PLACEHOLDER,
-    )
 
 
 async def run_bgm_demo(topic: str, video_path: Optional[str] = None) -> AudioMixResult:
@@ -212,13 +141,13 @@ async def run_bgm_demo(topic: str, video_path: Optional[str] = None) -> AudioMix
     print(f"      {len(catalog)} approved track(s) found")
 
     print("\n[3/3] Reconstructing narration context, planning mood, selecting a track, and mixing...")
-    srt_path = _find_matching_srt(video_path, DEFAULT_SUBTITLE_OUTPUT_DIR)
+    srt_path = find_matching_srt(video_path, DEFAULT_SUBTITLE_OUTPUT_DIR)
     if srt_path:
         print(f"      Reusing existing narration context from: {srt_path}")
-        script_result = _build_context_from_srt(topic, srt_path, video_path)
+        script_result = build_context_from_srt(topic, srt_path, video_path)
     else:
         print("      No matching .srt transcript found - using topic-only context (Research/Script are NOT re-run)")
-        script_result = _build_topic_only_context(topic)
+        script_result = build_topic_only_context(topic)
 
     settings = Settings()
     llm_provider = get_llm_provider(settings)  # only consumer: MusicContextPlanner's single mood-planning call

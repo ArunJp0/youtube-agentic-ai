@@ -50,7 +50,7 @@ Topic Input → Research Agent → Script Agent → Voice Service → Visual Con
             → BGM / Audio Mixing Service → Final Captioned + BGM Mixed MP4
 ```
 
-**Validation status**: every stage through Captions has been validated end-to-end with real providers (real Gemini, real Wikipedia, real Edge TTS, real Pexels, real Whisper). BGM/Audio Mixing has been validated as a standalone service with real providers, and its pipeline integration has been validated with the automated test suite (mocked throughout). The Gemini fallback model was subsequently changed (`gemini-3.6-flash` → `gemini-3.1-flash-lite`) after a real health check (`python -m src.gemini_health_check`) found the old fallback timing out under real load while the new one responded reliably - see `docs/DECISIONS.md`. A real full 8-stage end-to-end run with this corrected configuration has not yet been performed; that is the next planned milestone.
+**Validation status**: all 8 stages have been validated end-to-end together with real providers (real Gemini, real Wikipedia, real Edge TTS, real Pexels, real Whisper), including after the Gemini fallback model was changed (`gemini-3.6-flash` → `gemini-3.1-flash-lite`) following a real health check (`python -m src.gemini_health_check`) that found the old fallback timing out under real load - see `docs/DECISIONS.md`.
 
 - **Research Agent**: researches a topic (real Wikipedia search + Gemini LLM, with mock providers for offline dev) and produces a structured `ResearchResult` (summary, key points, sourced facts, source URLs).
 - **Script Agent**: converts a `ResearchResult` into a structured `ScriptResult` (title, hook, introduction, narrated sections, conclusion, call to action, estimated duration, source references) - natural spoken-style narration for YouTube, grounded only in the research.
@@ -72,9 +72,11 @@ All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo 
 
 **Known limitation (BGM)**: the approved BGM catalog (`assets/bgm/`) is a manually curated local library - there is no automatic licensed-music-provider integration yet, so adding tracks is a manual, one-time-per-track MVP step. Gemini mood planning is a single optional call per video; it has been observed to be unavailable under real Gemini free-tier rate limiting (429/503/timeouts), in which case mood selection falls back to a safe, generic deterministic profile rather than failing.
 
+A **Metadata Agent** has been implemented and validated standalone (`MetadataAgent`, `src/metadata_demo.py`): given a topic, the video's `ScriptResult`, and its final duration, it generates a professional YouTube title, description, tags, hashtags, an SEO summary, and chapters, using exactly one Gemini call reusing the same provider/model chain as the rest of the pipeline - never inventing facts, clickbait, or spam keywords beyond what the script actually supports. Chapter timestamps are always derived deterministically from real section-timing data (never asked of the LLM); if that timing data is insufficient, chapters are explicitly marked unavailable rather than fabricated. Output is written as a structured JSON artifact (`output/metadata/<video-slug>.json`) designed for reuse by a future YouTube Upload Agent. It is **not yet wired into the main pipeline** above; integrating it as a stage after BGM/Audio Mixing is the next planned milestone.
+
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 
-Thumbnail generation, video metadata generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is a real 8-stage end-to-end pipeline validation using the corrected Gemini model configuration, followed by a Metadata Agent.
+Thumbnail generation, copyright/compliance checking, YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is Metadata Agent Main Pipeline Integration, followed by a Thumbnail Agent.
 
 ## Project Structure
 
