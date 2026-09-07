@@ -16,11 +16,13 @@ from typing import Optional
 
 from langgraph.graph import END, StateGraph
 
+from src.agents.metadata_agent import MetadataAgent, MetadataAgentError
 from src.agents.research import ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent, ScriptAgentError
 from src.agents.visual_context_planner import VisualContextPlanner
 from src.models.captions import CaptionResult
 from src.models.media import VisualResult
+from src.models.metadata import MetadataResult
 from src.models.music import AudioMixResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
@@ -96,8 +98,13 @@ class PipelineState:
     # with how VisualQCResult/CaptionResult are each the single source of
     # truth for their own stage's structured data.
     audio_mix_result: Optional[AudioMixResult] = None
+    # MetadataResult already carries the generated title/description/tags/
+    # hashtags/chapters and the written JSON artifact path - no separate
+    # top-level fields, consistent with every other stage's result.
+    metadata_result: Optional[MetadataResult] = None
     # pending -> researching -> researched -> scripted -> voiced ->
-    # visualized -> qc_passed -> assembled -> captioned -> completed -> failed
+    # visualized -> qc_passed -> assembled -> captioned -> mixed ->
+    # completed -> failed
     status: str = "pending"
     error: Optional[str] = None
 
@@ -119,22 +126,24 @@ def build_pipeline_graph(
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
-    BGM/Audio Mixing.
+    BGM/Audio Mixing -> Metadata.
 
     Reuses the existing ResearchAgent, ScriptAgent, VoiceService,
     VisualMediaService, VisualQCService, VideoAssemblyService,
-    CaptionService, and AudioMixingService as-is (no duplicated business
-    logic, no reimplemented FFmpeg calls, no re-implemented QC evaluation/
-    replacement, no re-implemented transcription/SRT/subtitle-rendering or
-    music-planning/selection/mixing logic); this graph only wires their
-    existing async interfaces together and shares one PipelineState across
-    all eight. VoiceService, VisualMediaService, VisualQCService,
-    VideoAssemblyService, CaptionService, and AudioMixingService all remain
+    CaptionService, AudioMixingService, and MetadataAgent as-is (no
+    duplicated business logic, no reimplemented FFmpeg calls, no re-
+    implemented QC evaluation/replacement, no re-implemented transcription/
+    SRT/subtitle-rendering, music-planning/selection/mixing, or metadata-
+    generation/validation logic); this graph only wires their existing
+    interfaces together and shares one PipelineState across all nine.
+    VoiceService, VisualMediaService, VisualQCService, VideoAssemblyService,
+    CaptionService, AudioMixingService, and MetadataAgent all remain
     deterministic orchestration here - each is invoked directly, not
     treated as a reasoning agent (semantic judgment stays inside
-    VisualContextPlanner/VisualQCService's injected evaluator and
-    AudioMixingService's injected MusicContextPlanner; speech-to-text stays
-    inside CaptionService's injected transcription provider).
+    VisualContextPlanner/VisualQCService's injected evaluator,
+    AudioMixingService's injected MusicContextPlanner, and MetadataAgent's
+    own single LLM call; speech-to-text stays inside CaptionService's
+    injected transcription provider).
     VideoAssemblyService receives the exact ScriptResult/VoiceResult
     already produced earlier in this same run, and the post-QC
     ``qc_approved_visual_result`` (never the raw, pre-QC ``visual_result``).
@@ -142,13 +151,18 @@ def build_pipeline_graph(
     already produced earlier in this same run. AudioMixingService receives
     the exact ScriptResult already produced earlier in this same run
     (Research/Script are never re-run for BGM mood planning) and the
-    captioned MP4 CaptionService just produced - nothing is regenerated,
-    re-synthesized, re-downloaded, or re-assembled.
+    captioned MP4 CaptionService just produced. MetadataAgent likewise
+    receives the exact ScriptResult already produced earlier in this same
+    run (never reconstructed from an .srt transcript - that fallback is
+    only for the standalone demo, which has no PipelineState to read a
+    real ScriptResult from) and the real final duration from the BGM-mixed
+    MP4 - nothing is regenerated, re-synthesized, re-downloaded, or
+    re-assembled.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm → END
-                    │                  │               │              │                │                  │                  │
-                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──→ END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm ─(ok)─→ metadata → END
+                    │                  │               │              │                │                  │                  │              │
+                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──┴──────(error)──→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
@@ -208,6 +222,11 @@ def build_pipeline_graph(
     audio_mixing_service = AudioMixingService(
         catalog_provider=music_catalog_provider, assembler=assembler, llm_provider=llm_provider
     )
+    # Reuses the same LLMProvider (its single metadata-generation call per
+    # run) - no new provider/API key path. Chapter timestamps come from
+    # MetadataAgent's own deterministic section-timing derivation, never
+    # from this LLM call.
+    metadata_agent = MetadataAgent(llm_provider=llm_provider)
 
     async def research_node(state: PipelineState) -> dict:
         try:
@@ -467,7 +486,46 @@ def build_pipeline_graph(
                 "error": f"BGM mixing failed: {result.error}",
             }
 
-        return {"audio_mix_result": result, "status": "completed", "error": None}
+        return {"audio_mix_result": result, "status": "mixed", "error": None}
+
+    async def metadata_node(state: PipelineState) -> dict:
+        try:
+            # The exact ScriptResult already produced earlier in this run is
+            # passed straight through (never reconstructed from an .srt
+            # transcript - see MetadataAgent's docstring/module comment for
+            # why that fallback only exists for the standalone demo).
+            # Chapter timestamps are derived deterministically inside
+            # MetadataAgent from this same multi-section ScriptResult and
+            # the real BGM-mixed video's own probed duration - the LLM
+            # supplies only chapter labels, never timestamps.
+            duration = state.audio_mix_result.output_duration_seconds or state.audio_mix_result.source_duration_seconds
+            result = metadata_agent.generate_metadata(state.topic, state.script_result, duration_seconds=duration)
+        except MetadataAgentError as e:
+            return {"metadata_result": None, "status": "failed", "error": f"Metadata generation failed: {e}"}
+        except Exception as e:
+            return {
+                "metadata_result": None,
+                "status": "failed",
+                "error": f"Unexpected metadata error: {e}",
+            }
+
+        if not result.success:
+            # MetadataAgent never raises for LLM/parsing/validation
+            # failures - it reports them in MetadataResult.error instead
+            # (a chapters-only issue does NOT reach here: MetadataAgent
+            # already degrades that to chapters_available=False while
+            # still returning success=True - see MetadataResult.chapters_
+            # omitted_reason for that case). Surface the actual failure
+            # here; the final BGM-mixed MP4 and every earlier result are
+            # untouched regardless (MetadataAgent never writes to video
+            # files, only its own JSON artifact).
+            return {
+                "metadata_result": result,
+                "status": "failed",
+                "error": f"Metadata generation failed: {result.error}",
+            }
+
+        return {"metadata_result": result, "status": "completed", "error": None}
 
     def route_after_research(state: PipelineState) -> str:
         """Only proceed to scripting if research actually produced a result."""
@@ -509,6 +567,12 @@ def build_pipeline_graph(
         bgm node must never run on a missing/failed captioned MP4."""
         return "bgm" if state.caption_result is not None and state.caption_result.success else END
 
+    def route_after_bgm(state: PipelineState) -> str:
+        """Only proceed to metadata generation if BGM mixing actually
+        succeeded - the metadata node must never run on a missing/failed
+        final mixed MP4."""
+        return "metadata" if state.audio_mix_result is not None and state.audio_mix_result.success else END
+
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
@@ -518,6 +582,7 @@ def build_pipeline_graph(
     graph.add_node("video_assembly", video_assembly_node)
     graph.add_node("captions", caption_node)
     graph.add_node("bgm", bgm_node)
+    graph.add_node("metadata", metadata_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
@@ -531,7 +596,8 @@ def build_pipeline_graph(
         "video_assembly", route_after_video_assembly, {"captions": "captions", END: END}
     )
     graph.add_conditional_edges("captions", route_after_captions, {"bgm": "bgm", END: END})
-    graph.set_finish_point("bgm")
+    graph.add_conditional_edges("bgm", route_after_bgm, {"metadata": "metadata", END: END})
+    graph.set_finish_point("metadata")
 
     return graph
 
@@ -553,28 +619,30 @@ async def run_pipeline(
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
-    -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing pipeline and
-    return the final state.
+    -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata
+    pipeline and return the final state.
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
     can inspect ``status``/``error`` directly, including on partial failure
-    (e.g. every stage through captioning succeeded but BGM mixing failed).
+    (e.g. every stage through BGM mixing succeeded but metadata generation
+    failed).
 
     Each stage only runs if the previous one succeeded - a failure at any
     stage short-circuits the rest of the pipeline and it never silently
     continues (see route_after_research/route_after_script/route_after_voice/
     route_after_media/route_after_visual_qc/route_after_video_assembly/
-    route_after_captions). Visual QC itself fails the pipeline (status
-    "failed", Video Assembly never runs) if any asset is still flagged
-    misleading/conflicting after bounded replacement is exhausted - see
-    visual_qc_node. Pipeline status only becomes "completed" once BGM
-    mixing itself succeeds and a final captioned-and-mixed MP4 exists; a
-    semantic mood-planning failure inside that stage does not itself fail
-    the pipeline (AudioMixingService falls back to a deterministic
-    MusicPlan and mixing proceeds) - only an actual mixing/selection/
-    catalog failure does. The captioned MP4 (``caption_result``) and every
-    earlier-stage result are preserved unchanged either way.
+    route_after_captions/route_after_bgm). Visual QC itself fails the
+    pipeline (status "failed", Video Assembly never runs) if any asset is
+    still flagged misleading/conflicting after bounded replacement is
+    exhausted - see visual_qc_node. Pipeline status only becomes "completed"
+    once metadata generation itself succeeds; a semantic mood-planning
+    failure inside BGM, or a chapters-only issue inside metadata generation,
+    does not itself fail the pipeline (both degrade to a safe fallback and
+    continue) - only an actual mixing/selection/catalog failure, or a total
+    metadata generation failure, does. The final BGM-mixed MP4
+    (``audio_mix_result``) and every earlier-stage result are preserved
+    unchanged either way.
 
     Args:
         topic: Research topic to investigate, script, narrate, illustrate, and assemble
@@ -631,6 +699,7 @@ async def run_pipeline(
         video_assembly_result=raw_result.get("video_assembly_result"),
         caption_result=raw_result.get("caption_result"),
         audio_mix_result=raw_result.get("audio_mix_result"),
+        metadata_result=raw_result.get("metadata_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )

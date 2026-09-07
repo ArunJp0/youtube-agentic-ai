@@ -14,6 +14,7 @@ from src.llm.mock import MockLLMProvider
 from src.llm.provider import LLMProvider
 from src.models.captions import CaptionResult
 from src.models.media import VisualResult
+from src.models.metadata import MetadataResult
 from src.models.music import AudioMixResult, BGMTrack
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
@@ -36,6 +37,28 @@ TEST_VOICE_NAME = "test-voice"
 # doubles distinguish the BGM mood-planning call from Research/Script
 # prompts sharing the same LLMProvider.
 _MUSIC_PROMPT_MARKER = "BACKGROUND MUSIC CHARACTERISTICS"
+
+# MetadataAgent's prompt always mentions this phrase (see
+# src/agents/metadata_agent.py) - a unique marker that lets test doubles
+# distinguish the metadata-generation call from Research/Script/BGM
+# prompts sharing the same LLMProvider.
+_METADATA_PROMPT_MARKER = "YouTube upload metadata"
+
+
+def _default_metadata_json(**overrides) -> str:
+    """A valid MetadataAgent response payload - deliberately omits
+    chapter_labels so MetadataAgent's own section-heading fallback fills
+    every chapter title, regardless of how many real sections the default
+    fixture's mock Research->Script pipeline happens to produce."""
+    payload = {
+        "title": "Why Do Humans Dream? The Science Explained",
+        "description": "A grounded look at the real science of dreaming, covering what current research says.",
+        "seo_summary": "Learn what science says about why humans dream.",
+        "tags": ["dreams", "sleep science"],
+        "hashtags": ["#dreams", "#sleep"],
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
 
 
 class EmptySearchProvider(SearchProvider):
@@ -79,9 +102,12 @@ class ResearchMockWithVariedSections(LLMProvider):
     section-distinctness requirements.
 
     Never returns valid JSON for MusicContextPlanner's mood-planning
-    prompt either, so the default pipeline fixture exercises BGM's
-    deterministic fallback path (see MusicPlanningLLMProvider below for
-    the successful-semantic-planning counterpart).
+    prompt, so the default pipeline fixture exercises BGM's deterministic
+    fallback path (see MusicPlanningLLMProvider below for the successful-
+    semantic-planning counterpart). DOES return a valid MetadataAgent
+    response by default (metadata generation has no deterministic content
+    fallback, so the default fixture must produce something usable for
+    every "full pipeline success" test to mean anything).
     """
 
     def __init__(self) -> None:
@@ -91,6 +117,8 @@ class ResearchMockWithVariedSections(LLMProvider):
         if "Point to expand on: '" in prompt:
             point = prompt.split("Point to expand on: '", 1)[1].split("'.", 1)[0]
             return f"{point}. A distinct detail worth covering on its own."
+        if _METADATA_PROMPT_MARKER in prompt:
+            return _default_metadata_json()
         return self._mock.generate_text(prompt)
 
 
@@ -134,6 +162,27 @@ class MusicPlanningLLMProvider(LLMProvider):
                     "reasoning_summary": "test reasoning",
                 }
             )
+        return self._delegate.generate_text(prompt)
+
+
+class ConfigurableMetadataLLMProvider(LLMProvider):
+    """Delegates Research/Script/BGM prompts to ResearchMockWithVariedSections
+    unchanged, but lets a test control exactly what MetadataAgent's prompt
+    receives (a custom payload, or a raised error) without touching any
+    earlier stage - isolates metadata-only success/failure scenarios."""
+
+    def __init__(self, metadata_payload: dict | None = None, metadata_error: Exception | None = None) -> None:
+        self._delegate = ResearchMockWithVariedSections()
+        self.metadata_payload = metadata_payload
+        self.metadata_error = metadata_error
+        self.metadata_calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        if _METADATA_PROMPT_MARKER in prompt:
+            self.metadata_calls.append(prompt)
+            if self.metadata_error is not None:
+                raise self.metadata_error
+            return _default_metadata_json(**(self.metadata_payload or {}))
         return self._delegate.generate_text(prompt)
 
 
@@ -561,6 +610,7 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is None
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
@@ -579,6 +629,7 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is None
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert voice_provider.calls == []
         assert media_provider.calls == []
         assert assembler.build_calls == []
@@ -599,6 +650,7 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is None
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert media_provider.calls == []
         assert assembler.build_calls == []
 
@@ -619,6 +671,7 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is None
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
         assert assembler.extract_frame_calls == []
@@ -661,6 +714,7 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is None
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []
         assert transcription_provider.calls == []
@@ -715,19 +769,35 @@ class TestPipelineWorkflow:
         # Captions/BGM never run on a failed/missing assembled video.
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
 
-    # ---- H. status only "completed" when BGM mixing succeeds after captioning -
+    # ---- H. status only "completed" when metadata generation succeeds after BGM -
 
     @pytest.mark.asyncio
-    async def test_status_is_completed_only_when_bgm_mixing_succeeds(self, providers) -> None:
+    async def test_status_is_completed_only_when_metadata_generation_succeeds(self, providers) -> None:
         success_state = await self._run(providers)
         assert success_state.status == "completed"
         assert success_state.video_assembly_result.success is True
         assert success_state.caption_result.success is True
         assert success_state.audio_mix_result.success is True
+        assert success_state.metadata_result.success is True
 
         failure_state = await self._run(providers, assembler=FakeVideoAssembler(fail=True))
         assert failure_state.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_bgm_success_alone_no_longer_marks_pipeline_completed(self, providers) -> None:
+        """BGM succeeding is necessary but not sufficient - a metadata
+        failure after a successful BGM mix must NOT be reported as
+        "completed"; the pipeline's final deliverable now includes metadata."""
+        state = await self._run(
+            providers, llm_provider=ConfigurableMetadataLLMProvider(metadata_error=RuntimeError("metadata outage"))
+        )
+
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
+        assert state.status == "failed"
+        assert state.status != "completed"
 
     @pytest.mark.asyncio
     async def test_status_is_failed_not_completed_after_hard_qc_failure(self, providers) -> None:
@@ -738,10 +808,10 @@ class TestPipelineWorkflow:
     # ---- I. existing behavior preserved -------------------------------------
 
     @pytest.mark.asyncio
-    async def test_no_search_results_still_completes_through_bgm(self, providers) -> None:
+    async def test_no_search_results_still_completes_through_metadata(self, providers) -> None:
         """MockSearchProvider returning [] is a valid (if sparse) research result,
         not an error - the pipeline should still complete all the way through
-        BGM mixing."""
+        metadata generation."""
         state = await self._run(providers, topic="obscure topic", search_provider=EmptySearchProvider())
 
         assert state.research_result is not None
@@ -753,6 +823,8 @@ class TestPipelineWorkflow:
         assert state.caption_result.success is True
         assert state.audio_mix_result is not None
         assert state.audio_mix_result.success is True
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is True
 
     @pytest.mark.asyncio
     async def test_pipeline_state_defaults(self) -> None:
@@ -768,6 +840,8 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result is None
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
+        assert state.metadata_result is None
         assert state.status == "pending"
         assert state.error is None
 
@@ -833,6 +907,7 @@ class TestPipelineWorkflow:
         assert state.status == "failed"
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert transcription_provider.calls == []
 
     @pytest.mark.asyncio
@@ -843,6 +918,7 @@ class TestPipelineWorkflow:
         assert state.status == "failed"
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert transcription_provider.calls == []
 
     @pytest.mark.asyncio
@@ -852,6 +928,7 @@ class TestPipelineWorkflow:
 
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
         assert transcription_provider.calls == []
 
     # ---- L. Caption failure behavior -----------------------------------------
@@ -863,6 +940,7 @@ class TestPipelineWorkflow:
         assert state.status == "failed"
         assert "Caption generation failed" in state.error
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
 
     @pytest.mark.asyncio
     async def test_caption_burn_failure_preserves_original_mp4(self, providers) -> None:
@@ -901,6 +979,7 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result.success is True
         assert os.path.exists(state.video_assembly_result.output_path)
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
 
     # ---- M. AudioMixResult stored / correct inputs ---------------------------
 
@@ -1018,6 +1097,7 @@ class TestPipelineWorkflow:
 
         assert state.status == "failed"
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
 
     @pytest.mark.asyncio
     async def test_bgm_node_not_called_after_hard_qc_failure(self, providers) -> None:
@@ -1025,6 +1105,7 @@ class TestPipelineWorkflow:
 
         assert state.status == "failed"
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
 
     @pytest.mark.asyncio
     async def test_bgm_node_not_called_when_video_assembly_fails(self, providers) -> None:
@@ -1032,6 +1113,7 @@ class TestPipelineWorkflow:
 
         assert state.status == "failed"
         assert state.audio_mix_result is None
+        assert state.metadata_result is None
 
     # ---- P. BGM failure behavior ----------------------------------------------
 
@@ -1088,3 +1170,230 @@ class TestPipelineWorkflow:
         assert state.video_assembly_result.success is True
         assert state.caption_result is not None
         assert state.caption_result.success is True
+
+    # ---- Q. Metadata: stored / correct inputs / routing -----------------------
+
+    @pytest.mark.asyncio
+    async def test_metadata_node_exists_and_pipeline_builds(self, providers) -> None:
+        (
+            search_provider, llm_provider, voice_provider, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        ) = providers
+        graph = build_pipeline_graph(
+            search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        )
+        compiled = graph.compile()
+        assert "metadata" in compiled.get_graph().nodes
+
+    @pytest.mark.asyncio
+    async def test_metadata_result_is_structured_and_stored_in_final_state(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert isinstance(state.metadata_result, MetadataResult)
+        assert state.metadata_result.success is True
+        assert state.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_metadata_runs_only_after_bgm_succeeds(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider()
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
+        assert len(provider.metadata_calls) == 1
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is True
+
+    @pytest.mark.asyncio
+    async def test_metadata_receives_original_topic(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, topic="Why do humans dream?", llm_provider=recording_llm)
+
+        metadata_prompts = [c for c in recording_llm.calls if _METADATA_PROMPT_MARKER in c]
+        assert len(metadata_prompts) == 1
+        assert state.topic in metadata_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_metadata_receives_actual_multi_section_script_result(self, providers) -> None:
+        """The metadata prompt must reflect the SAME multi-section
+        ScriptResult the pipeline actually produced - proving the real
+        PipelineState.script_result is used, not a reconstructed one."""
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, llm_provider=recording_llm)
+
+        assert len(state.script_result.sections) >= 2  # a real multi-section script, not a synthetic 1-section stand-in
+
+        metadata_prompts = [c for c in recording_llm.calls if _METADATA_PROMPT_MARKER in c]
+        assert len(metadata_prompts) == 1
+        for section in state.script_result.sections:
+            assert section.heading in metadata_prompts[0]
+            assert section.narration in metadata_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_metadata_does_not_reconstruct_script_from_srt(self, providers) -> None:
+        """No script-context-reconstruction placeholder text should ever
+        appear in pipeline-integrated metadata output - that fallback only
+        exists for the standalone demo, which has no PipelineState."""
+        state = await self._run(providers)
+
+        assert "reconstructed for standalone validation" not in state.metadata_result.title.lower()
+        assert "reconstructed for standalone validation" not in state.metadata_result.description.lower()
+
+    @pytest.mark.asyncio
+    async def test_metadata_receives_final_mixed_video_duration(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.metadata_result.duration_seconds == state.audio_mix_result.output_duration_seconds
+
+    @pytest.mark.asyncio
+    async def test_no_research_or_script_rerun_for_metadata(self, providers) -> None:
+        recording_search = RecordingSearchProvider()
+        await self._run(providers, search_provider=recording_search)
+
+        # ResearchAgent is the only caller of SearchProvider.search() in the
+        # whole pipeline - if metadata generation re-ran Research, this
+        # would be > 1.
+        assert len(recording_search.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_metadata_agent_called_exactly_once(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider()
+        await self._run(providers, llm_provider=provider)
+
+        assert len(provider.metadata_calls) == 1
+
+    # ---- R. Metadata not called before/without BGM success --------------------
+
+    @pytest.mark.asyncio
+    async def test_metadata_not_called_when_caption_fails(self, providers) -> None:
+        state = await self._run(providers, assembler=FakeVideoAssembler(fail_burn_subtitles=True))
+
+        assert state.status == "failed"
+        assert state.metadata_result is None
+
+    @pytest.mark.asyncio
+    async def test_metadata_not_called_after_hard_qc_failure(self, providers) -> None:
+        state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
+
+        assert state.status == "failed"
+        assert state.metadata_result is None
+
+    @pytest.mark.asyncio
+    async def test_metadata_not_called_when_bgm_mixing_fails(self, providers) -> None:
+        state = await self._run(providers, music_catalog_provider=MockMusicCatalogProvider(tracks=[]))
+
+        assert state.status == "failed"
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is False
+        assert state.metadata_result is None
+
+    # ---- S. Metadata failure behavior ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_metadata_llm_failure_marks_pipeline_failed(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider(metadata_error=RuntimeError("simulated metadata LLM outage"))
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.status == "failed"
+        assert "Metadata generation failed" in state.error
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is False
+
+    @pytest.mark.asyncio
+    async def test_metadata_failure_preserves_final_mixed_video(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider(metadata_error=RuntimeError("outage"))
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
+        assert os.path.exists(state.audio_mix_result.output_path)
+
+    @pytest.mark.asyncio
+    async def test_metadata_failure_preserves_earlier_pipeline_outputs(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider(metadata_error=RuntimeError("outage"))
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.status == "failed"
+        assert state.research_result is not None
+        assert state.script_result is not None
+        assert state.voice_result is not None
+        assert state.voice_result.success is True
+        assert state.visual_result is not None
+        assert state.visual_qc_result is not None
+        assert state.qc_approved_visual_result is not None
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
+        assert state.caption_result is not None
+        assert state.caption_result.success is True
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
+
+    # ---- T. Deterministic chapter generation from the real multi-section script -
+
+    @pytest.mark.asyncio
+    async def test_real_multi_section_script_produces_chapter_candidates(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.metadata_result.chapters_available is True
+        assert len(state.metadata_result.chapters) == len(state.script_result.sections)
+
+    @pytest.mark.asyncio
+    async def test_first_chapter_starts_at_zero(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.metadata_result.chapters[0].timestamp_seconds == 0.0
+        assert state.metadata_result.chapters[0].timestamp_text == "0:00"
+
+    @pytest.mark.asyncio
+    async def test_chapter_timestamps_strictly_increasing(self, providers) -> None:
+        state = await self._run(providers)
+
+        timestamps = [c.timestamp_seconds for c in state.metadata_result.chapters]
+        assert timestamps == sorted(timestamps)
+        assert len(set(timestamps)) == len(timestamps)
+
+    @pytest.mark.asyncio
+    async def test_chapter_timestamps_within_final_duration(self, providers) -> None:
+        state = await self._run(providers)
+
+        duration = state.audio_mix_result.output_duration_seconds
+        assert all(c.timestamp_seconds < duration for c in state.metadata_result.chapters)
+
+    @pytest.mark.asyncio
+    async def test_llm_does_not_control_raw_chapter_timestamps(self, providers) -> None:
+        """The metadata prompt must tell the LLM timestamps are already
+        fixed when chapters are being requested - proving the LLM is only
+        ever asked for labels, never timestamps."""
+        recording_llm = RecordingLLMProvider()
+        await self._run(providers, llm_provider=recording_llm)
+
+        metadata_prompts = [c for c in recording_llm.calls if _METADATA_PROMPT_MARKER in c]
+        assert "ALREADY FIXED" in metadata_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_missing_chapter_label_falls_back_to_section_heading(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider(metadata_payload={"chapter_labels": ["Only One Real Label"]})
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.metadata_result.chapters_available is True
+        assert state.metadata_result.chapters[0].title == "Only One Real Label"
+        # Every later chapter falls back to its own section's real heading.
+        for index in range(1, len(state.metadata_result.chapters)):
+            assert state.metadata_result.chapters[index].title == state.script_result.sections[index].heading
+
+    # ---- U. Metadata JSON artifact ---------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_metadata_json_artifact_written_to_disk(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.metadata_result.output_path is not None
+        assert os.path.exists(state.metadata_result.output_path)
+        with open(state.metadata_result.output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["title"] == state.metadata_result.title
+        assert data["chapters_available"] is True
+        assert len(data["chapters"]) == len(state.script_result.sections)

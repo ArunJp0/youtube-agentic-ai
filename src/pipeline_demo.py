@@ -29,6 +29,7 @@ from src.config.providers import (
 from src.config.settings import Settings
 from src.main import print_research_result
 from src.media_demo import print_visual_result
+from src.metadata_demo import print_metadata_result
 from src.script_demo import print_script_result
 from src.visual_qc_demo import print_qc_result
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR
@@ -46,14 +47,15 @@ DEFAULT_TOPIC = "Why do humans dream?"
 # top-level progress stage - it isn't a separately observable pipeline step
 # from the outside, just an internal part of how Visual Media selects assets.
 _STAGE_LABELS = {
-    "research": "[1/8] Research",
-    "script": "[2/8] Script",
-    "voice": "[3/8] Voice",
-    "media": "[4/8] Visual Media",
-    "visual_qc": "[5/8] Visual QC",
-    "video_assembly": "[6/8] Video Assembly",
-    "captions": "[7/8] Subtitles / Captions",
-    "bgm": "[8/8] BGM / Audio Mixing",
+    "research": "[1/9] Research",
+    "script": "[2/9] Script",
+    "voice": "[3/9] Voice",
+    "media": "[4/9] Visual Media",
+    "visual_qc": "[5/9] Visual QC",
+    "video_assembly": "[6/9] Video Assembly",
+    "captions": "[7/9] Subtitles / Captions",
+    "bgm": "[8/9] BGM / Audio Mixing",
+    "metadata": "[9/9] Metadata",
 }
 
 
@@ -66,7 +68,7 @@ def _ensure_utf8_stdout() -> None:
 
 
 async def run_pipeline_demo(topic: str) -> PipelineState:
-    """Run the full 8-stage pipeline, printing progress as each stage completes.
+    """Run the full 9-stage pipeline, printing progress as each stage completes.
 
     Provider selection comes entirely from Settings/.env via the existing
     provider factory (src.config.providers) - this function does not
@@ -152,6 +154,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         video_assembly_result=accumulated.get("video_assembly_result"),
         caption_result=accumulated.get("caption_result"),
         audio_mix_result=accumulated.get("audio_mix_result"),
+        metadata_result=accumulated.get("metadata_result"),
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
     )
@@ -242,6 +245,26 @@ def _print_final_summary(state: PipelineState) -> None:
     else:
         print("BGM/Audio Mix success: False")
 
+    if state.metadata_result:
+        metadata = state.metadata_result
+        print(f"Metadata success: {metadata.success}")
+        if metadata.success:
+            print(f"Title: {metadata.title}")
+            print(f"Tags ({len(metadata.tags)}): {metadata.tags}")
+            print(f"Hashtags ({len(metadata.hashtags)}): {metadata.hashtags}")
+            if metadata.chapters_available:
+                print(f"Chapters ({len(metadata.chapters)}):")
+                for chapter in metadata.chapters:
+                    print(f"   {chapter.timestamp_text:>8s}  {chapter.title}")
+            else:
+                print(f"Chapters: unavailable ({metadata.chapters_omitted_reason})")
+            print(f"Metadata JSON: {metadata.output_path}")
+            print(f"LLM provider: {metadata.llm_provider} | model: {metadata.llm_model} | fallback used: {metadata.used_fallback_model}")
+        else:
+            print(f"Metadata error: {metadata.error}")
+    else:
+        print("Metadata success: False")
+
 
 async def main() -> None:
     """Main entry point for the pipeline demo."""
@@ -328,6 +351,12 @@ async def main() -> None:
         print("# AUDIO MIX RESULT")
         print("#" * 60)
         print_mix_result(state.audio_mix_result)
+
+    if state.metadata_result:
+        print("\n" + "#" * 60)
+        print("# METADATA RESULT")
+        print("#" * 60)
+        print_metadata_result(state.metadata_result)
 
     _print_final_summary(state)
 

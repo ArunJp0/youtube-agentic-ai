@@ -218,6 +218,14 @@
 - Chapters were correctly reported unavailable in this standalone run - the SRT-based reconstruction produces only one synthetic section (a standalone-demo limitation, not a Metadata Agent defect), and the agent correctly refused to fabricate a fake chapter split rather than inventing timestamps; once integrated into the main pipeline, the real multi-section `ScriptResult` will be available and real chapter generation can be validated
 - Manual review flagged one upstream accuracy note: the generated description inherited a wording/factual issue about Matthew Walker from the real narration/transcript context the standalone demo reconstructed from - the Metadata Agent did not invent this independently; noted as a future accuracy/compliance hardening consideration, not a defect in this milestone
 - Standalone Metadata Agent milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/metadata_demo.py` is a separate standalone runner for this milestone
+- Metadata Agent Main Pipeline Integration implemented: `MetadataAgent` is now wired into the main LangGraph orchestration as a `metadata` node running after BGM/Audio Mixing - the pipeline is now 9 stages: Research → Script → Voice → Visual Media → Visual QC → Video Assembly → Subtitles/Captions → BGM/Audio Mixing → Metadata
+- Only 3 files were changed to wire it in: `src/workflows/pipeline_graph.py`, `src/pipeline_demo.py`, `tests/test_pipeline_workflow.py` - the existing standalone `MetadataAgent`, deterministic chapter-timing logic, and validation/normalization layer were reused exactly as validated in the standalone milestone, with no duplicated generation/validation logic introduced
+- `PipelineState.metadata_result` added; pipeline `status` only becomes `completed` once metadata generation itself succeeds (`bgm_node`'s own success status was renamed to `mixed`); a metadata failure marks the pipeline `failed` while preserving every earlier stage's successful results, including the final BGM-mixed MP4
+- The integrated `metadata_node` reuses the exact multi-section `ScriptResult` already present in `PipelineState` (never reconstructed from an `.srt` transcript - that fallback exists only in the standalone demo, which has no pipeline state to read a real `ScriptResult` from) and the real final duration probed from the BGM-mixed MP4 (`audio_mix_result.output_duration_seconds`) for deterministic chapter timing - Research/Script/Voice/Visual Media/Visual QC/Video Assembly/Captions/BGM are never re-run for metadata generation
+- 850/850 tests passing (23 new Metadata pipeline-integration tests), all using mocked LLM doubles - no real Gemini, Pexels, Whisper, or FFmpeg calls in the automated suite
+- Real end-to-end run validated via `python -m src.pipeline_demo "Why do humans dream?"`: all 9 stages completed with final status `completed` - the Metadata call succeeded on the primary Gemini model with no fallback needed, producing title "Why Do Humans Dream? The Science and Mystery of Sleep", 5 tags, 4 hashtags, a grounded description, and **5 real chapters derived from the 5 real script sections** (`0:00`, `0:34`, `0:59`, `1:27`, `2:01`) - confirmed first chapter at `0:00`, strictly increasing timestamps, all within the final ~151.57s duration; this resolves the standalone milestone's single-synthetic-section chapter limitation
+- Manual review of the real run confirmed the final video and generated metadata (title, description, tags, hashtags, chapters) were good; the same upstream Matthew Walker wording/accuracy note observed in the standalone milestone recurred (inherited from Research/Script content, not invented by the Metadata Agent) - recorded as a future accuracy/compliance hardening item
+- Metadata Agent Main Pipeline Integration milestone marked **COMPLETE**
 
 ## Known Limitations
 
@@ -233,27 +241,23 @@
 - The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
 - Gemini mood planning is a single optional call per video; real validation showed it can be unavailable under Gemini free-tier rate limiting (429/503/timeouts), in which case the deterministic fallback `MusicPlan` (neutral/calm, low energy, ambient/cinematic, neutral/subtle required) is used automatically - mood selection is correspondingly generic whenever the LLM call doesn't succeed.
 - The main pipeline now produces **three** MP4-related outputs per run on disk (the original assembled MP4, the captioned MP4, and the final BGM-mixed MP4), plus the `.srt` file, rather than a single final output - intentional for now as development/debug fallbacks; a future storage/cleanup milestone may remove the intermediate files once the final mixed MP4 has been used/uploaded successfully.
-- The Standalone Metadata Agent is implemented and real-validated but is **standalone only** - the main pipeline's final output does not currently include generated YouTube metadata.
-- Metadata Agent chapter generation has only been exercised against the standalone demo's single-synthetic-section reconstructed context (chapters correctly reported unavailable there); real multi-section chapter generation has not yet been validated against an actual multi-section `ScriptResult` - that requires main-pipeline integration.
-- Metadata content quality (title/description/tags/hashtags accuracy) depends entirely on the quality and accuracy of the input `ScriptResult`/narration - the Metadata Agent does not independently fact-check; an accuracy issue already present in upstream narration will pass through into the generated metadata (observed once in real validation - see the Matthew Walker note above).
+- Metadata content quality (title/description/tags/hashtags accuracy) depends entirely on the quality and accuracy of the input `ScriptResult`/narration - the Metadata Agent does not independently fact-check; an accuracy issue already present in upstream narration will pass through into the generated metadata (observed in both the standalone milestone and the real integrated run - see the Matthew Walker note above).
+- The Metadata Agent is now integrated into the main pipeline, but its main-pipeline JSON artifact output (`output/metadata/<video-slug>.json`) is not yet consumed by anything - it is written for a future YouTube Upload Agent to read, which does not exist yet.
 
 ## Current Next Milestone
 
-**Metadata Agent Main Pipeline Integration** - wire the already-validated standalone `MetadataAgent` into the main orchestration as a stage after BGM/Audio Mixing, using the real multi-section `ScriptResult` already present in pipeline state (not a reconstructed one) so chapter generation can finally be validated against real section timing:
+**Thumbnail Agent** - the Metadata milestone is now frozen after successful real 9-stage integration validation.
 
 ```
 Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
       → Subtitles / Captions → BGM / Audio Mixing → Metadata → END
 ```
 
-After successful integration and real validation, freeze the Metadata milestone and move to Thumbnail Agent.
-
 Planned sequence after that, in order:
 
-1. Metadata Agent Main Pipeline Integration
-2. Thumbnail Agent
-3. Copyright / Compliance checks
-4. YouTube Upload + Scheduling
-5. Monitoring / Post-publish
-6. Topic Planner
-7. Final storage/cleanup hardening as appropriate (including the multi-file-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)
+1. Thumbnail Agent
+2. Copyright / Compliance checks
+3. YouTube Upload + Scheduling
+4. Monitoring / Post-publish
+5. Topic Planner
+6. Final storage/cleanup hardening as appropriate (including the multi-file-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)
