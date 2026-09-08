@@ -31,6 +31,7 @@ from src.main import print_research_result
 from src.media_demo import print_visual_result
 from src.metadata_demo import print_metadata_result
 from src.script_demo import print_script_result
+from src.thumbnail_demo import print_thumbnail_result
 from src.visual_qc_demo import print_qc_result
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR
 from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
@@ -47,15 +48,16 @@ DEFAULT_TOPIC = "Why do humans dream?"
 # top-level progress stage - it isn't a separately observable pipeline step
 # from the outside, just an internal part of how Visual Media selects assets.
 _STAGE_LABELS = {
-    "research": "[1/9] Research",
-    "script": "[2/9] Script",
-    "voice": "[3/9] Voice",
-    "media": "[4/9] Visual Media",
-    "visual_qc": "[5/9] Visual QC",
-    "video_assembly": "[6/9] Video Assembly",
-    "captions": "[7/9] Subtitles / Captions",
-    "bgm": "[8/9] BGM / Audio Mixing",
-    "metadata": "[9/9] Metadata",
+    "research": "[1/10] Research",
+    "script": "[2/10] Script",
+    "voice": "[3/10] Voice",
+    "media": "[4/10] Visual Media",
+    "visual_qc": "[5/10] Visual QC",
+    "video_assembly": "[6/10] Video Assembly",
+    "captions": "[7/10] Subtitles / Captions",
+    "bgm": "[8/10] BGM / Audio Mixing",
+    "metadata": "[9/10] Metadata",
+    "thumbnail": "[10/10] Thumbnail",
 }
 
 
@@ -68,7 +70,7 @@ def _ensure_utf8_stdout() -> None:
 
 
 async def run_pipeline_demo(topic: str) -> PipelineState:
-    """Run the full 9-stage pipeline, printing progress as each stage completes.
+    """Run the full 10-stage pipeline, printing progress as each stage completes.
 
     Provider selection comes entirely from Settings/.env via the existing
     provider factory (src.config.providers) - this function does not
@@ -155,6 +157,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         caption_result=accumulated.get("caption_result"),
         audio_mix_result=accumulated.get("audio_mix_result"),
         metadata_result=accumulated.get("metadata_result"),
+        thumbnail_result=accumulated.get("thumbnail_result"),
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
     )
@@ -265,6 +268,18 @@ def _print_final_summary(state: PipelineState) -> None:
     else:
         print("Metadata success: False")
 
+    if state.thumbnail_result:
+        thumbnail = state.thumbnail_result
+        print(f"Thumbnail success: {thumbnail.success}")
+        if thumbnail.success:
+            plan = thumbnail.plan
+            print(f"Hook: {plan.hook_text if plan else None} | Composition: {plan.composition if plan else None}")
+            print(f"Thumbnail: {thumbnail.output_path} ({thumbnail.width}x{thumbnail.height})")
+        else:
+            print(f"Thumbnail error: {thumbnail.error}")
+    else:
+        print("Thumbnail success: False")
+
 
 async def main() -> None:
     """Main entry point for the pipeline demo."""
@@ -357,6 +372,12 @@ async def main() -> None:
         print("# METADATA RESULT")
         print("#" * 60)
         print_metadata_result(state.metadata_result)
+
+    if state.thumbnail_result:
+        print("\n" + "#" * 60)
+        print("# THUMBNAIL RESULT")
+        print("#" * 60)
+        print_thumbnail_result(state.thumbnail_result)
 
     _print_final_summary(state)
 

@@ -9,6 +9,7 @@ import json
 import os
 
 import pytest
+from PIL import Image
 
 from src.llm.mock import MockLLMProvider
 from src.llm.provider import LLMProvider
@@ -18,6 +19,7 @@ from src.models.metadata import MetadataResult
 from src.models.music import AudioMixResult, BGMTrack
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
+from src.models.thumbnail import ThumbnailResult
 from src.models.video import VideoAssemblyResult
 from src.models.visual_qc import RawAssetVerdict, VisualQCResult
 from src.models.voice import VoiceResult
@@ -43,6 +45,28 @@ _MUSIC_PROMPT_MARKER = "BACKGROUND MUSIC CHARACTERISTICS"
 # distinguish the metadata-generation call from Research/Script/BGM
 # prompts sharing the same LLMProvider.
 _METADATA_PROMPT_MARKER = "YouTube upload metadata"
+
+# ThumbnailPlanner's prompt always opens with this phrase (see
+# src/agents/thumbnail_planner.py) - a unique marker that lets test doubles
+# distinguish the thumbnail-planning call from Research/Script/BGM/Metadata
+# prompts sharing the same LLMProvider.
+_THUMBNAIL_PROMPT_MARKER = "planning a YouTube thumbnail CONCEPT"
+
+
+def _default_thumbnail_plan_json(**overrides) -> str:
+    """A valid ThumbnailPlanner response payload."""
+    payload = {
+        "hook_text": "WHY DO WE DREAM",
+        "visual_concept": "A sleeping person with dream imagery",
+        "search_query": "person sleeping dreaming",
+        "mood": "curious",
+        "subject": "a sleeping person",
+        "composition": "subject_left",
+        "text_position": "right",
+        "avoid_concepts": [],
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
 
 
 def _default_metadata_json(**overrides) -> str:
@@ -186,6 +210,49 @@ class ConfigurableMetadataLLMProvider(LLMProvider):
         return self._delegate.generate_text(prompt)
 
 
+class ConfigurableThumbnailLLMProvider(LLMProvider):
+    """Delegates Research/Script/BGM/Metadata prompts to
+    ResearchMockWithVariedSections unchanged (including its default valid
+    MetadataAgent response), but lets a test control exactly what
+    ThumbnailPlanner's prompt receives (a custom payload, or a raised
+    error) without touching any earlier stage - isolates thumbnail-only
+    success/failure/hook-quality scenarios."""
+
+    def __init__(self, thumbnail_payload: dict | None = None, thumbnail_error: Exception | None = None) -> None:
+        self._delegate = ResearchMockWithVariedSections()
+        self.thumbnail_payload = thumbnail_payload
+        self.thumbnail_error = thumbnail_error
+        self.thumbnail_calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        if _THUMBNAIL_PROMPT_MARKER in prompt:
+            self.thumbnail_calls.append(prompt)
+            if self.thumbnail_error is not None:
+                raise self.thumbnail_error
+            return _default_thumbnail_plan_json(**(self.thumbnail_payload or {}))
+        return self._delegate.generate_text(prompt)
+
+
+class RecordingMetadataAndThumbnailLLMProvider(LLMProvider):
+    """Lets a test set a distinctive metadata title and records every
+    prompt seen - proving the Thumbnail stage's prompt reflects that exact
+    in-memory MetadataResult.title rather than anything reloaded from disk
+    (no ScriptResult/MetadataResult is ever reloaded from JSON by the real
+    pipeline - that reconstruction fallback exists only for standalone
+    demos, which have no PipelineState to read a real result from)."""
+
+    def __init__(self, metadata_title: str) -> None:
+        self._delegate = ResearchMockWithVariedSections()
+        self.metadata_title = metadata_title
+        self.calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        if _METADATA_PROMPT_MARKER in prompt:
+            return _default_metadata_json(title=self.metadata_title)
+        return self._delegate.generate_text(prompt)
+
+
 class ExplodingVoiceProvider(VoiceProvider):
     """Test double: synthesize always raises, to simulate TTS failure."""
 
@@ -213,6 +280,56 @@ class ExplodingMediaProvider(MediaProvider):
 
     async def download(self, candidate, output_path: str) -> None:
         raise RuntimeError("should never be called")
+
+
+class ThumbnailCapableMediaProvider(MediaProvider):
+    """Wraps MockMediaProvider but writes a real, valid, small Pillow image
+    on download instead of MockMediaProvider's raw placeholder bytes.
+
+    The full pipeline's Thumbnail stage (unlike the FFmpeg-based Visual
+    Media/Video Assembly stages, which never inspect file content because
+    FakeVideoAssembler fakes encoding entirely) decodes the downloaded
+    image with real Pillow - so the default pipeline fixture needs a
+    media provider whose "downloaded" files are genuinely openable images.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        self._delegate = MockMediaProvider(**kwargs)
+
+    @property
+    def name(self) -> str:
+        return self._delegate.name
+
+    @property
+    def calls(self):
+        return self._delegate.calls
+
+    async def search(self, query: str, prefer_video: bool = True, max_results: int = 5):
+        return await self._delegate.search(query, prefer_video, max_results)
+
+    async def download(self, candidate, output_path: str) -> None:
+        self._delegate.calls.append(("download", candidate.download_url))
+        Image.new("RGB", (1920, 1080), (100, 120, 140)).save(output_path, format="JPEG")
+
+
+class FailThumbnailSearchMediaProvider(ThumbnailCapableMediaProvider):
+    """Behaves exactly like ThumbnailCapableMediaProvider (Visual Media's
+    own per-section searches succeed normally with real downloadable
+    images), except a search whose query is the raw, unmodified topic
+    string always fails - the Thumbnail stage's own deterministic-fallback
+    search query (see build_deterministic_thumbnail_plan) is always the
+    topic verbatim, letting this test double fail ONLY the Thumbnail
+    stage's image search without touching Visual Media's earlier, already-
+    succeeded search calls."""
+
+    def __init__(self, topic: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.topic = topic
+
+    async def search(self, query: str, prefer_video: bool = True, max_results: int = 5):
+        if query == self.topic:
+            raise RuntimeError("simulated thumbnail image search outage")
+        return await super().search(query, prefer_video, max_results)
 
 
 class FakeVideoAssembler(VideoAssembler):
@@ -392,7 +509,7 @@ class TestPipelineWorkflow:
             MockSearchProvider(),
             ResearchMockWithVariedSections(),
             MockVoiceProvider(),
-            MockMediaProvider(),
+            ThumbnailCapableMediaProvider(),
             FakeVideoAssembler(),
             MockVisualRelevanceEvaluator(default_score=0.9),
             MockTranscriptionProvider(),
@@ -419,6 +536,11 @@ class TestPipelineWorkflow:
             video_dir,
             subtitle_dir,
         ) = providers
+        # Derived from voice_dir (rather than a 13th fixture element) so
+        # every existing positional-unpacking of `providers` throughout this
+        # file keeps working unchanged - still always under tmp_path, never
+        # the real project output/ directory.
+        thumbnail_dir = os.path.join(os.path.dirname(voice_dir), "thumbnails")
         return run_pipeline(
             topic,
             overrides.get("search_provider", search_provider),
@@ -434,6 +556,7 @@ class TestPipelineWorkflow:
             media_dir,
             video_dir,
             subtitle_dir,
+            overrides.get("thumbnail_output_dir", thumbnail_dir),
         )
 
     @pytest.mark.asyncio
@@ -1397,3 +1520,273 @@ class TestPipelineWorkflow:
         assert data["title"] == state.metadata_result.title
         assert data["chapters_available"] is True
         assert len(data["chapters"]) == len(state.script_result.sections)
+
+
+class TestThumbnailPipelineIntegration:
+    """Tests for the Thumbnail Agent's integration as the final stage of the
+    LangGraph pipeline (Metadata -> Thumbnail -> END). Reuses the same
+    TestPipelineWorkflow fixture/_run helper shape - all mock/fake/local
+    providers only, no real Gemini/Pexels/FFmpeg/Whisper calls."""
+
+    providers = TestPipelineWorkflow.providers
+    _run = staticmethod(TestPipelineWorkflow._run)
+
+    # ---- A. Node exists / routing -------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_node_exists_and_pipeline_builds(self, providers) -> None:
+        (
+            search_provider, llm_provider, voice_provider, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        ) = providers
+        graph = build_pipeline_graph(
+            search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        )
+        compiled = graph.compile()
+        assert "thumbnail" in compiled.get_graph().nodes
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_runs_after_successful_metadata(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is True
+        assert state.thumbnail_result is not None
+        assert isinstance(state.thumbnail_result, ThumbnailResult)
+        assert state.thumbnail_result.success is True
+        assert state.status == "completed"
+        # Output validation (exact 1280x720) is preserved unchanged.
+        assert state.thumbnail_result.width == 1280
+        assert state.thumbnail_result.height == 720
+        assert state.thumbnail_result.output_path is not None
+        assert os.path.exists(state.thumbnail_result.output_path)
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_not_called_when_metadata_fails(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider(metadata_error=RuntimeError("simulated metadata outage"))
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.status == "failed"
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is False
+        assert state.thumbnail_result is None
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_not_called_when_bgm_fails(self, providers) -> None:
+        """Thumbnail must never run before Metadata - proven here via an
+        earlier-stage (BGM) failure, which must never let the graph reach
+        metadata or thumbnail at all."""
+        state = await self._run(providers, music_catalog_provider=MockMusicCatalogProvider(tracks=[]))
+
+        assert state.status == "failed"
+        assert state.metadata_result is None
+        assert state.thumbnail_result is None
+
+    # ---- B. Inputs reused from real pipeline state ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_receives_original_topic(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, topic="Why do humans dream?", llm_provider=recording_llm)
+
+        thumbnail_prompts = [c for c in recording_llm.calls if _THUMBNAIL_PROMPT_MARKER in c]
+        assert len(thumbnail_prompts) == 1
+        assert state.topic in thumbnail_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_receives_actual_script_result(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, llm_provider=recording_llm)
+
+        assert len(state.script_result.sections) >= 2  # a real multi-section script, not a synthetic stand-in
+
+        thumbnail_prompts = [c for c in recording_llm.calls if _THUMBNAIL_PROMPT_MARKER in c]
+        assert len(thumbnail_prompts) == 1
+        for section in state.script_result.sections:
+            assert section.heading in thumbnail_prompts[0]
+            assert section.narration in thumbnail_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_receives_actual_metadata_result(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, llm_provider=recording_llm)
+
+        thumbnail_prompts = [c for c in recording_llm.calls if _THUMBNAIL_PROMPT_MARKER in c]
+        assert len(thumbnail_prompts) == 1
+        assert state.metadata_result.title in thumbnail_prompts[0]
+        assert state.metadata_result.seo_summary in thumbnail_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_uses_in_memory_metadata_not_reloaded_from_json(self, providers) -> None:
+        """A distinctive, never-persisted-elsewhere title proves the
+        Thumbnail stage's prompt reflects state.metadata_result.title
+        directly - not anything reconstructed/reloaded from a JSON file
+        (the real pipeline never reloads metadata from disk; that fallback
+        only exists for standalone demo tooling)."""
+        distinctive_title = "UNIQUE-METADATA-TITLE-Q7F2"
+        provider = RecordingMetadataAndThumbnailLLMProvider(metadata_title=distinctive_title)
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.metadata_result.title == distinctive_title
+        thumbnail_prompts = [c for c in provider.calls if _THUMBNAIL_PROMPT_MARKER in c]
+        assert len(thumbnail_prompts) == 1
+        assert distinctive_title in thumbnail_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_metadata_agent_not_rerun_for_thumbnail(self, providers) -> None:
+        provider = ConfigurableMetadataLLMProvider()
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.thumbnail_result is not None
+        assert state.thumbnail_result.success is True
+        assert len(provider.metadata_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_research_or_script_rerun_for_thumbnail(self, providers) -> None:
+        recording_search = RecordingSearchProvider()
+        await self._run(providers, search_provider=recording_search)
+
+        # ResearchAgent is the only caller of SearchProvider.search() in the
+        # whole pipeline - if thumbnail generation re-ran Research, this
+        # would be > 1.
+        assert len(recording_search.calls) == 1
+
+    # ---- C. Provider reuse (dependency injection, no duplicates) -------------
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_agent_planner_called_exactly_once(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        await self._run(providers, llm_provider=recording_llm)
+
+        thumbnail_prompts = [c for c in recording_llm.calls if _THUMBNAIL_PROMPT_MARKER in c]
+        assert len(thumbnail_prompts) == 1
+
+    @pytest.mark.asyncio
+    async def test_shared_llm_provider_reused_for_thumbnail(self, providers) -> None:
+        """The same LLMProvider instance already used by Research/Script/
+        BGM/Metadata must be the one Thumbnail planning calls too - no
+        second provider/API key path."""
+        recording_llm = RecordingLLMProvider()
+        await self._run(providers, llm_provider=recording_llm)
+
+        assert any(_METADATA_PROMPT_MARKER in c for c in recording_llm.calls)
+        assert any(_THUMBNAIL_PROMPT_MARKER in c for c in recording_llm.calls)
+
+    @pytest.mark.asyncio
+    async def test_shared_media_provider_reused_for_thumbnail(self, providers) -> None:
+        """The same MediaProvider instance already used by Visual Media must
+        be the one Thumbnail image search/download uses too - no second
+        Pexels/HTTP implementation."""
+        _, _, _, media_provider, _, _, _, _, _, _, _, _ = providers
+        state = await self._run(providers)
+
+        assert state.thumbnail_result.success is True
+        search_queries = [call[1] for call in media_provider.calls if call[0] == "search"]
+        # Thumbnail's own deterministic-fallback search query is the raw
+        # topic (see build_deterministic_thumbnail_plan) - distinct from
+        # Visual Media's per-section queries, proving a real extra call was
+        # made on the SAME shared provider instance, not a duplicate one.
+        assert search_queries.count(state.topic) == 1
+
+    # ---- D. Routing / final status --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_metadata_success_alone_no_longer_completes_pipeline(self, providers) -> None:
+        """Metadata succeeding is necessary but not sufficient - a thumbnail
+        failure after successful metadata must NOT be reported as
+        "completed"; the pipeline's final deliverable now includes the
+        thumbnail."""
+        state = await self._run(providers, media_provider=FailThumbnailSearchMediaProvider(topic="Why do humans dream?"))
+
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is True
+        assert state.status == "failed"
+        assert state.status != "completed"
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_failure_marks_pipeline_failed(self, providers) -> None:
+        state = await self._run(providers, media_provider=FailThumbnailSearchMediaProvider(topic="Why do humans dream?"))
+
+        assert state.status == "failed"
+        assert "Thumbnail generation failed" in state.error
+        assert state.thumbnail_result is not None
+        assert state.thumbnail_result.success is False
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_failure_preserves_final_bgm_video(self, providers) -> None:
+        state = await self._run(providers, media_provider=FailThumbnailSearchMediaProvider(topic="Why do humans dream?"))
+
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
+        assert os.path.exists(state.audio_mix_result.output_path)
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_failure_preserves_metadata_result(self, providers) -> None:
+        state = await self._run(providers, media_provider=FailThumbnailSearchMediaProvider(topic="Why do humans dream?"))
+
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is True
+        assert state.metadata_result.output_path is not None
+        assert os.path.exists(state.metadata_result.output_path)
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_failure_preserves_earlier_results(self, providers) -> None:
+        state = await self._run(providers, media_provider=FailThumbnailSearchMediaProvider(topic="Why do humans dream?"))
+
+        assert state.research_result is not None
+        assert state.script_result is not None
+        assert state.voice_result is not None
+        assert state.voice_result.success is True
+        assert state.visual_result is not None
+        assert state.visual_qc_result is not None
+        assert state.qc_approved_visual_result is not None
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
+        assert state.caption_result is not None
+        assert state.caption_result.success is True
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
+
+    # ---- E. Approved hook-quality policy / deterministic fallback -----------
+
+    @pytest.mark.asyncio
+    async def test_approved_hook_quality_policy_remains_active(self, providers) -> None:
+        """An ambiguous isolated-statistic hook from the LLM must still be
+        deterministically replaced inside the real pipeline - the approved
+        hook-quality guard is not bypassed by integration."""
+        provider = ConfigurableThumbnailLLMProvider(thumbnail_payload={"hook_text": "Two Hours Every Night"})
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.thumbnail_result.success is True
+        assert state.thumbnail_result.plan.hook_text != "Two Hours Every Night"
+        assert any("isolated statistic" in w.lower() for w in state.thumbnail_result.warnings)
+
+    @pytest.mark.asyncio
+    async def test_deterministic_hook_fallback_remains_active(self, providers) -> None:
+        """The default fixture's LLM never returns valid JSON for the
+        thumbnail-planning prompt - ThumbnailPlanner must fall back to the
+        deterministic plan, and the pipeline must still complete."""
+        state = await self._run(providers)
+
+        assert state.status == "completed"
+        assert state.thumbnail_result.success is True
+        assert state.thumbnail_result.plan.used_semantic_planning is False
+        assert state.thumbnail_result.plan.fallback_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_one_semantic_llm_call_maximum_for_thumbnail(self, providers) -> None:
+        provider = ConfigurableThumbnailLLMProvider(thumbnail_payload={"hook_text": "Two Hours Every Night"})
+        await self._run(providers, llm_provider=provider)
+
+        assert len(provider.thumbnail_calls) == 1
+
+    # ---- F. Pipeline demo stage labels -----------------------------------------
+
+    def test_pipeline_demo_stage_labels_include_thumbnail(self) -> None:
+        from src.pipeline_demo import _STAGE_LABELS
+
+        assert len(_STAGE_LABELS) == 10
+        assert _STAGE_LABELS["thumbnail"] == "[10/10] Thumbnail"

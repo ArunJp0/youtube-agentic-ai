@@ -242,6 +242,14 @@
 - Real re-validation via `python -m src.thumbnail_demo "Why do humans dream?"`: the updated prompt alone produced a clear hook ("Why Do We Dream") on the first LLM attempt - no deterministic replacement was needed this time, confirming the guard is a safety net rather than the primary mechanism; real Gemini (primary model, no fallback) and real Pexels both succeeded; output validated at exactly 1280x720; written to `output/thumbnails/why-do-humans-dream-bf436b99.jpg`
 - Manual review approved the final thumbnail: image relevance, hook clarity, text readability, and composition were all judged acceptable and professional for the current MVP's simple stock-photo-plus-text style; a future V2 may explore an AI image-generation provider for more custom/cinematic thumbnails, but no additional paid service is needed for the current MVP
 - Standalone Thumbnail Agent milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/thumbnail_demo.py` is a separate standalone runner for this milestone
+- Thumbnail Agent Main Pipeline Integration implemented: `ThumbnailAgent` is now wired into the main LangGraph orchestration as a `thumbnail` node running after Metadata - the pipeline is now 10 stages: Research → Script → Voice → Visual Media → Visual QC → Video Assembly → Subtitles/Captions → BGM/Audio Mixing → Metadata → Thumbnail
+- Only 3 files were changed to wire it in: `src/workflows/pipeline_graph.py`, `src/pipeline_demo.py`, `tests/test_pipeline_workflow.py` - the existing standalone `ThumbnailAgent`/`ThumbnailPlanner`/selection/renderer/validation layers (including the approved hook-quality guard) were reused exactly as validated in the standalone milestone, with no duplicated planning/selection/rendering/validation logic introduced
+- `PipelineState.thumbnail_result` added; pipeline `status` only becomes `completed` once thumbnail generation itself succeeds (`metadata_node`'s own success status was renamed to `metadata_generated`); a thumbnail failure marks the pipeline `failed` while preserving every earlier stage's successful results, including the final BGM-mixed MP4 and the generated MetadataResult/JSON
+- The integrated `thumbnail_node` reuses the exact `ScriptResult` already present in `PipelineState` and the real `MetadataResult`'s title/SEO summary directly as extra planning context (never reconstructed from an `.srt` transcript or reloaded from the metadata JSON artifact - those fallbacks exist only in standalone demo tooling) - Research/Script/Metadata are never re-run for thumbnail generation
+- 987/987 tests passing (22 new Thumbnail pipeline-integration tests), all using mocked LLM/media-provider doubles - no real Gemini, Pexels, Whisper, or FFmpeg calls in the automated suite; the shared mock media-provider test double was extended to write real, Pillow-openable local images (rather than raw placeholder bytes), since Thumbnail rendering - unlike the faked FFmpeg-based stages - genuinely decodes the downloaded image
+- Real end-to-end run validated via `python -m src.pipeline_demo "Why do humans dream?"`: all 10 stages completed with final status `completed` - the Thumbnail call succeeded on the primary Gemini model with no fallback model needed, producing the hook "Why Do We Dream?" directly from the LLM (no deterministic hook replacement was triggered - the LLM's own hook was already clear and topic-aligned), composition `subject_left`, a real selected Pexels source image, and a final validated 1280x720 thumbnail at `output/thumbnails/why-do-we-dream.jpg`
+- Manual review of the real run confirmed the final video, audio, subtitles, BGM, and thumbnail (image relevance, hook clarity, text readability, composition) were all good
+- Thumbnail Agent Main Pipeline Integration milestone marked **COMPLETE**
 
 ## Known Limitations
 
@@ -259,13 +267,13 @@
 - The main pipeline now produces **three** MP4-related outputs per run on disk (the original assembled MP4, the captioned MP4, and the final BGM-mixed MP4), plus the `.srt` file, rather than a single final output - intentional for now as development/debug fallbacks; a future storage/cleanup milestone may remove the intermediate files once the final mixed MP4 has been used/uploaded successfully.
 - Metadata content quality (title/description/tags/hashtags accuracy) depends entirely on the quality and accuracy of the input `ScriptResult`/narration - the Metadata Agent does not independently fact-check; an accuracy issue already present in upstream narration will pass through into the generated metadata (observed in both the standalone milestone and the real integrated run - see the Matthew Walker note above).
 - The Metadata Agent is now integrated into the main pipeline, but its main-pipeline JSON artifact output (`output/metadata/<video-slug>.json`) is not yet consumed by anything - it is written for a future YouTube Upload Agent to read, which does not exist yet.
-- The Standalone Thumbnail Agent is implemented, hook-quality-hardened, and real-validated but is **standalone only** - the main pipeline's final output does not currently include a generated thumbnail.
 - Thumbnail image selection has no true subject-detection - `composition` only controls which side of the frame hosts the text panel (with a translucent scrim guaranteeing contrast there), not literal awareness of where a photo's actual subject is; this is an accepted MVP simplification, not a bug.
 - The current thumbnail style is a straightforward stock-photo-plus-text-overlay composite; more custom/cinematic thumbnail styles (e.g. via an AI image-generation provider) are a possible future V2 enhancement, not needed for the current MVP.
+- The generated thumbnail file (`output/thumbnails/<slug>.jpg`) is now produced by every real pipeline run but has no consumer yet - a future YouTube Upload Agent is expected to use it alongside the metadata JSON.
 
 ## Current Next Milestone
 
-**Thumbnail Agent Main Pipeline Integration** - the standalone Thumbnail milestone is now frozen after hook-quality hardening and manual approval.
+**Copyright / Compliance Agent** - the Thumbnail Agent Main Pipeline Integration milestone is now complete and real-validated end-to-end; this is the real, currently-validated pipeline (not a target):
 
 ```
 Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
@@ -274,9 +282,8 @@ Topic → Research → Script → Voice → Visual Media → Visual QC → Video
 
 Planned sequence after that, in order:
 
-1. Thumbnail Agent Main Pipeline Integration
-2. Copyright / Compliance checks
-3. YouTube Upload + Scheduling
-4. Monitoring / Post-publish
-5. Topic Planner
-6. Final storage/cleanup hardening as appropriate (including the multi-file-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)
+1. Copyright / Compliance checks
+2. YouTube Upload + Scheduling
+3. Monitoring / Post-publish
+4. Topic Planner
+5. Final storage/cleanup hardening as appropriate (including the multi-file-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)

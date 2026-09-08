@@ -1,14 +1,16 @@
 # Full Research -> Script -> Voice -> Visual Media -> Visual QC -> Video
-# Assembly -> Subtitle/Caption -> BGM/Audio Mixing pipeline using LangGraph.
+# Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata -> Thumbnail
+# pipeline using LangGraph.
 #
 # This module does not implement any research, scripting, voice-synthesis,
 # visual-media, QC-evaluation, video-encoding, transcription, subtitle-
-# rendering, or music-planning/selection/mixing logic itself - it only
-# wires the existing ResearchAgent, ScriptAgent, VoiceService,
-# VisualMediaService, VisualQCService, VideoAssemblyService,
-# CaptionService, and AudioMixingService together into a single LangGraph
-# state machine, passing each stage's output directly into the next
-# stage's input.
+# rendering, music-planning/selection/mixing, metadata-generation, or
+# thumbnail planning/rendering logic itself - it only wires the existing
+# ResearchAgent, ScriptAgent, VoiceService, VisualMediaService,
+# VisualQCService, VideoAssemblyService, CaptionService,
+# AudioMixingService, MetadataAgent, and ThumbnailAgent together into a
+# single LangGraph state machine, passing each stage's output directly
+# into the next stage's input.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +21,7 @@ from langgraph.graph import END, StateGraph
 from src.agents.metadata_agent import MetadataAgent, MetadataAgentError
 from src.agents.research import ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent, ScriptAgentError
+from src.agents.thumbnail_agent import DEFAULT_THUMBNAIL_OUTPUT_DIR, ThumbnailAgent, ThumbnailAgentError
 from src.agents.visual_context_planner import VisualContextPlanner
 from src.models.captions import CaptionResult
 from src.models.media import VisualResult
@@ -26,6 +29,7 @@ from src.models.metadata import MetadataResult
 from src.models.music import AudioMixResult
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
+from src.models.thumbnail import ThumbnailResult
 from src.models.video import VideoAssemblyResult
 from src.models.visual_plan import VisualPlan
 from src.models.visual_qc import VisualQCResult
@@ -102,9 +106,13 @@ class PipelineState:
     # hashtags/chapters and the written JSON artifact path - no separate
     # top-level fields, consistent with every other stage's result.
     metadata_result: Optional[MetadataResult] = None
+    # ThumbnailResult already carries the generated plan, selected source
+    # image, and final rendered thumbnail path - no separate top-level
+    # fields, consistent with every other stage's result.
+    thumbnail_result: Optional[ThumbnailResult] = None
     # pending -> researching -> researched -> scripted -> voiced ->
     # visualized -> qc_passed -> assembled -> captioned -> mixed ->
-    # completed -> failed
+    # metadata_generated -> completed -> failed
     status: str = "pending"
     error: Optional[str] = None
 
@@ -123,27 +131,30 @@ def build_pipeline_graph(
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
+    thumbnail_output_dir: str = DEFAULT_THUMBNAIL_OUTPUT_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
-    BGM/Audio Mixing -> Metadata.
+    BGM/Audio Mixing -> Metadata -> Thumbnail.
 
     Reuses the existing ResearchAgent, ScriptAgent, VoiceService,
     VisualMediaService, VisualQCService, VideoAssemblyService,
-    CaptionService, AudioMixingService, and MetadataAgent as-is (no
-    duplicated business logic, no reimplemented FFmpeg calls, no re-
-    implemented QC evaluation/replacement, no re-implemented transcription/
-    SRT/subtitle-rendering, music-planning/selection/mixing, or metadata-
-    generation/validation logic); this graph only wires their existing
-    interfaces together and shares one PipelineState across all nine.
+    CaptionService, AudioMixingService, MetadataAgent, and ThumbnailAgent
+    as-is (no duplicated business logic, no reimplemented FFmpeg calls, no
+    re-implemented QC evaluation/replacement, no re-implemented
+    transcription/SRT/subtitle-rendering, music-planning/selection/mixing,
+    metadata-generation/validation, or thumbnail planning/rendering/
+    validation logic); this graph only wires their existing interfaces
+    together and shares one PipelineState across all ten.
     VoiceService, VisualMediaService, VisualQCService, VideoAssemblyService,
-    CaptionService, AudioMixingService, and MetadataAgent all remain
-    deterministic orchestration here - each is invoked directly, not
-    treated as a reasoning agent (semantic judgment stays inside
+    CaptionService, AudioMixingService, MetadataAgent, and ThumbnailAgent
+    all remain deterministic orchestration here - each is invoked directly,
+    not treated as a reasoning agent (semantic judgment stays inside
     VisualContextPlanner/VisualQCService's injected evaluator,
-    AudioMixingService's injected MusicContextPlanner, and MetadataAgent's
-    own single LLM call; speech-to-text stays inside CaptionService's
-    injected transcription provider).
+    AudioMixingService's injected MusicContextPlanner, MetadataAgent's own
+    single LLM call, and ThumbnailAgent's injected ThumbnailPlanner's own
+    single LLM call; speech-to-text stays inside CaptionService's injected
+    transcription provider).
     VideoAssemblyService receives the exact ScriptResult/VoiceResult
     already produced earlier in this same run, and the post-QC
     ``qc_approved_visual_result`` (never the raw, pre-QC ``visual_result``).
@@ -156,21 +167,26 @@ def build_pipeline_graph(
     run (never reconstructed from an .srt transcript - that fallback is
     only for the standalone demo, which has no PipelineState to read a
     real ScriptResult from) and the real final duration from the BGM-mixed
-    MP4 - nothing is regenerated, re-synthesized, re-downloaded, or
-    re-assembled.
+    MP4. ThumbnailAgent likewise receives the exact ScriptResult already
+    produced earlier in this same run, plus the real MetadataResult's
+    title/SEO summary as extra planning context (Research/Script/Metadata
+    are never re-run for thumbnail planning) - nothing is regenerated,
+    re-synthesized, re-downloaded, or re-assembled.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm ─(ok)─→ metadata → END
-                    │                  │               │              │                │                  │                  │              │
-                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──┴──────(error)──→ END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm ─(ok)─→ metadata ─(ok)─→ thumbnail → END
+                    │                  │               │              │                │                  │                  │              │                  │
+                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──┴──────(error)──────┴──────(error)──→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
         llm_provider: LLMProvider implementation shared by Research, Script,
-            Visual Context Planning, Visual QC, and BGM mood planning
+            Visual Context Planning, Visual QC, BGM mood planning, and
+            Thumbnail planning
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
-        media_provider: MediaProvider implementation for the Visual Media Service
+        media_provider: MediaProvider implementation shared by the Visual
+            Media Service and the Thumbnail Agent (stock-photo search/download)
         assembler: VideoAssembler implementation, shared by Visual QC (frame
             extraction/probing), the Video Assembly Service (encoding), the
             Caption Service (subtitle burning), and Audio Mixing (background
@@ -185,6 +201,7 @@ def build_pipeline_graph(
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
         subtitle_output_dir: Directory the Caption Service writes .srt files into
+        thumbnail_output_dir: Directory the Thumbnail Agent writes the rendered thumbnail into
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -227,6 +244,13 @@ def build_pipeline_graph(
     # MetadataAgent's own deterministic section-timing derivation, never
     # from this LLM call.
     metadata_agent = MetadataAgent(llm_provider=llm_provider)
+    # Reuses the same LLMProvider (its single thumbnail-planning call per
+    # run, via the injected ThumbnailPlanner) and the same MediaProvider
+    # (stock-photo search/download) already used by Visual Media - no new
+    # provider/API key path and no second Pexels/HTTP implementation.
+    thumbnail_agent = ThumbnailAgent(
+        media_provider=media_provider, llm_provider=llm_provider, output_dir=thumbnail_output_dir
+    )
 
     async def research_node(state: PipelineState) -> dict:
         try:
@@ -525,7 +549,45 @@ def build_pipeline_graph(
                 "error": f"Metadata generation failed: {result.error}",
             }
 
-        return {"metadata_result": result, "status": "completed", "error": None}
+        return {"metadata_result": result, "status": "metadata_generated", "error": None}
+
+    async def thumbnail_node(state: PipelineState) -> dict:
+        try:
+            # The exact ScriptResult already produced earlier in this run is
+            # passed straight through (Research/Script are never re-run for
+            # thumbnail planning), and the real MetadataResult already
+            # produced by the metadata stage supplies extra title/SEO
+            # context - Metadata is never re-run either.
+            result = await thumbnail_agent.generate_thumbnail(
+                state.topic,
+                state.script_result,
+                metadata_title=state.metadata_result.title,
+                seo_summary=state.metadata_result.seo_summary,
+            )
+        except ThumbnailAgentError as e:
+            return {"thumbnail_result": None, "status": "failed", "error": f"Thumbnail generation failed: {e}"}
+        except Exception as e:
+            return {
+                "thumbnail_result": None,
+                "status": "failed",
+                "error": f"Unexpected thumbnail error: {e}",
+            }
+
+        if not result.success:
+            # ThumbnailAgent never raises for search/selection/rendering/
+            # validation failures - it reports them in ThumbnailResult.error
+            # instead. Surface that in pipeline state (and keep the
+            # ThumbnailResult itself for inspection); the final BGM-mixed
+            # MP4, metadata, and every earlier result are untouched
+            # regardless (ThumbnailAgent never writes to them, only its own
+            # thumbnail image).
+            return {
+                "thumbnail_result": result,
+                "status": "failed",
+                "error": f"Thumbnail generation failed: {result.error}",
+            }
+
+        return {"thumbnail_result": result, "status": "completed", "error": None}
 
     def route_after_research(state: PipelineState) -> str:
         """Only proceed to scripting if research actually produced a result."""
@@ -573,6 +635,12 @@ def build_pipeline_graph(
         final mixed MP4."""
         return "metadata" if state.audio_mix_result is not None and state.audio_mix_result.success else END
 
+    def route_after_metadata(state: PipelineState) -> str:
+        """Only proceed to thumbnail generation if metadata generation
+        actually succeeded - the thumbnail node must never run on
+        missing/failed metadata."""
+        return "thumbnail" if state.metadata_result is not None and state.metadata_result.success else END
+
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
@@ -583,6 +651,7 @@ def build_pipeline_graph(
     graph.add_node("captions", caption_node)
     graph.add_node("bgm", bgm_node)
     graph.add_node("metadata", metadata_node)
+    graph.add_node("thumbnail", thumbnail_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
@@ -597,7 +666,8 @@ def build_pipeline_graph(
     )
     graph.add_conditional_edges("captions", route_after_captions, {"bgm": "bgm", END: END})
     graph.add_conditional_edges("bgm", route_after_bgm, {"metadata": "metadata", END: END})
-    graph.set_finish_point("metadata")
+    graph.add_conditional_edges("metadata", route_after_metadata, {"thumbnail": "thumbnail", END: END})
+    graph.set_finish_point("thumbnail")
 
     return graph
 
@@ -617,41 +687,45 @@ async def run_pipeline(
     media_output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
+    thumbnail_output_dir: str = DEFAULT_THUMBNAIL_OUTPUT_DIR,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
-    -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata
-    pipeline and return the final state.
+    -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
+    Thumbnail pipeline and return the final state.
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
     can inspect ``status``/``error`` directly, including on partial failure
-    (e.g. every stage through BGM mixing succeeded but metadata generation
-    failed).
+    (e.g. every stage through metadata generation succeeded but thumbnail
+    generation failed).
 
     Each stage only runs if the previous one succeeded - a failure at any
     stage short-circuits the rest of the pipeline and it never silently
     continues (see route_after_research/route_after_script/route_after_voice/
     route_after_media/route_after_visual_qc/route_after_video_assembly/
-    route_after_captions/route_after_bgm). Visual QC itself fails the
-    pipeline (status "failed", Video Assembly never runs) if any asset is
-    still flagged misleading/conflicting after bounded replacement is
-    exhausted - see visual_qc_node. Pipeline status only becomes "completed"
-    once metadata generation itself succeeds; a semantic mood-planning
-    failure inside BGM, or a chapters-only issue inside metadata generation,
-    does not itself fail the pipeline (both degrade to a safe fallback and
-    continue) - only an actual mixing/selection/catalog failure, or a total
-    metadata generation failure, does. The final BGM-mixed MP4
-    (``audio_mix_result``) and every earlier-stage result are preserved
-    unchanged either way.
+    route_after_captions/route_after_bgm/route_after_metadata). Visual QC
+    itself fails the pipeline (status "failed", Video Assembly never runs)
+    if any asset is still flagged misleading/conflicting after bounded
+    replacement is exhausted - see visual_qc_node. Pipeline status only
+    becomes "completed" once thumbnail generation itself succeeds; a
+    semantic mood-planning failure inside BGM, or a chapters-only issue
+    inside metadata generation, does not itself fail the pipeline (both
+    degrade to a safe fallback and continue) - only an actual mixing/
+    selection/catalog failure, a total metadata generation failure, or a
+    total thumbnail generation failure, does. The final BGM-mixed MP4
+    (``audio_mix_result``), the generated metadata (``metadata_result``),
+    and every earlier-stage result are preserved unchanged either way.
 
     Args:
         topic: Research topic to investigate, script, narrate, illustrate, and assemble
         search_provider: SearchProvider implementation for the Research Agent
         llm_provider: LLMProvider implementation shared by Research, Script,
-            Visual Context Planning, Visual QC, and BGM mood planning
+            Visual Context Planning, Visual QC, BGM mood planning, and
+            Thumbnail planning
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
-        media_provider: MediaProvider implementation for the Visual Media Service
+        media_provider: MediaProvider implementation shared by the Visual
+            Media Service and the Thumbnail Agent
         assembler: VideoAssembler implementation, shared by Visual QC, the
             Video Assembly Service, the Caption Service, and Audio Mixing
         visual_relevance_evaluator: VisualRelevanceEvaluator implementation
@@ -664,6 +738,7 @@ async def run_pipeline(
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
         subtitle_output_dir: Directory the Caption Service writes .srt files into
+        thumbnail_output_dir: Directory the Thumbnail Agent writes the rendered thumbnail into
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -682,6 +757,7 @@ async def run_pipeline(
         media_output_dir,
         video_output_dir,
         subtitle_output_dir,
+        thumbnail_output_dir,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
@@ -700,6 +776,7 @@ async def run_pipeline(
         caption_result=raw_result.get("caption_result"),
         audio_mix_result=raw_result.get("audio_mix_result"),
         metadata_result=raw_result.get("metadata_result"),
+        thumbnail_result=raw_result.get("thumbnail_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )
