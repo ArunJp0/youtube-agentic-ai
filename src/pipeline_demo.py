@@ -1,5 +1,6 @@
 # Live demo runner for the complete Research -> Script -> Voice -> Visual
-# Media -> Visual QC -> Video Assembly -> Subtitle/Caption pipeline.
+# Media -> Visual QC -> Video Assembly -> Subtitle/Caption -> BGM/Audio
+# Mixing -> Metadata -> Thumbnail -> Copyright/Compliance pipeline.
 #
 # Uses the existing provider factory (src.config.providers / Settings), so
 # with the current .env configuration (LLM_PROVIDER=gemini,
@@ -17,6 +18,7 @@ import sys
 
 from src.bgm_demo import print_mix_result
 from src.caption_demo import print_caption_result
+from src.compliance_demo import print_compliance_result
 from src.config.providers import (
     ProviderConfigError,
     get_llm_provider,
@@ -34,7 +36,7 @@ from src.script_demo import print_script_result
 from src.thumbnail_demo import print_thumbnail_result
 from src.visual_qc_demo import print_qc_result
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR
-from src.services.provenance_collection import persist_provenance_if_completed
+from src.services.provenance_store import ProvenanceManifestStore, ProvenanceStoreError
 from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.services.visual_media_service import DEFAULT_MEDIA_OUTPUT_DIR
 from src.services.voice_service import DEFAULT_OUTPUT_DIR
@@ -49,16 +51,17 @@ DEFAULT_TOPIC = "Why do humans dream?"
 # top-level progress stage - it isn't a separately observable pipeline step
 # from the outside, just an internal part of how Visual Media selects assets.
 _STAGE_LABELS = {
-    "research": "[1/10] Research",
-    "script": "[2/10] Script",
-    "voice": "[3/10] Voice",
-    "media": "[4/10] Visual Media",
-    "visual_qc": "[5/10] Visual QC",
-    "video_assembly": "[6/10] Video Assembly",
-    "captions": "[7/10] Subtitles / Captions",
-    "bgm": "[8/10] BGM / Audio Mixing",
-    "metadata": "[9/10] Metadata",
-    "thumbnail": "[10/10] Thumbnail",
+    "research": "[1/11] Research",
+    "script": "[2/11] Script",
+    "voice": "[3/11] Voice",
+    "media": "[4/11] Visual Media",
+    "visual_qc": "[5/11] Visual QC",
+    "video_assembly": "[6/11] Video Assembly",
+    "captions": "[7/11] Subtitles / Captions",
+    "bgm": "[8/11] BGM / Audio Mixing",
+    "metadata": "[9/11] Metadata",
+    "thumbnail": "[10/11] Thumbnail",
+    "compliance": "[11/11] Copyright / Compliance",
 }
 
 
@@ -71,7 +74,7 @@ def _ensure_utf8_stdout() -> None:
 
 
 async def run_pipeline_demo(topic: str) -> PipelineState:
-    """Run the full 10-stage pipeline, printing progress as each stage completes.
+    """Run the full 11-stage pipeline, printing progress as each stage completes.
 
     Provider selection comes entirely from Settings/.env via the existing
     provider factory (src.config.providers) - this function does not
@@ -159,13 +162,21 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         audio_mix_result=accumulated.get("audio_mix_result"),
         metadata_result=accumulated.get("metadata_result"),
         thumbnail_result=accumulated.get("thumbnail_result"),
+        compliance_result=accumulated.get("compliance_result"),
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
     )
 
-    provenance_path = persist_provenance_if_completed(final_state)
-    if provenance_path:
-        print(f"Provenance manifest: done ({provenance_path})")
+    # Provenance is persisted INSIDE the graph (by thumbnail_node, on its
+    # own success) - not here. This is a read-only lookup purely to report
+    # the manifest's path in the demo output.
+    if final_state.audio_mix_result and final_state.audio_mix_result.output_path:
+        try:
+            manifest = ProvenanceManifestStore().find_for_video(final_state.audio_mix_result.output_path)
+        except ProvenanceStoreError:
+            manifest = None
+        if manifest:
+            print(f"Provenance manifest: done (output/provenance/{manifest.run_id}.json)")
 
     return final_state
 
@@ -287,6 +298,18 @@ def _print_final_summary(state: PipelineState) -> None:
     else:
         print("Thumbnail success: False")
 
+    if state.compliance_result:
+        compliance = state.compliance_result
+        print(f"Compliance success: {compliance.success}")
+        if compliance.success:
+            print(f"Decision: {compliance.publish_decision} | Risk level: {compliance.risk_level}")
+            print(f"Warnings: {len(compliance.warnings)} | Blockers: {len(compliance.blockers)}")
+            print(f"Attribution required: {compliance.attribution_required}")
+        else:
+            print(f"Compliance error: {compliance.error}")
+    else:
+        print("Compliance success: False")
+
 
 async def main() -> None:
     """Main entry point for the pipeline demo."""
@@ -386,10 +409,17 @@ async def main() -> None:
         print("#" * 60)
         print_thumbnail_result(state.thumbnail_result)
 
+    if state.compliance_result:
+        print("\n" + "#" * 60)
+        print("# COMPLIANCE RESULT")
+        print("#" * 60)
+        print_compliance_result(state.compliance_result)
+
     _print_final_summary(state)
 
     if state.status != "completed":
-        print(f"\nPipeline error: {state.error}")
+        print(f"\nPipeline status: {state.status}")
+        print(f"Pipeline error: {state.error}")
         sys.exit(1)
 
 

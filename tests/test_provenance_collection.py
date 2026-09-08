@@ -74,8 +74,25 @@ class TestBuildManifestFromPipelineState:
         manifest = build_manifest_from_pipeline_state(_completed_state())
         assert manifest.run_id == "why-do-humans-dream-8baeee8d"
 
-    def test_not_completed_status_returns_none(self) -> None:
+    def test_later_stage_failure_still_produces_a_manifest(self) -> None:
+        """The guard checks audio_mix_result.success directly, not the
+        pipeline's overall status - this is what lets thumbnail_node
+        persist provenance on its OWN success, before the pipeline's final
+        status is known (e.g. before Compliance has even run). A later
+        stage failing (status='failed') must not retroactively erase
+        already-valid BGM/visual provenance."""
         state = _completed_state(status="failed")
+        manifest = build_manifest_from_pipeline_state(state)
+        assert manifest is not None
+        assert manifest.topic == "Why do humans dream?"
+
+    def test_unsuccessful_audio_mix_returns_none_regardless_of_status(self) -> None:
+        """The true prerequisite is audio_mix_result.success, not the
+        status string - even a state claiming status='completed' must not
+        produce a manifest if BGM mixing itself never actually succeeded."""
+        state = _completed_state(
+            status="completed", audio_mix_result=AudioMixResult(success=False, error="mix failed")
+        )
         assert build_manifest_from_pipeline_state(state) is None
 
     def test_missing_audio_mix_result_returns_none(self) -> None:
@@ -168,11 +185,20 @@ class TestPersistProvenanceIfCompleted:
         assert path is not None
         assert os.path.exists(path)
 
-    def test_returns_none_for_incomplete_run(self, tmp_path) -> None:
-        state = _completed_state(status="failed")
+    def test_returns_none_when_audio_mix_did_not_succeed(self, tmp_path) -> None:
+        state = _completed_state(audio_mix_result=AudioMixResult(success=False, error="mix failed"))
         path = persist_provenance_if_completed(state, output_dir=str(tmp_path))
         assert path is None
         assert os.listdir(tmp_path) == []
+
+    def test_writes_manifest_even_if_a_later_stage_failed(self, tmp_path) -> None:
+        """thumbnail_node persists provenance on ITS OWN success, before
+        the pipeline's overall status is known - a later failure (e.g.
+        Compliance itself erroring) must not prevent this earlier write."""
+        state = _completed_state(status="failed")
+        path = persist_provenance_if_completed(state, output_dir=str(tmp_path))
+        assert path is not None
+        assert os.path.exists(path)
 
     def test_written_manifest_is_discoverable_via_store(self, tmp_path) -> None:
         state = _completed_state()

@@ -270,6 +270,17 @@
 - Real standalone compliance validation against that fresh run (`python -m src.compliance_demo "Why do humans dream?"`) produced **PASS, risk level low**: all deterministic checks OK (final video, metadata, thumbnail, topic consistency, 21 visual assets with identifiable provenance, thumbnail provenance, and BGM provenance - `calm-music`, YouTube Audio Library, approved in the current catalog, `attribution_required: false`), and the real Gemini semantic review found no issues
 - An earlier real standalone run (before the fresh pipeline run existed) correctly exercised the legacy-artifact path instead: no provenance manifest existed yet for that older video, so visual/thumbnail/BGM provenance were honestly reported `unavailable` and the result was `REVIEW` - confirming the agent never infers or fabricates provenance it doesn't have
 - Standalone Copyright / Compliance Agent + Provenance Hardening milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py`'s graph structure/routing is unchanged; only the additive provenance-persistence call described above was added); `src/compliance_demo.py` is a separate standalone runner for this milestone
+- Copyright / Compliance Agent Main Pipeline Integration implemented: `ComplianceAgent` is now wired into the main LangGraph orchestration as a `compliance` node running after Thumbnail - the pipeline is now 11 stages: Research → Script → Voice → Visual Media → Visual QC → Video Assembly → Subtitles/Captions → BGM/Audio Mixing → Metadata → Thumbnail → Copyright/Compliance
+- 5 files were changed to wire it in - `src/workflows/pipeline_graph.py`, `src/pipeline_demo.py`, `src/services/provenance_collection.py`, `tests/test_pipeline_workflow.py`, `tests/test_provenance_collection.py` (one more than a typical integration milestone, since provenance timing itself needed a small correction - see below); the existing standalone `ComplianceAgent`/`ComplianceReviewer`/compliance checks/compliance rules/`ProvenanceManifestStore`/shared `MusicCatalogProvider`/`LLMProvider` were reused exactly as validated in the standalone milestone, with no duplicated compliance or provenance logic introduced
+- `PipelineState.compliance_result` added; `thumbnail_node`'s own success status was renamed from `completed` to `thumbnail_generated` (mirroring the exact renaming precedent used at every prior integration step); the pipeline's final status now depends entirely on the Compliance decision - `PASS` sets `completed`, `REVIEW` sets `review_required`, `BLOCK` sets `blocked` - and none of the three is ever conflated with a technical `failed` state
+- Provenance timing was corrected as part of this integration: `build_manifest_from_pipeline_state`'s guard changed from checking the pipeline's overall `status == "completed"` to checking `audio_mix_result.success` directly (the true prerequisite) - this lets `thumbnail_node` persist the current run's provenance manifest immediately on its own success, before the pipeline's final status is even known; `compliance_node` then looks that exact manifest back up via `ProvenanceManifestStore.find_for_video` using the same real `audio_mix_result.output_path`, guaranteeing Compliance always reads the current run's own provenance and never a previous run's
+- The integrated `compliance_node` reuses the exact `ScriptResult`/`MetadataResult`/`ThumbnailResult` already present in `PipelineState` and the real final video path from `audio_mix_result` - Research/Script/Metadata/Thumbnail are never re-run for compliance review
+- A deterministic blocker always wins: even when the semantic review is clean, a real BGM-catalog/provenance blocker still forces `BLOCK`; both a `REVIEW` and a `BLOCK` outcome preserve every earlier artifact (final video, metadata, thumbnail) untouched - only the pipeline's own status/error reflect the outcome
+- Pipeline demo updated to 11 stage labels (`[1/11]` … `[11/11] Copyright / Compliance`) and now prints the full compliance summary (decision, risk level, warnings, blockers, attribution requirement, semantic review summary, provenance summary, LLM provider/model, and the disclaimer) by reusing `compliance_demo.py`'s existing `print_compliance_result` - no duplicated printing logic
+- 1156/1156 tests passing (35 new: compliance pipeline-integration tests, plus two pre-existing provenance-guard tests updated to match the corrected timing behavior), all using mocked LLM/catalog doubles - no real Gemini, Pexels, Whisper, or FFmpeg calls in the automated suite; a before/after snapshot of the real `output/` directories across the full suite confirmed zero new or modified files
+- A laptop power interruption occurred mid-milestone during the first real end-to-end validation attempt; recovery confirmed (via `git diff --stat` and an AST-parse check of every modified file) that all code and tests had survived intact with no corruption or loss, and that the interrupted real run had only reached Visual Media before dying (no video/thumbnail/compliance artifacts were ever produced by it, so nothing needed to be redone besides a fresh real validation run)
+- Real end-to-end run validated via `python -m src.pipeline_demo "Why do humans dream?"`: all 11 stages completed with final status `completed` - Compliance returned **PASS, risk level low**, all 7 deterministic checks OK (final video, metadata, thumbnail, topic consistency, 20 visual assets with identifiable provenance, thumbnail provenance, and BGM provenance - `calm-music`, YouTube Audio Library, `attribution_required: false`), and the real Gemini semantic review found no issues; provenance manifest written to `output/provenance/why-do-humans-dream-284170bd.json`
+- Copyright / Compliance Agent Main Pipeline Integration milestone marked **COMPLETE**
 
 ## Known Limitations
 
@@ -290,20 +301,13 @@
 - Thumbnail image selection has no true subject-detection - `composition` only controls which side of the frame hosts the text panel (with a translucent scrim guaranteeing contrast there), not literal awareness of where a photo's actual subject is; this is an accepted MVP simplification, not a bug.
 - The current thumbnail style is a straightforward stock-photo-plus-text-overlay composite; more custom/cinematic thumbnail styles (e.g. via an AI image-generation provider) are a possible future V2 enhancement, not needed for the current MVP.
 - The generated thumbnail file (`output/thumbnails/<slug>.jpg`) is now produced by every real pipeline run but has no consumer yet - a future YouTube Upload Agent is expected to use it alongside the metadata JSON.
-- The Copyright / Compliance Agent is implemented, provenance-hardened, and real-validated but is **standalone only** - it is not yet wired into the main pipeline as a gating stage before publishing.
 - Full provenance-aware compliance review depends on a persisted `ProvenanceManifest` existing for the run being checked; runs from before this milestone (or any run whose manifest write failed) are legacy artifacts with no manifest, and correctly resolve to `REVIEW` rather than a fabricated `PASS` - an honest limitation of the current MVP, not a defect.
 - The semantic compliance review is a single advisory LLM pass, not independent fact-checking - it can only ever push toward `REVIEW`, never `BLOCK`, and a well-worded but still-misleading claim could pass through undetected, exactly like the equivalent limitation already noted for the Thumbnail Agent's hook-quality guard.
+- Compliance is now the pipeline's final gate for its own `completed`/`review_required`/`blocked` status, but nothing outside the pipeline itself yet enforces that gate - a future Upload Agent must explicitly check `compliance_result.publish_decision == "PASS"` before publishing; this is the next planned milestone, not yet implemented.
 
 ## Current Next Milestone
 
-**Copyright / Compliance Agent Main Pipeline Integration** - the standalone Compliance Agent and provenance-persistence hardening are now complete and real-validated end-to-end; this is the real, currently-validated pipeline (not a target):
-
-```
-Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
-      → Subtitles / Captions → BGM / Audio Mixing → Metadata → Thumbnail → END
-```
-
-Target pipeline after integration:
+**YouTube Upload & Scheduling Agent** - standalone first, following this project's established pattern (build and real-validate standalone, then integrate as a separate later milestone). This is the real, currently-validated pipeline (not a target):
 
 ```
 Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
@@ -311,10 +315,16 @@ Topic → Research → Script → Voice → Visual Media → Visual QC → Video
       → Copyright / Compliance → END
 ```
 
+Prerequisites/constraints for the Upload Agent milestone:
+
+- Configure YouTube Data API / Google OAuth credentials before implementation begins
+- No paid subscription required unless genuinely necessary for the MVP
+- The Upload Agent must only publish when the current run's `compliance_result.publish_decision == "PASS"`
+- A `REVIEW` or `BLOCK` compliance decision must prevent upload entirely - never a partial/best-effort publish
+
 Planned sequence after that, in order:
 
-1. Copyright / Compliance Agent Main Pipeline Integration
-2. YouTube Upload + Scheduling Agent
-3. Monitoring / Post-publish
-4. Topic Planner
-5. Final storage/cleanup hardening as appropriate (including the multi-file-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)
+1. YouTube Upload & Scheduling Agent (standalone first, then integrated)
+2. Monitoring / Post-publish
+3. Topic Planner
+4. Final storage/cleanup hardening as appropriate (including the multi-file-output cleanup noted above, and replacing manual local BGM catalog curation with an automated/licensed provider or managed catalog workflow)

@@ -1,16 +1,16 @@
 # Full Research -> Script -> Voice -> Visual Media -> Visual QC -> Video
-# Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata -> Thumbnail
-# pipeline using LangGraph.
+# Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata -> Thumbnail ->
+# Copyright/Compliance pipeline using LangGraph.
 #
 # This module does not implement any research, scripting, voice-synthesis,
 # visual-media, QC-evaluation, video-encoding, transcription, subtitle-
-# rendering, music-planning/selection/mixing, metadata-generation, or
-# thumbnail planning/rendering logic itself - it only wires the existing
-# ResearchAgent, ScriptAgent, VoiceService, VisualMediaService,
-# VisualQCService, VideoAssemblyService, CaptionService,
-# AudioMixingService, MetadataAgent, and ThumbnailAgent together into a
-# single LangGraph state machine, passing each stage's output directly
-# into the next stage's input.
+# rendering, music-planning/selection/mixing, metadata-generation,
+# thumbnail planning/rendering, or compliance-checking logic itself - it
+# only wires the existing ResearchAgent, ScriptAgent, VoiceService,
+# VisualMediaService, VisualQCService, VideoAssemblyService,
+# CaptionService, AudioMixingService, MetadataAgent, ThumbnailAgent, and
+# ComplianceAgent together into a single LangGraph state machine, passing
+# each stage's output directly into the next stage's input.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,12 +18,14 @@ from typing import Optional
 
 from langgraph.graph import END, StateGraph
 
+from src.agents.compliance_agent import ComplianceAgent, ComplianceAgentError
 from src.agents.metadata_agent import DEFAULT_METADATA_OUTPUT_DIR, MetadataAgent, MetadataAgentError
 from src.agents.research import ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent, ScriptAgentError
 from src.agents.thumbnail_agent import DEFAULT_THUMBNAIL_OUTPUT_DIR, ThumbnailAgent, ThumbnailAgentError
 from src.agents.visual_context_planner import VisualContextPlanner
 from src.models.captions import CaptionResult
+from src.models.compliance import ComplianceResult
 from src.models.media import VisualResult
 from src.models.metadata import MetadataResult
 from src.models.music import AudioMixResult
@@ -37,7 +39,7 @@ from src.models.voice import VoiceResult
 from src.services.audio_mixing_service import AudioMixingService, AudioMixingServiceError
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR, CaptionService, CaptionServiceError
 from src.services.provenance_collection import persist_provenance_if_completed
-from src.services.provenance_store import DEFAULT_PROVENANCE_OUTPUT_DIR
+from src.services.provenance_store import DEFAULT_PROVENANCE_OUTPUT_DIR, ProvenanceManifestStore, ProvenanceStoreError
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
     VideoAssemblyService,
@@ -112,9 +114,16 @@ class PipelineState:
     # image, and final rendered thumbnail path - no separate top-level
     # fields, consistent with every other stage's result.
     thumbnail_result: Optional[ThumbnailResult] = None
+    # ComplianceResult already carries the publish_decision/risk_level/
+    # checks/warnings/blockers/required_attributions/semantic_review - no
+    # separate top-level PASS/REVIEW/BLOCK fields, consistent with every
+    # other stage's result. A future Upload Agent reads this directly.
+    compliance_result: Optional[ComplianceResult] = None
     # pending -> researching -> researched -> scripted -> voiced ->
     # visualized -> qc_passed -> assembled -> captioned -> mixed ->
-    # metadata_generated -> completed -> failed
+    # metadata_generated -> thumbnail_generated -> completed (Compliance
+    # PASS) -> review_required (Compliance REVIEW) -> blocked (Compliance
+    # BLOCK) -> failed (a technical failure at any stage)
     status: str = "pending"
     error: Optional[str] = None
 
@@ -135,29 +144,32 @@ def build_pipeline_graph(
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
     thumbnail_output_dir: str = DEFAULT_THUMBNAIL_OUTPUT_DIR,
     metadata_output_dir: str = DEFAULT_METADATA_OUTPUT_DIR,
+    provenance_output_dir: str = DEFAULT_PROVENANCE_OUTPUT_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
-    BGM/Audio Mixing -> Metadata -> Thumbnail.
+    BGM/Audio Mixing -> Metadata -> Thumbnail -> Copyright/Compliance.
 
     Reuses the existing ResearchAgent, ScriptAgent, VoiceService,
     VisualMediaService, VisualQCService, VideoAssemblyService,
-    CaptionService, AudioMixingService, MetadataAgent, and ThumbnailAgent
-    as-is (no duplicated business logic, no reimplemented FFmpeg calls, no
-    re-implemented QC evaluation/replacement, no re-implemented
-    transcription/SRT/subtitle-rendering, music-planning/selection/mixing,
-    metadata-generation/validation, or thumbnail planning/rendering/
-    validation logic); this graph only wires their existing interfaces
-    together and shares one PipelineState across all ten.
+    CaptionService, AudioMixingService, MetadataAgent, ThumbnailAgent, and
+    ComplianceAgent as-is (no duplicated business logic, no reimplemented
+    FFmpeg calls, no re-implemented QC evaluation/replacement, no
+    re-implemented transcription/SRT/subtitle-rendering, music-planning/
+    selection/mixing, metadata-generation/validation, thumbnail planning/
+    rendering/validation, or compliance-checking/provenance logic); this
+    graph only wires their existing interfaces together and shares one
+    PipelineState across all eleven.
     VoiceService, VisualMediaService, VisualQCService, VideoAssemblyService,
-    CaptionService, AudioMixingService, MetadataAgent, and ThumbnailAgent
-    all remain deterministic orchestration here - each is invoked directly,
-    not treated as a reasoning agent (semantic judgment stays inside
-    VisualContextPlanner/VisualQCService's injected evaluator,
+    CaptionService, AudioMixingService, MetadataAgent, ThumbnailAgent, and
+    ComplianceAgent all remain deterministic orchestration here - each is
+    invoked directly, not treated as a reasoning agent (semantic judgment
+    stays inside VisualContextPlanner/VisualQCService's injected evaluator,
     AudioMixingService's injected MusicContextPlanner, MetadataAgent's own
-    single LLM call, and ThumbnailAgent's injected ThumbnailPlanner's own
-    single LLM call; speech-to-text stays inside CaptionService's injected
-    transcription provider).
+    single LLM call, ThumbnailAgent's injected ThumbnailPlanner's own
+    single LLM call, and ComplianceAgent's injected ComplianceReviewer's
+    own single advisory LLM call; speech-to-text stays inside
+    CaptionService's injected transcription provider).
     VideoAssemblyService receives the exact ScriptResult/VoiceResult
     already produced earlier in this same run, and the post-QC
     ``qc_approved_visual_result`` (never the raw, pre-QC ``visual_result``).
@@ -173,19 +185,27 @@ def build_pipeline_graph(
     MP4. ThumbnailAgent likewise receives the exact ScriptResult already
     produced earlier in this same run, plus the real MetadataResult's
     title/SEO summary as extra planning context (Research/Script/Metadata
-    are never re-run for thumbnail planning) - nothing is regenerated,
+    are never re-run for thumbnail planning). ComplianceAgent receives the
+    exact ScriptResult/MetadataResult/ThumbnailResult already produced
+    earlier in this same run, the real final video path from
+    ``audio_mix_result``, and the current run's own ProvenanceManifest
+    (written by ``thumbnail_node`` on its own success, then looked up by
+    ``compliance_node`` via ``ProvenanceManifestStore.find_for_video`` -
+    never reconstructed from filenames, never a previous run's manifest,
+    since both steps derive the same run identifier from the same real
+    ``audio_mix_result.output_path``) - nothing is regenerated,
     re-synthesized, re-downloaded, or re-assembled.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm ─(ok)─→ metadata ─(ok)─→ thumbnail → END
-                    │                  │               │              │                │                  │                  │              │                  │
-                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──┴──────(error)──────┴──────(error)──→ END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm ─(ok)─→ metadata ─(ok)─→ thumbnail ─(ok)─→ compliance → END
+                    │                  │               │              │                │                  │                  │              │                  │                  │
+                    └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──┴──────(error)──────┴──────(error)────┴──────(error)──→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
         llm_provider: LLMProvider implementation shared by Research, Script,
-            Visual Context Planning, Visual QC, BGM mood planning, and
-            Thumbnail planning
+            Visual Context Planning, Visual QC, BGM mood planning,
+            Thumbnail planning, and the Compliance semantic review
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation shared by the Visual
@@ -199,13 +219,17 @@ def build_pipeline_graph(
         transcription_provider: TranscriptionProvider implementation for
             the Caption Service
         music_catalog_provider: MusicCatalogProvider implementation (the
-            approved BGM catalog) for the Audio Mixing Service
+            approved BGM catalog) shared by the Audio Mixing Service and
+            the Compliance Agent's BGM provenance cross-check
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
         subtitle_output_dir: Directory the Caption Service writes .srt files into
         thumbnail_output_dir: Directory the Thumbnail Agent writes the rendered thumbnail into
         metadata_output_dir: Directory the Metadata Agent writes its JSON artifact into
+        provenance_output_dir: Directory the provenance manifest is written into
+            (by ``thumbnail_node``, on its own success) and read from (by
+            ``compliance_node``)
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -255,6 +279,12 @@ def build_pipeline_graph(
     thumbnail_agent = ThumbnailAgent(
         media_provider=media_provider, llm_provider=llm_provider, output_dir=thumbnail_output_dir
     )
+    # Reuses the same MusicCatalogProvider AudioMixingService already
+    # depends on (the trusted, CURRENT source of BGM licensing/attribution
+    # data) and the same LLMProvider (its single advisory semantic-review
+    # call per run, via the injected ComplianceReviewer) - no new provider/
+    # API key path and no duplicated catalog-reading logic.
+    compliance_agent = ComplianceAgent(music_catalog_provider=music_catalog_provider, llm_provider=llm_provider)
 
     async def research_node(state: PipelineState) -> dict:
         try:
@@ -591,7 +621,86 @@ def build_pipeline_graph(
                 "error": f"Thumbnail generation failed: {result.error}",
             }
 
-        return {"thumbnail_result": result, "status": "completed", "error": None}
+        # Persist provenance for THIS exact run immediately, right after the
+        # last stage that contributes to it succeeds - never deferred until
+        # the whole pipeline finishes. compliance_node (next) looks this
+        # manifest back up by the same real audio_mix_result.output_path,
+        # so it can never accidentally read a previous run's manifest. A
+        # write failure here is best-effort/non-fatal (see
+        # persist_provenance_if_completed) and never fails thumbnail
+        # generation, which has already genuinely succeeded.
+        manifest_state = PipelineState(
+            topic=state.topic,
+            audio_mix_result=state.audio_mix_result,
+            qc_approved_visual_result=state.qc_approved_visual_result,
+            thumbnail_result=result,
+        )
+        persist_provenance_if_completed(manifest_state, provenance_output_dir)
+
+        return {"thumbnail_result": result, "status": "thumbnail_generated", "error": None}
+
+    async def compliance_node(state: PipelineState) -> dict:
+        # The current run's own provenance manifest, written by
+        # thumbnail_node above using this exact same audio_mix_result -
+        # never a previous run's manifest, and never reconstructed from
+        # filenames. A missing manifest (write failed, or somehow absent)
+        # is treated as unavailable, never raised - ComplianceAgent already
+        # reports that as a conservative REVIEW-contributing warning rather
+        # than fabricating provenance.
+        video_path = state.audio_mix_result.output_path if state.audio_mix_result else None
+        try:
+            provenance_manifest = (
+                ProvenanceManifestStore(provenance_output_dir).find_for_video(video_path) if video_path else None
+            )
+        except ProvenanceStoreError:
+            provenance_manifest = None
+
+        try:
+            # The exact ScriptResult/MetadataResult/ThumbnailResult already
+            # produced earlier in this same run are passed straight through
+            # - Research/Script/Metadata/Thumbnail are never re-run for
+            # compliance review.
+            result = compliance_agent.review_compliance(
+                state.topic,
+                final_video_path=video_path,
+                metadata_result=state.metadata_result,
+                thumbnail_path=state.thumbnail_result.output_path if state.thumbnail_result else None,
+                script=state.script_result,
+                thumbnail_result=state.thumbnail_result,
+                provenance_manifest=provenance_manifest,
+            )
+        except ComplianceAgentError as e:
+            return {"compliance_result": None, "status": "failed", "error": f"Compliance review failed: {e}"}
+        except Exception as e:
+            return {
+                "compliance_result": None,
+                "status": "failed",
+                "error": f"Unexpected compliance error: {e}",
+            }
+
+        if result.publish_decision == "BLOCK":
+            # A known deterministic compliance blocker was found - never
+            # treated as PASS. Every earlier artifact (final video,
+            # metadata, thumbnail) is preserved untouched; only the
+            # pipeline's own status/error reflect the blocked outcome.
+            blocker_summary = "; ".join(result.blockers) or "see compliance_result for details"
+            return {
+                "compliance_result": result,
+                "status": "blocked",
+                "error": f"Compliance blocked publishing: {blocker_summary}",
+            }
+
+        if result.publish_decision == "REVIEW":
+            # Uncertainty or a non-blocking concern requiring human/another
+            # system review - never silently treated as approved.
+            warning_summary = "; ".join(result.warnings) or "see compliance_result for details"
+            return {
+                "compliance_result": result,
+                "status": "review_required",
+                "error": f"Compliance requires human review: {warning_summary}",
+            }
+
+        return {"compliance_result": result, "status": "completed", "error": None}
 
     def route_after_research(state: PipelineState) -> str:
         """Only proceed to scripting if research actually produced a result."""
@@ -645,6 +754,12 @@ def build_pipeline_graph(
         missing/failed metadata."""
         return "thumbnail" if state.metadata_result is not None and state.metadata_result.success else END
 
+    def route_after_thumbnail(state: PipelineState) -> str:
+        """Only proceed to compliance review if thumbnail generation
+        actually succeeded - the compliance node must never run on
+        missing/failed thumbnail generation."""
+        return "compliance" if state.thumbnail_result is not None and state.thumbnail_result.success else END
+
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
@@ -656,6 +771,7 @@ def build_pipeline_graph(
     graph.add_node("bgm", bgm_node)
     graph.add_node("metadata", metadata_node)
     graph.add_node("thumbnail", thumbnail_node)
+    graph.add_node("compliance", compliance_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
@@ -671,7 +787,8 @@ def build_pipeline_graph(
     graph.add_conditional_edges("captions", route_after_captions, {"bgm": "bgm", END: END})
     graph.add_conditional_edges("bgm", route_after_bgm, {"metadata": "metadata", END: END})
     graph.add_conditional_edges("metadata", route_after_metadata, {"thumbnail": "thumbnail", END: END})
-    graph.set_finish_point("thumbnail")
+    graph.add_conditional_edges("thumbnail", route_after_thumbnail, {"compliance": "compliance", END: END})
+    graph.set_finish_point("compliance")
 
     return graph
 
@@ -697,46 +814,53 @@ async def run_pipeline(
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
-    Thumbnail pipeline and return the final state.
+    Thumbnail -> Copyright/Compliance pipeline and return the final state.
 
-    On a successful ("completed") run, also persists a machine-readable
-    ProvenanceManifest (visual/thumbnail/BGM asset provenance actually used)
-    to ``provenance_output_dir`` via ``persist_provenance_if_completed`` -
-    the one place this happens; no individual node/agent writes its own
-    provenance file. This is pure post-run persistence, not a pipeline
-    stage: it never affects routing, never runs for a failed/partial run,
-    and a failure to write it never retroactively fails an already-
-    completed run (see src.services.provenance_collection).
+    Provenance persistence happens INSIDE the graph, not as post-run
+    processing: ``thumbnail_node`` persists a machine-readable
+    ProvenanceManifest for the current run immediately on its own success
+    (via ``persist_provenance_if_completed``), and ``compliance_node`` looks
+    that exact manifest back up (via ``ProvenanceManifestStore.find_for_video``)
+    before running its checks - this guarantees Compliance always reviews
+    the current run's real provenance, never a previous run's, and never a
+    filename-guessed reconstruction. No individual node writes provenance
+    for any run but its own, and a write failure never retroactively fails
+    an already-succeeded stage (see src.services.provenance_collection).
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
     can inspect ``status``/``error`` directly, including on partial failure
-    (e.g. every stage through metadata generation succeeded but thumbnail
-    generation failed).
+    (e.g. every stage through thumbnail generation succeeded but compliance
+    review returned BLOCK).
 
     Each stage only runs if the previous one succeeded - a failure at any
     stage short-circuits the rest of the pipeline and it never silently
     continues (see route_after_research/route_after_script/route_after_voice/
     route_after_media/route_after_visual_qc/route_after_video_assembly/
-    route_after_captions/route_after_bgm/route_after_metadata). Visual QC
-    itself fails the pipeline (status "failed", Video Assembly never runs)
-    if any asset is still flagged misleading/conflicting after bounded
-    replacement is exhausted - see visual_qc_node. Pipeline status only
-    becomes "completed" once thumbnail generation itself succeeds; a
-    semantic mood-planning failure inside BGM, or a chapters-only issue
-    inside metadata generation, does not itself fail the pipeline (both
-    degrade to a safe fallback and continue) - only an actual mixing/
-    selection/catalog failure, a total metadata generation failure, or a
-    total thumbnail generation failure, does. The final BGM-mixed MP4
-    (``audio_mix_result``), the generated metadata (``metadata_result``),
-    and every earlier-stage result are preserved unchanged either way.
+    route_after_captions/route_after_bgm/route_after_metadata/
+    route_after_thumbnail). Visual QC itself fails the pipeline (status
+    "failed", Video Assembly never runs) if any asset is still flagged
+    misleading/conflicting after bounded replacement is exhausted - see
+    visual_qc_node. Pipeline status only becomes "completed" once
+    compliance review itself returns a PASS decision; a semantic mood-
+    planning failure inside BGM, or a chapters-only issue inside metadata
+    generation, does not itself fail the pipeline (both degrade to a safe
+    fallback and continue) - only an actual mixing/selection/catalog
+    failure, a total metadata generation failure, a total thumbnail
+    generation failure, or a total compliance-review failure (as opposed to
+    a completed review that itself returns REVIEW/BLOCK - see
+    compliance_node), does. A compliance REVIEW decision sets status
+    "review_required" and a BLOCK decision sets status "blocked" - neither
+    is ever reported as "completed", and every earlier-stage result
+    (including the final BGM-mixed MP4, generated metadata, and rendered
+    thumbnail) is preserved unchanged in all three outcomes.
 
     Args:
         topic: Research topic to investigate, script, narrate, illustrate, and assemble
         search_provider: SearchProvider implementation for the Research Agent
         llm_provider: LLMProvider implementation shared by Research, Script,
-            Visual Context Planning, Visual QC, BGM mood planning, and
-            Thumbnail planning
+            Visual Context Planning, Visual QC, BGM mood planning,
+            Thumbnail planning, and the Compliance semantic review
         voice_provider: VoiceProvider implementation for the Voice Service
         voice_name: Provider-specific voice identifier for the Voice Service
         media_provider: MediaProvider implementation shared by the Visual
@@ -748,15 +872,16 @@ async def run_pipeline(
         transcription_provider: TranscriptionProvider implementation for
             the Caption Service
         music_catalog_provider: MusicCatalogProvider implementation (the
-            approved BGM catalog) for the Audio Mixing Service
+            approved BGM catalog) shared by the Audio Mixing Service and
+            the Compliance Agent's BGM provenance cross-check
         voice_output_dir: Directory the Voice Service writes audio files into
         media_output_dir: Directory the Visual Media Service writes assets into
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
         subtitle_output_dir: Directory the Caption Service writes .srt files into
         thumbnail_output_dir: Directory the Thumbnail Agent writes the rendered thumbnail into
         metadata_output_dir: Directory the Metadata Agent writes its JSON artifact into
-        provenance_output_dir: Directory the provenance manifest is written into on a
-            completed run
+        provenance_output_dir: Directory the provenance manifest is written into
+            (by thumbnail_node) and read from (by compliance_node)
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -777,12 +902,13 @@ async def run_pipeline(
         subtitle_output_dir,
         thumbnail_output_dir,
         metadata_output_dir,
+        provenance_output_dir,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
     raw_result = await graph.ainvoke(initial_state)
 
-    final_state = PipelineState(
+    return PipelineState(
         topic=raw_result.get("topic", topic),
         research_result=raw_result.get("research_result"),
         script_result=raw_result.get("script_result"),
@@ -796,8 +922,7 @@ async def run_pipeline(
         audio_mix_result=raw_result.get("audio_mix_result"),
         metadata_result=raw_result.get("metadata_result"),
         thumbnail_result=raw_result.get("thumbnail_result"),
+        compliance_result=raw_result.get("compliance_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )
-    persist_provenance_if_completed(final_state, provenance_output_dir)
-    return final_state

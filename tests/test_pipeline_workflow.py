@@ -14,6 +14,7 @@ from PIL import Image
 from src.llm.mock import MockLLMProvider
 from src.llm.provider import LLMProvider
 from src.models.captions import CaptionResult
+from src.models.compliance import ComplianceResult
 from src.models.media import VisualResult
 from src.models.metadata import MetadataResult
 from src.models.music import AudioMixResult, BGMTrack
@@ -25,7 +26,7 @@ from src.models.visual_qc import RawAssetVerdict, VisualQCResult
 from src.models.voice import VoiceResult
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
-from src.tools.music_catalog_provider import MockMusicCatalogProvider
+from src.tools.music_catalog_provider import MockMusicCatalogProvider, MusicCatalogProvider
 from src.tools.search_provider import MockSearchProvider, SearchProvider
 from src.tools.transcription_provider import MockTranscriptionProvider, TranscriptionProviderError
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
@@ -51,6 +52,25 @@ _METADATA_PROMPT_MARKER = "YouTube upload metadata"
 # distinguish the thumbnail-planning call from Research/Script/BGM/Metadata
 # prompts sharing the same LLMProvider.
 _THUMBNAIL_PROMPT_MARKER = "planning a YouTube thumbnail CONCEPT"
+
+# ComplianceReviewer's prompt always opens with this phrase (see
+# src/agents/compliance_reviewer.py) - a unique marker that lets test
+# doubles distinguish the compliance semantic-review call from Research/
+# Script/BGM/Metadata/Thumbnail prompts sharing the same LLMProvider.
+_COMPLIANCE_PROMPT_MARKER = "SEMANTIC COMPLIANCE REVIEW"
+
+
+def _default_compliance_json(**overrides) -> str:
+    """A valid ComplianceReviewer response payload - no findings, so the
+    default fixture's semantic review is performed AND clean, letting a
+    full pipeline success actually reach a PASS decision. Compliance (like
+    Metadata) has no deterministic content fallback for its semantic
+    review - an unperformed review always forces REVIEW, never PASS - so
+    the default fixture must produce something usable here, exactly like
+    it already does for MetadataAgent."""
+    payload = {"findings": [], "summary": "No issues found"}
+    payload.update(overrides)
+    return json.dumps(payload)
 
 
 def _default_thumbnail_plan_json(**overrides) -> str:
@@ -131,7 +151,10 @@ class ResearchMockWithVariedSections(LLMProvider):
     semantic-planning counterpart). DOES return a valid MetadataAgent
     response by default (metadata generation has no deterministic content
     fallback, so the default fixture must produce something usable for
-    every "full pipeline success" test to mean anything).
+    every "full pipeline success" test to mean anything) and, likewise, a
+    valid clean ComplianceReviewer response (compliance semantic review has
+    the same no-fallback-on-unperformed-review constraint - see
+    _default_compliance_json above).
     """
 
     def __init__(self) -> None:
@@ -143,6 +166,8 @@ class ResearchMockWithVariedSections(LLMProvider):
             return f"{point}. A distinct detail worth covering on its own."
         if _METADATA_PROMPT_MARKER in prompt:
             return _default_metadata_json()
+        if _COMPLIANCE_PROMPT_MARKER in prompt:
+            return _default_compliance_json()
         return self._mock.generate_text(prompt)
 
 
@@ -230,6 +255,29 @@ class ConfigurableThumbnailLLMProvider(LLMProvider):
             if self.thumbnail_error is not None:
                 raise self.thumbnail_error
             return _default_thumbnail_plan_json(**(self.thumbnail_payload or {}))
+        return self._delegate.generate_text(prompt)
+
+
+class ConfigurableComplianceLLMProvider(LLMProvider):
+    """Delegates Research/Script/BGM/Metadata/Thumbnail prompts to
+    ResearchMockWithVariedSections unchanged (including its default valid
+    Metadata/Compliance responses), but lets a test control exactly what
+    ComplianceReviewer's prompt receives (custom findings, or a raised
+    error) without touching any earlier stage - isolates compliance-only
+    success/findings/failure scenarios."""
+
+    def __init__(self, compliance_payload: dict | None = None, compliance_error: Exception | None = None) -> None:
+        self._delegate = ResearchMockWithVariedSections()
+        self.compliance_payload = compliance_payload
+        self.compliance_error = compliance_error
+        self.compliance_calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        if _COMPLIANCE_PROMPT_MARKER in prompt:
+            self.compliance_calls.append(prompt)
+            if self.compliance_error is not None:
+                raise self.compliance_error
+            return _default_compliance_json(**(self.compliance_payload or {}))
         return self._delegate.generate_text(prompt)
 
 
@@ -1796,5 +1844,422 @@ class TestThumbnailPipelineIntegration:
     def test_pipeline_demo_stage_labels_include_thumbnail(self) -> None:
         from src.pipeline_demo import _STAGE_LABELS
 
-        assert len(_STAGE_LABELS) == 10
-        assert _STAGE_LABELS["thumbnail"] == "[10/10] Thumbnail"
+        assert _STAGE_LABELS["thumbnail"] == "[10/11] Thumbnail"
+
+
+class DisappearingTrackMusicCatalogProvider(MusicCatalogProvider):
+    """Test double: list_tracks() returns the approved track on its FIRST
+    call (so BGM mixing itself succeeds normally, exactly like the default
+    fixture), but an EMPTY catalog on every later call - simulating the
+    approved catalog being edited/the track removed between BGM mixing and
+    the Compliance stage's cross-check. Lets pipeline tests deterministically
+    exercise a real BLOCK decision without breaking any earlier stage."""
+
+    def __init__(self, track: BGMTrack) -> None:
+        self._track = track
+        self._call_count = 0
+
+    @property
+    def name(self) -> str:
+        return "disappearing-track-test-double"
+
+    def list_tracks(self):
+        self._call_count += 1
+        return [self._track] if self._call_count == 1 else []
+
+
+class MutatingAttributionMusicCatalogProvider(MusicCatalogProvider):
+    """Test double: list_tracks() returns ``first_version`` on its FIRST
+    call (so BGM mixing selects/records that snapshot) and ``second_version``
+    (same track_id, different attribution fields) on every later call -
+    simulating the catalog being edited between BGM mixing and the
+    Compliance stage's cross-check. Lets pipeline tests deterministically
+    exercise a manifest/catalog disagreement WARNING (not a blocker, since
+    the current catalog entry still resolves to a usable attribution)."""
+
+    def __init__(self, first_version: BGMTrack, second_version: BGMTrack) -> None:
+        self._first_version = first_version
+        self._second_version = second_version
+        self._call_count = 0
+
+    @property
+    def name(self) -> str:
+        return "mutating-attribution-test-double"
+
+    def list_tracks(self):
+        self._call_count += 1
+        return [self._first_version if self._call_count == 1 else self._second_version]
+
+
+class TestCompliancePipelineIntegration:
+    """Tests for the Compliance Agent's integration as the final stage of
+    the LangGraph pipeline (Thumbnail -> Compliance -> END). Reuses the
+    same TestPipelineWorkflow fixture/_run helper shape - all mock/fake/
+    local providers only, no real Gemini/Pexels/FFmpeg/Whisper calls."""
+
+    providers = TestPipelineWorkflow.providers
+    _run = staticmethod(TestPipelineWorkflow._run)
+
+    # ---- A. Node exists / routing -------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_compliance_node_exists_and_pipeline_builds(self, providers) -> None:
+        (
+            search_provider, llm_provider, voice_provider, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        ) = providers
+        graph = build_pipeline_graph(
+            search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        )
+        compiled = graph.compile()
+        assert "compliance" in compiled.get_graph().nodes
+
+    @pytest.mark.asyncio
+    async def test_compliance_runs_after_successful_thumbnail(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.thumbnail_result is not None
+        assert state.thumbnail_result.success is True
+        assert state.compliance_result is not None
+        assert isinstance(state.compliance_result, ComplianceResult)
+        assert state.compliance_result.success is True
+
+    @pytest.mark.asyncio
+    async def test_compliance_not_called_when_metadata_fails(self, providers) -> None:
+        """Compliance must never run before Thumbnail - proven here via an
+        earlier-stage (Metadata) failure, which must never let the graph
+        reach thumbnail or compliance at all."""
+        provider = ConfigurableMetadataLLMProvider(metadata_error=RuntimeError("simulated metadata outage"))
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.status == "failed"
+        assert state.thumbnail_result is None
+        assert state.compliance_result is None
+
+    @pytest.mark.asyncio
+    async def test_compliance_not_called_when_bgm_fails(self, providers) -> None:
+        state = await self._run(providers, music_catalog_provider=MockMusicCatalogProvider(tracks=[]))
+
+        assert state.status == "failed"
+        assert state.thumbnail_result is None
+        assert state.compliance_result is None
+
+    @pytest.mark.asyncio
+    async def test_compliance_not_called_when_thumbnail_fails(self, providers) -> None:
+        provider = ConfigurableThumbnailLLMProvider(thumbnail_error=RuntimeError("simulated thumbnail planning outage"))
+        state = await self._run(providers, llm_provider=provider)
+
+        # ThumbnailPlanner never raises for LLM failures - it falls back
+        # deterministically - so force a real thumbnail failure downstream
+        # instead via a media provider that fails only the thumbnail's own
+        # deterministic-fallback search query (the raw topic).
+        failing_media = FailThumbnailSearchMediaProvider(topic="Why do humans dream?")
+        state = await self._run(providers, media_provider=failing_media)
+
+        assert state.status == "failed"
+        assert state.thumbnail_result is not None
+        assert state.thumbnail_result.success is False
+        assert state.compliance_result is None
+
+    # ---- B. Inputs reused from real pipeline state ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_compliance_receives_original_topic(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, topic="Why do humans dream?", llm_provider=recording_llm)
+
+        compliance_prompts = [c for c in recording_llm.calls if _COMPLIANCE_PROMPT_MARKER in c]
+        assert len(compliance_prompts) == 1
+        assert state.topic in compliance_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_compliance_receives_real_script_result(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, llm_provider=recording_llm)
+
+        assert len(state.script_result.sections) >= 2  # a real multi-section script, not a synthetic stand-in
+
+        compliance_prompts = [c for c in recording_llm.calls if _COMPLIANCE_PROMPT_MARKER in c]
+        assert len(compliance_prompts) == 1
+        for section in state.script_result.sections:
+            assert section.heading in compliance_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_compliance_receives_real_metadata_result(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, llm_provider=recording_llm)
+
+        compliance_prompts = [c for c in recording_llm.calls if _COMPLIANCE_PROMPT_MARKER in c]
+        assert len(compliance_prompts) == 1
+        assert state.metadata_result.title in compliance_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_compliance_receives_real_thumbnail_result(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        state = await self._run(providers, llm_provider=recording_llm)
+
+        compliance_prompts = [c for c in recording_llm.calls if _COMPLIANCE_PROMPT_MARKER in c]
+        assert len(compliance_prompts) == 1
+        assert state.thumbnail_result.plan.hook_text in compliance_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_compliance_receives_exact_current_final_video_path(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.compliance_result.success is True
+        assert any(
+            state.audio_mix_result.output_path in artifact for artifact in state.compliance_result.artifacts_inspected
+        )
+
+    # ---- C. Provenance manifest: current-run association ---------------------
+
+    @pytest.mark.asyncio
+    async def test_current_run_provenance_manifest_used(self, providers) -> None:
+        state = await self._run(providers)
+
+        visual_check = next(c for c in state.compliance_result.checks if c.check_name == "visual_provenance")
+        expected_asset_count = sum(
+            1 for section in state.qc_approved_visual_result.sections for asset in section.assets if asset.success
+        )
+        assert visual_check.status == "ok"
+        assert str(expected_asset_count) in visual_check.detail
+
+    @pytest.mark.asyncio
+    async def test_provenance_manifest_does_not_select_previous_runs_manifest(self, providers, tmp_path) -> None:
+        """Two separate runs (different topics, so different final-video
+        hashes) must each get compliance results reflecting their OWN
+        provenance manifest, never a stale/previous one."""
+        state_a = await self._run(providers, topic="Topic A")
+        state_b = await self._run(providers, topic="Topic B")
+
+        assert state_a.audio_mix_result.output_path != state_b.audio_mix_result.output_path
+        assert state_a.compliance_result.success is True
+        assert state_b.compliance_result.success is True
+        visual_check_a = next(c for c in state_a.compliance_result.checks if c.check_name == "visual_provenance")
+        visual_check_b = next(c for c in state_b.compliance_result.checks if c.check_name == "visual_provenance")
+        assert visual_check_a.status == "ok"
+        assert visual_check_b.status == "ok"
+
+    @pytest.mark.asyncio
+    async def test_provenance_manifest_exists_before_compliance_executes(self, providers) -> None:
+        from src.services.provenance_store import ProvenanceManifestStore
+
+        _, _, _, _, _, _, _, _, voice_dir, _, _, _ = providers
+        provenance_dir = os.path.join(os.path.dirname(voice_dir), "provenance")
+        state = await self._run(providers)
+
+        manifest = ProvenanceManifestStore(output_dir=provenance_dir).find_for_video(state.audio_mix_result.output_path)
+        assert manifest is not None
+        assert manifest.topic == state.topic
+
+    # ---- D. Provider reuse (dependency injection, no duplicates) -------------
+
+    @pytest.mark.asyncio
+    async def test_shared_llm_provider_reused_for_compliance(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        await self._run(providers, llm_provider=recording_llm)
+
+        assert any(_METADATA_PROMPT_MARKER in c for c in recording_llm.calls)
+        assert any(_COMPLIANCE_PROMPT_MARKER in c for c in recording_llm.calls)
+
+    @pytest.mark.asyncio
+    async def test_shared_music_catalog_provider_reused_for_compliance(self, providers, tmp_path) -> None:
+        track = BGMTrack(
+            track_id="distinctive-catalog-track", file_path=str(tmp_path / "t.mp3"), title="Distinctive Track",
+            source="Test Fixture", license_type="test_license", instrumental=True,
+            mood_tags=["calm", "neutral", "subtle"], energy_level="low",
+        )
+        (tmp_path / "t.mp3").write_bytes(b"FAKE BGM TRACK AUDIO")
+        catalog = MockMusicCatalogProvider(tracks=[track])
+        state = await self._run(providers, music_catalog_provider=catalog)
+
+        assert state.audio_mix_result.selected_track.track_id == "distinctive-catalog-track"
+        bgm_check = next(c for c in state.compliance_result.checks if c.check_name == "bgm_provenance")
+        assert bgm_check.status == "ok"
+        assert "distinctive-catalog-track" in bgm_check.detail
+
+    @pytest.mark.asyncio
+    async def test_compliance_agent_called_exactly_once(self, providers) -> None:
+        provider = ConfigurableComplianceLLMProvider()
+        await self._run(providers, llm_provider=provider)
+
+        assert len(provider.compliance_calls) == 1
+
+    # ---- E. PASS / REVIEW / BLOCK routing and final status --------------------
+
+    @pytest.mark.asyncio
+    async def test_pass_stores_compliance_result(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.compliance_result is not None
+        assert state.compliance_result.publish_decision == "PASS"
+
+    @pytest.mark.asyncio
+    async def test_pass_sets_final_completed(self, providers) -> None:
+        state = await self._run(providers)
+
+        assert state.compliance_result.publish_decision == "PASS"
+        assert state.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_review_does_not_set_completed(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported by the script"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.compliance_result.publish_decision == "REVIEW"
+        assert state.status != "completed"
+
+    @pytest.mark.asyncio
+    async def test_review_sets_review_required_status(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported by the script"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.status == "review_required"
+        assert state.error is not None
+
+    @pytest.mark.asyncio
+    async def test_block_does_not_set_completed(self, providers, tmp_path) -> None:
+        track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        catalog = DisappearingTrackMusicCatalogProvider(track)
+        state = await self._run(providers, music_catalog_provider=catalog)
+
+        assert state.audio_mix_result.success is True  # BGM mixing itself succeeded normally
+        assert state.compliance_result.publish_decision == "BLOCK"
+        assert state.status != "completed"
+
+    @pytest.mark.asyncio
+    async def test_block_sets_blocked_status(self, providers, tmp_path) -> None:
+        track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        catalog = DisappearingTrackMusicCatalogProvider(track)
+        state = await self._run(providers, music_catalog_provider=catalog)
+
+        assert state.status == "blocked"
+        assert state.error is not None
+        assert state.compliance_result.blockers != []
+
+    # ---- F. Warnings/blockers/attributions preserved --------------------------
+
+    @pytest.mark.asyncio
+    async def test_warnings_preserved_on_review(self, providers, tmp_path) -> None:
+        """A manifest/catalog attribution disagreement (the catalog gained
+        an attribution requirement after BGM mixing already recorded none)
+        is a deterministic WARNING, not a blocker - it must still surface
+        on the final ComplianceResult and push the decision to REVIEW."""
+        base_track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        updated_track = base_track.model_copy(
+            update={"attribution_required": True, "attribution_text": "Credit required now"}
+        )
+        catalog = MutatingAttributionMusicCatalogProvider(base_track, updated_track)
+        state = await self._run(providers, music_catalog_provider=catalog)
+
+        assert state.compliance_result.publish_decision == "REVIEW"
+        assert state.compliance_result.blockers == []
+        assert state.compliance_result.warnings != []
+        assert any("disagreement" in w.lower() for w in state.compliance_result.warnings)
+
+    @pytest.mark.asyncio
+    async def test_blockers_preserved_on_block(self, providers, tmp_path) -> None:
+        track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        catalog = DisappearingTrackMusicCatalogProvider(track)
+        state = await self._run(providers, music_catalog_provider=catalog)
+
+        assert len(state.compliance_result.blockers) >= 1
+
+    @pytest.mark.asyncio
+    async def test_required_attributions_preserved(self, providers, tmp_path) -> None:
+        track = BGMTrack(
+            track_id="attribution-track", file_path=str(tmp_path / "attr.mp3"), title="Attribution Track",
+            source="Test Fixture", license_type="test_license_attribution_required", instrumental=True,
+            mood_tags=["calm", "neutral", "subtle"], energy_level="low",
+            attribution_required=True, attribution_text="Music by Test Artist",
+        )
+        (tmp_path / "attr.mp3").write_bytes(b"FAKE BGM TRACK AUDIO")
+        catalog = MockMusicCatalogProvider(tracks=[track])
+        state = await self._run(providers, music_catalog_provider=catalog)
+
+        assert state.compliance_result.attribution_required is True
+        assert len(state.compliance_result.required_attributions) == 1
+        assert state.compliance_result.required_attributions[0].attribution_text == "Music by Test Artist"
+        assert state.compliance_result.publish_decision == "PASS"  # attribution alone never blocks
+
+    # ---- G. Artifacts preserved on REVIEW/BLOCK --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_final_video_preserved_on_review(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.audio_mix_result is not None
+        assert state.audio_mix_result.success is True
+        assert os.path.exists(state.audio_mix_result.output_path)
+
+    @pytest.mark.asyncio
+    async def test_metadata_preserved_on_review(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.metadata_result is not None
+        assert state.metadata_result.success is True
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_preserved_on_review(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        state = await self._run(providers, llm_provider=provider)
+
+        assert state.thumbnail_result is not None
+        assert state.thumbnail_result.success is True
+
+    @pytest.mark.asyncio
+    async def test_artifacts_preserved_on_block(self, providers, tmp_path) -> None:
+        track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        catalog = DisappearingTrackMusicCatalogProvider(track)
+        state = await self._run(providers, music_catalog_provider=catalog)
+
+        assert state.audio_mix_result is not None and state.audio_mix_result.success is True
+        assert state.metadata_result is not None and state.metadata_result.success is True
+        assert state.thumbnail_result is not None and state.thumbnail_result.success is True
+        assert os.path.exists(state.audio_mix_result.output_path)
+
+    # ---- H. No upstream rerun --------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_no_research_or_script_rerun_for_compliance(self, providers) -> None:
+        recording_search = RecordingSearchProvider()
+        await self._run(providers, search_provider=recording_search)
+
+        # ResearchAgent is the only caller of SearchProvider.search() in the
+        # whole pipeline - if compliance review re-ran Research, this would
+        # be > 1.
+        assert len(recording_search.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_metadata_agent_not_rerun_for_compliance(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        await self._run(providers, llm_provider=recording_llm)
+
+        metadata_prompts = [c for c in recording_llm.calls if _METADATA_PROMPT_MARKER in c]
+        assert len(metadata_prompts) == 1
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_agent_not_rerun_for_compliance(self, providers) -> None:
+        recording_llm = RecordingLLMProvider()
+        await self._run(providers, llm_provider=recording_llm)
+
+        thumbnail_prompts = [c for c in recording_llm.calls if _THUMBNAIL_PROMPT_MARKER in c]
+        assert len(thumbnail_prompts) == 1
+
+    # ---- I. Pipeline demo stage labels -----------------------------------------
+
+    def test_pipeline_demo_stage_labels_updated_to_eleven(self) -> None:
+        from src.pipeline_demo import _STAGE_LABELS
+
+        assert len(_STAGE_LABELS) == 11
+        assert _STAGE_LABELS["compliance"] == "[11/11] Copyright / Compliance"
