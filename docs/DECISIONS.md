@@ -525,6 +525,34 @@ With Metadata now the final stage, `bgm_node`'s own success status was renamed f
 
 The standalone Metadata milestone's real run produced `chapters_available=False` because its SRT-based reconstruction always yields exactly one synthetic section - `MetadataAgent`'s own `MIN_SECTIONS_FOR_CHAPTERS` guard correctly refused to fabricate a chapter split from that. Real pipeline integration validated the intended path directly: given the actual 5-section `ScriptResult`, the same unmodified `MetadataAgent` produced 5 real chapters, first at `0:00`, strictly increasing, all within the final duration - confirming the deterministic chapter-timing design works end-to-end without requiring any code change to `MetadataAgent` itself.
 
+## Thumbnail generation splits cleanly into semantic planning and deterministic rendering, mirroring the project's established pattern
+
+Just as `VisualContextPlanner`/`MusicContextPlanner`/`MetadataAgent` each keep LLM reasoning in a small, focused component while deterministic services own everything mechanical, thumbnail generation is split into `ThumbnailPlanner` (`src/agents/thumbnail_planner.py`, one LLM call, semantic/creative decisions only - hook text, visual concept, search query, mood, subject, composition, avoid concepts) and deterministic downstream work (`thumbnail_selection.py`, `thumbnail_renderer.py`, `thumbnail_validation.py`). The LLM is never asked for pixel coordinates or file operations - `composition` is a closed 3-value enum (`subject_left`/`subject_right`/`centered`) the renderer translates into fixed layout rules, consistent with "don't let the LLM generate arbitrary pixel coordinates."
+
+## Pillow added as a new dependency; no paid image-generation API
+
+The project had no existing image-processing library, and deterministic local cropping/resizing/text-compositing genuinely needs one - reusing FFmpeg for this (via `drawtext`/scaling filters) would be far clunkier for text measurement, wrapping, and layout than a proper imaging library. Pillow (`Pillow>=10.0`) was added as the minimal, free, purely-local dependency this requires; no paid AI image-generation service was introduced, consistent with the project's "no paid APIs" MVP constraint.
+
+## Existing Pexels MediaProvider reused as-is for thumbnail source images; no second HTTP implementation
+
+`ThumbnailAgent` calls the same `MediaProvider.search(query, prefer_video=False, ...)`/`.download(...)` interface `VisualMediaService` already depends on - `prefer_video=False` routes `PexelsMediaProvider` straight to its existing photo-search path (already `orientation=landscape` filtered server-side). No new Pexels request/response handling was written.
+
+## Thumbnail planning tolerates a total LLM failure gracefully, unlike Metadata
+
+Unlike `MetadataAgent` (where a title/description genuinely cannot be synthesized without an LLM), a safe thumbnail hook CAN be deterministically derived - the video's own topic (or already-generated metadata title) is definitionally accurate for its own video. `ThumbnailPlanner.plan_thumbnail` therefore never raises for an LLM failure; it always returns a usable `ThumbnailPlan` (deterministic fallback: topic/title's own words, uppercased, capped at 6), so a Gemini outage degrades thumbnail quality rather than blocking thumbnail generation entirely - a deliberate difference in fallback philosophy explicitly called for by this milestone's failure-behavior requirements.
+
+## No local fallback image asset exists yet; a Pexels search/selection failure is a clean typed failure
+
+Unlike Gemini's own retry/fallback-model chain, there is no pre-existing local "safe fallback image" asset in this project (nothing comparable to the curated BGM catalog). Rather than inventing one mid-milestone or silently reusing an unrelated image, a Pexels search failure or an empty/all-filtered candidate list returns a clean `ThumbnailResult(success=False, error=...)` - honest failure over a fabricated result, consistent with "do not silently use an unrelated random image."
+
+## Deterministic rendering guarantees no text overflow, regardless of hook length
+
+`thumbnail_renderer.py`'s `_fit_text` shrinks the font in fixed steps until the wrapped hook fits the composition's text box, and as an absolute last-resort safety net, clips to however many lines actually fit at the minimum font size rather than ever letting text visually overflow the 1280x720 canvas. Combined with a local/system font fallback chain (configurable path → common Windows/Linux/Mac bold sans-serif files → Pillow's bundled bitmap font as the ultimate fallback), rendering can never fail purely because of missing fonts or long text - only a genuinely corrupt/unreadable source image does.
+
+## Real validation surfaced an ambiguous-hook failure pattern; a deterministic topic-alignment guard was added without a second LLM call
+
+The first real standalone run produced a factually-grounded but ambiguous hook ("Two Hours Every Night" for "Why do humans dream?") - a viewer couldn't tell what the video was about from the thumbnail text alone. Rather than adding a second LLM call to judge the first one's output, `thumbnail_validation.py` gained a generic lexical-overlap guard (`is_ambiguous_supporting_fact_hook`, built from `looks_like_isolated_statistic` + `has_topical_overlap`): a hook dominated by a bare number/duration/percentage AND sharing no significant word with the video's own topic/title is deterministically replaced with a topic/title-derived hook (`resolve_hook_text`, preferring the metadata title over the raw topic). The word lists involved (English stopwords, number words, duration units) are generic linguistic resources, not topic-specific content - verified by a dedicated test applying the same guard to an unrelated volcano-topic example. `ThumbnailPlanner`'s prompt was also updated with an explicit hook-selection priority policy so the LLM produces a clear hook more often in the first place, with the deterministic guard remaining as the safety net, not the primary mechanism - confirmed by real re-validation, where the updated prompt alone produced a clear hook and the guard did not need to intervene.
+
 ## Known limitations
 
 - The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
@@ -532,6 +560,9 @@ The standalone Metadata milestone's real run produced `chapters_available=False`
 - The main pipeline currently produces three MP4-related outputs per run (original assembled, captioned, and BGM-mixed) plus an `.srt` file, rather than a single final output - intentional for now; a future cleanup milestone may remove the intermediate files once the final mixed MP4 has been used/uploaded successfully.
 - The Metadata Agent does not independently fact-check its output - metadata quality/accuracy is only as good as the input `ScriptResult`/narration; an upstream accuracy issue (observed in both the standalone milestone and the real integrated run - a Matthew Walker-related description detail inherited from Research/Script content) passes through rather than being caught. Flagged as a future accuracy/compliance hardening consideration, not addressed in this milestone.
 - The Metadata Agent's JSON artifact (`output/metadata/<video-slug>.json`) is now produced by every real pipeline run but has no consumer yet - a future YouTube Upload Agent is expected to read it.
+- The Thumbnail Agent is implemented, hook-quality-hardened, and real-validated but is **standalone only** - the main pipeline's final output does not currently include a generated thumbnail.
+- Thumbnail composition has no true subject-detection - it only controls which side of the frame hosts the text panel/contrast scrim, not literal awareness of where a photo's subject actually is; an accepted MVP simplification.
+- The current thumbnail style (real stock photo + text overlay) is intentionally simple for the MVP; more custom/cinematic styles via an AI image-generation provider are a possible future V2 enhancement, not required now.
 - Whisper transcription accuracy depends on the TTS narration's clarity; it has not been validated against noisy or multi-speaker audio, which this pipeline does not produce.
 - The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts and occasional single-word caption segments - both cosmetic, not correctness issues for caption sync or meaning, and not being tuned further at this stage.
 - Stock footage semantic relevance can vary run-to-run with live Pexels results; the visual pipeline is considered feature-complete/frozen for the MVP and is not planned for further optimization without a new, recurring, concrete problem.

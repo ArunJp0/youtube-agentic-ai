@@ -226,6 +226,22 @@
 - Real end-to-end run validated via `python -m src.pipeline_demo "Why do humans dream?"`: all 9 stages completed with final status `completed` - the Metadata call succeeded on the primary Gemini model with no fallback needed, producing title "Why Do Humans Dream? The Science and Mystery of Sleep", 5 tags, 4 hashtags, a grounded description, and **5 real chapters derived from the 5 real script sections** (`0:00`, `0:34`, `0:59`, `1:27`, `2:01`) - confirmed first chapter at `0:00`, strictly increasing timestamps, all within the final ~151.57s duration; this resolves the standalone milestone's single-synthetic-section chapter limitation
 - Manual review of the real run confirmed the final video and generated metadata (title, description, tags, hashtags, chapters) were good; the same upstream Matthew Walker wording/accuracy note observed in the standalone milestone recurred (inherited from Research/Script content, not invented by the Metadata Agent) - recorded as a future accuracy/compliance hardening item
 - Metadata Agent Main Pipeline Integration milestone marked **COMPLETE**
+- Standalone Thumbnail Agent implemented: given a video's topic, its `ScriptResult`, and (when available) its already-generated `MetadataResult`/JSON, produces a professional 1280x720 YouTube thumbnail - a real stock photo with a short, clear text hook composited on top
+- New typed models `ThumbnailPlan`, `ThumbnailSourceAsset`, `ThumbnailResult` (`src/models/thumbnail.py`)
+- Clean two-part architecture: `ThumbnailPlanner` (`src/agents/thumbnail_planner.py`) handles semantic/creative planning only (hook text, visual concept, search query, mood, subject, composition, avoid concepts) via exactly ONE LLM call, reusing the existing `LLMProvider` abstraction and already-configured Gemini primary/fallback chain - no new provider, no new API key, no hardcoded model; deterministic rendering (`src/services/thumbnail_renderer.py`, Pillow) owns all layout math - the LLM never supplies pixel coordinates, only picks one of a small fixed set of compositions (`subject_left`/`subject_right`/`centered`)
+- `Pillow` added as a new dependency (no equivalent image-processing library existed in the project) - used only for deterministic local image cropping/resizing/text compositing, no paid image-generation API
+- Existing Pexels `MediaProvider` abstraction reused as-is for stock-photo search/download (the same one `VisualMediaService` already depends on) - no duplicate HTTP/API implementation
+- Deterministic rendering guarantees: exact 1280x720 output, center-crop (never stretched) for both landscape and portrait sources, auto-shrinking/wrapping text with safe margins so text can never overflow the canvas, a translucent contrast panel behind the text, and a local/system font fallback chain (no font downloads, no design application dependency)
+- Deterministic validation layer (`src/services/thumbnail_selection.py`, `src/services/thumbnail_validation.py`): avoid-concept-aware image selection (best-available last resort if every candidate matches an avoid concept, never a silently unrelated image), hook-text normalization/length capping, and output-image validation (dimensions, format, non-corrupt, file existence) - malformed output is never silently accepted
+- Unlike `MetadataAgent`, thumbnail planning tolerates a total LLM failure gracefully: `ThumbnailPlanner` always returns a usable plan (a safe deterministic hook derived from the topic's own words, since a topic is definitionally accurate for its own video) rather than failing the whole thumbnail - consistent with this milestone's explicit "if practical, allow a conservative deterministic plan" requirement
+- Standalone demo `src/thumbnail_demo.py`: reuses the latest final video, its matching `.srt` transcript (via the existing shared `script_context_reconstruction.py` module - no duplicated logic), and the latest generated Metadata JSON artifact (if present, for extra title/SEO context) - Research/Script/Voice/Visual Media/Visual QC/Video Assembly/Captions/BGM/Metadata are never re-run just to validate a thumbnail
+- 939/939 tests passing after the initial implementation (89 new Thumbnail Agent tests), all using mocked LLM/media-provider doubles and locally-generated Pillow test images - no real Gemini/Pexels calls in the automated suite
+- Real standalone validation initially produced a technically valid but content-flawed thumbnail: hook text "Two Hours Every Night" for topic "Why do humans dream?" - factually grounded in the script, but manual review found it too ambiguous as a standalone thumbnail (a viewer couldn't tell if it referred to dreaming, sleep, or something unrelated)
+- Hook-quality enhancement completed before approving the milestone: `ThumbnailPlanner`'s prompt was updated with an explicit hook-selection priority policy (primary topic clarity → shortened title → contextual hook → avoid ambiguous isolated statistics/durations → standalone clarity test → 2-6 words, no clickbait/stuffing/emojis), and a new deterministic topic-alignment guard (`src/services/thumbnail_validation.py`: `is_ambiguous_supporting_fact_hook`/`resolve_hook_text`) was added to catch and replace an ambiguous isolated-statistic hook with a safe metadata-title-or-topic-derived one - a generic lexical-overlap rule with no topic-specific hardcoding and no second LLM call
+- 965/965 tests passing after the hook-quality enhancement (26 new focused tests, including a deliberately unrelated volcano-topic test proving the guard is generic, not hardcoded to the dreams example)
+- Real re-validation via `python -m src.thumbnail_demo "Why do humans dream?"`: the updated prompt alone produced a clear hook ("Why Do We Dream") on the first LLM attempt - no deterministic replacement was needed this time, confirming the guard is a safety net rather than the primary mechanism; real Gemini (primary model, no fallback) and real Pexels both succeeded; output validated at exactly 1280x720; written to `output/thumbnails/why-do-humans-dream-bf436b99.jpg`
+- Manual review approved the final thumbnail: image relevance, hook clarity, text readability, and composition were all judged acceptable and professional for the current MVP's simple stock-photo-plus-text style; a future V2 may explore an AI image-generation provider for more custom/cinematic thumbnails, but no additional paid service is needed for the current MVP
+- Standalone Thumbnail Agent milestone marked **COMPLETE** - deliberately **not yet wired into the main LangGraph pipeline** (`src/workflows/pipeline_graph.py` is unchanged); `src/thumbnail_demo.py` is a separate standalone runner for this milestone
 
 ## Known Limitations
 
@@ -243,19 +259,22 @@
 - The main pipeline now produces **three** MP4-related outputs per run on disk (the original assembled MP4, the captioned MP4, and the final BGM-mixed MP4), plus the `.srt` file, rather than a single final output - intentional for now as development/debug fallbacks; a future storage/cleanup milestone may remove the intermediate files once the final mixed MP4 has been used/uploaded successfully.
 - Metadata content quality (title/description/tags/hashtags accuracy) depends entirely on the quality and accuracy of the input `ScriptResult`/narration - the Metadata Agent does not independently fact-check; an accuracy issue already present in upstream narration will pass through into the generated metadata (observed in both the standalone milestone and the real integrated run - see the Matthew Walker note above).
 - The Metadata Agent is now integrated into the main pipeline, but its main-pipeline JSON artifact output (`output/metadata/<video-slug>.json`) is not yet consumed by anything - it is written for a future YouTube Upload Agent to read, which does not exist yet.
+- The Standalone Thumbnail Agent is implemented, hook-quality-hardened, and real-validated but is **standalone only** - the main pipeline's final output does not currently include a generated thumbnail.
+- Thumbnail image selection has no true subject-detection - `composition` only controls which side of the frame hosts the text panel (with a translucent scrim guaranteeing contrast there), not literal awareness of where a photo's actual subject is; this is an accepted MVP simplification, not a bug.
+- The current thumbnail style is a straightforward stock-photo-plus-text-overlay composite; more custom/cinematic thumbnail styles (e.g. via an AI image-generation provider) are a possible future V2 enhancement, not needed for the current MVP.
 
 ## Current Next Milestone
 
-**Thumbnail Agent** - the Metadata milestone is now frozen after successful real 9-stage integration validation.
+**Thumbnail Agent Main Pipeline Integration** - the standalone Thumbnail milestone is now frozen after hook-quality hardening and manual approval.
 
 ```
 Topic → Research → Script → Voice → Visual Media → Visual QC → Video Assembly
-      → Subtitles / Captions → BGM / Audio Mixing → Metadata → END
+      → Subtitles / Captions → BGM / Audio Mixing → Metadata → Thumbnail → END
 ```
 
 Planned sequence after that, in order:
 
-1. Thumbnail Agent
+1. Thumbnail Agent Main Pipeline Integration
 2. Copyright / Compliance checks
 3. YouTube Upload + Scheduling
 4. Monitoring / Post-publish
