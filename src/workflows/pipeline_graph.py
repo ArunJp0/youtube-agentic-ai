@@ -18,7 +18,7 @@ from typing import Optional
 
 from langgraph.graph import END, StateGraph
 
-from src.agents.metadata_agent import MetadataAgent, MetadataAgentError
+from src.agents.metadata_agent import DEFAULT_METADATA_OUTPUT_DIR, MetadataAgent, MetadataAgentError
 from src.agents.research import ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent, ScriptAgentError
 from src.agents.thumbnail_agent import DEFAULT_THUMBNAIL_OUTPUT_DIR, ThumbnailAgent, ThumbnailAgentError
@@ -36,6 +36,8 @@ from src.models.visual_qc import VisualQCResult
 from src.models.voice import VoiceResult
 from src.services.audio_mixing_service import AudioMixingService, AudioMixingServiceError
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR, CaptionService, CaptionServiceError
+from src.services.provenance_collection import persist_provenance_if_completed
+from src.services.provenance_store import DEFAULT_PROVENANCE_OUTPUT_DIR
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
     VideoAssemblyService,
@@ -132,6 +134,7 @@ def build_pipeline_graph(
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
     thumbnail_output_dir: str = DEFAULT_THUMBNAIL_OUTPUT_DIR,
+    metadata_output_dir: str = DEFAULT_METADATA_OUTPUT_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
@@ -202,6 +205,7 @@ def build_pipeline_graph(
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
         subtitle_output_dir: Directory the Caption Service writes .srt files into
         thumbnail_output_dir: Directory the Thumbnail Agent writes the rendered thumbnail into
+        metadata_output_dir: Directory the Metadata Agent writes its JSON artifact into
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -243,7 +247,7 @@ def build_pipeline_graph(
     # run) - no new provider/API key path. Chapter timestamps come from
     # MetadataAgent's own deterministic section-timing derivation, never
     # from this LLM call.
-    metadata_agent = MetadataAgent(llm_provider=llm_provider)
+    metadata_agent = MetadataAgent(llm_provider=llm_provider, output_dir=metadata_output_dir)
     # Reuses the same LLMProvider (its single thumbnail-planning call per
     # run, via the injected ThumbnailPlanner) and the same MediaProvider
     # (stock-photo search/download) already used by Visual Media - no new
@@ -688,10 +692,21 @@ async def run_pipeline(
     video_output_dir: str = DEFAULT_VIDEO_OUTPUT_DIR,
     subtitle_output_dir: str = DEFAULT_SUBTITLE_OUTPUT_DIR,
     thumbnail_output_dir: str = DEFAULT_THUMBNAIL_OUTPUT_DIR,
+    metadata_output_dir: str = DEFAULT_METADATA_OUTPUT_DIR,
+    provenance_output_dir: str = DEFAULT_PROVENANCE_OUTPUT_DIR,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
     Thumbnail pipeline and return the final state.
+
+    On a successful ("completed") run, also persists a machine-readable
+    ProvenanceManifest (visual/thumbnail/BGM asset provenance actually used)
+    to ``provenance_output_dir`` via ``persist_provenance_if_completed`` -
+    the one place this happens; no individual node/agent writes its own
+    provenance file. This is pure post-run persistence, not a pipeline
+    stage: it never affects routing, never runs for a failed/partial run,
+    and a failure to write it never retroactively fails an already-
+    completed run (see src.services.provenance_collection).
 
     Unlike the individual research/script workflow convenience functions
     (which raise on failure), this returns the full PipelineState so callers
@@ -739,6 +754,9 @@ async def run_pipeline(
         video_output_dir: Directory the Video Assembly Service writes the final MP4 into
         subtitle_output_dir: Directory the Caption Service writes .srt files into
         thumbnail_output_dir: Directory the Thumbnail Agent writes the rendered thumbnail into
+        metadata_output_dir: Directory the Metadata Agent writes its JSON artifact into
+        provenance_output_dir: Directory the provenance manifest is written into on a
+            completed run
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -758,12 +776,13 @@ async def run_pipeline(
         video_output_dir,
         subtitle_output_dir,
         thumbnail_output_dir,
+        metadata_output_dir,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
     raw_result = await graph.ainvoke(initial_state)
 
-    return PipelineState(
+    final_state = PipelineState(
         topic=raw_result.get("topic", topic),
         research_result=raw_result.get("research_result"),
         script_result=raw_result.get("script_result"),
@@ -780,3 +799,5 @@ async def run_pipeline(
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )
+    persist_provenance_if_completed(final_state, provenance_output_dir)
+    return final_state

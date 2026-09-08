@@ -536,11 +536,17 @@ class TestPipelineWorkflow:
             video_dir,
             subtitle_dir,
         ) = providers
-        # Derived from voice_dir (rather than a 13th fixture element) so
+        # Derived from voice_dir (rather than adding more fixture elements) so
         # every existing positional-unpacking of `providers` throughout this
         # file keeps working unchanged - still always under tmp_path, never
-        # the real project output/ directory.
+        # the real project output/ directory. metadata_dir/provenance_dir
+        # matter just as much as thumbnail_dir here: without them,
+        # MetadataAgent/the provenance manifest writer would otherwise fall
+        # back to their real DEFAULT_*_OUTPUT_DIR constants and write test
+        # artifacts into the actual project output/ directories.
         thumbnail_dir = os.path.join(os.path.dirname(voice_dir), "thumbnails")
+        metadata_dir = os.path.join(os.path.dirname(voice_dir), "metadata")
+        provenance_dir = os.path.join(os.path.dirname(voice_dir), "provenance")
         return run_pipeline(
             topic,
             overrides.get("search_provider", search_provider),
@@ -557,6 +563,8 @@ class TestPipelineWorkflow:
             video_dir,
             subtitle_dir,
             overrides.get("thumbnail_output_dir", thumbnail_dir),
+            overrides.get("metadata_output_dir", metadata_dir),
+            overrides.get("provenance_output_dir", provenance_dir),
         )
 
     @pytest.mark.asyncio

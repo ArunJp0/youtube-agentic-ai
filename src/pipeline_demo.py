@@ -34,6 +34,7 @@ from src.script_demo import print_script_result
 from src.thumbnail_demo import print_thumbnail_result
 from src.visual_qc_demo import print_qc_result
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR
+from src.services.provenance_collection import persist_provenance_if_completed
 from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.services.visual_media_service import DEFAULT_MEDIA_OUTPUT_DIR
 from src.services.voice_service import DEFAULT_OUTPUT_DIR
@@ -144,7 +145,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
             else:
                 print(f"{label}: done")
 
-    return PipelineState(
+    final_state = PipelineState(
         topic=accumulated.get("topic", topic),
         research_result=accumulated.get("research_result"),
         script_result=accumulated.get("script_result"),
@@ -161,6 +162,12 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
     )
+
+    provenance_path = persist_provenance_if_completed(final_state)
+    if provenance_path:
+        print(f"Provenance manifest: done ({provenance_path})")
+
+    return final_state
 
 
 def _print_final_summary(state: PipelineState) -> None:
