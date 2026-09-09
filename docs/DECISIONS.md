@@ -629,6 +629,38 @@ The centralized decision rule (`decide_publish_status`) established in the stand
 
 The implementation, tests, and one real end-to-end validation attempt were already complete on disk when a laptop power loss occurred during that first real run. Recovery consisted of: confirming every modified file still parsed as valid Python (`ast.parse`) and matched the expected `git diff --stat`, re-running the full pytest suite to reconfirm 1156/1156, and inspecting output-directory file timestamps to determine exactly how far the interrupted real run had gotten (through Visual Media only - no video/thumbnail/compliance artifacts existed from it) before launching one fresh real validation run. No code was rewritten and no test was re-derived - the crash affected only in-progress process state, never anything already written to disk.
 
+## YouTube Upload & Scheduling Agent built standalone-first, mirroring every prior integration milestone's pattern
+
+Consistent with Visual QC, Captions, BGM, Metadata, Thumbnail, and Compliance all being built and real-validated as standalone components before any pipeline wiring was considered, the Upload/Scheduling Agent was built the same way: `src/youtube_upload_demo.py` is a separate CLI entry point, and `src/workflows/pipeline_graph.py` was not touched. This keeps the already-validated 11-stage content-generation graph unchanged while the publishing side is developed and real-tested in isolation - integration remains a deliberately separate, later decision, not assumed here.
+
+## YouTube access follows the existing provider-abstraction pattern - a YouTubeClient ABC, not a direct googleapiclient dependency
+
+Every external service in this project (search, LLM, voice, media, transcription, music catalog) sits behind a small abstract interface with a real and a mock implementation, so agents/services never depend on a concrete vendor SDK directly. YouTube access follows the same shape: `YouTubeClient` (`src/tools/youtube_client.py`) declares `get_authenticated_channel`/`insert_video`/`set_thumbnail`, with `GoogleYouTubeClient` (real, `googleapiclient`-backed, dependency-injectable `youtube_service` for testability) and `MockYouTubeClient` (in-memory, records calls) as the two implementations. `YouTubeUploadAgent` depends only on the interface.
+
+## OAuth credentials: stored-token-first, refresh-before-reauth, secrets/ only, never logged
+
+`src/tools/youtube_oauth.py`'s `get_credentials` tries, in order: a valid stored token, then a refresh via the stored refresh token if the access token expired, and only falls back to the interactive browser consent flow (`InstalledAppFlow.run_local_server`) if neither works - so a validated token is reused indefinitely across real runs without re-prompting the user. The token is persisted only under the Git-ignored `secrets/` directory (`secrets/youtube_token.json`), written atomically (temp file + `os.replace`, mirroring every other atomic store in this project). Neither the client secret nor the token is ever printed or logged anywhere in the implementation - a deliberate, verified constraint, not an incidental omission.
+
+## The Compliance PASS gate is checked on the typed field directly, never via string/log parsing
+
+`YouTubeUploadAgent.publish()` gates on `artifacts.compliance_result is not None and artifacts.compliance_result.publish_decision == "PASS"` - a direct comparison against the same typed `PublishDecision` enum `compliance_rules.decide_publish_status` already produces, never a parsed terminal message or a human-readable summary string. A missing `ComplianceResult` is treated identically to `REVIEW`/`BLOCK` (upload refused) rather than as a special "unknown, allow it" case. This makes the gate impossible to accidentally satisfy with anything other than a genuine `PASS` object, and keeps the check trivially unit-testable without needing to construct or parse any log output.
+
+## Idempotency mirrors the existing atomic-write-per-run_id store pattern, not a database
+
+`PublishingRecordStore` (`src/services/publishing_record_store.py`) follows the exact same shape as `ProvenanceManifestStore`/`ComplianceRecordStore`: one atomically-written JSON file per `run_id` under `output/publishing/`. `YouTubeUploadAgent.publish()` checks for an existing record before uploading (unless `force=True`) and returns early - reporting the *same* status the original upload would have reported (via a shared `_derive_status` helper), not a hardcoded generic value, so a rerun of an already-scheduled or partially-failed run is never misreported as a fresh, fully-completed upload.
+
+## Scheduling validation and UTC normalization are centralized in one module, never duplicated
+
+`src/services/youtube_upload_validation.py`'s `validate_scheduling` is the single place that enforces YouTube's real API requirement (`privacyStatus=private` while `status.publishAt` is set) plus this project's own safety rules (reject a naive datetime - never silently assume a timezone - and reject a past timestamp). `format_publish_at` is the single RFC3339-UTC formatter, reused identically for the real API request body, the persisted `PublishingRecord.scheduled_publish_at`, and the CLI's `--schedule` dry-run preview - so the value actually sent to YouTube, the value persisted to disk, and the value shown to a human before upload can never drift apart or be computed three different ways.
+
+## The first real upload was deliberately private-only, and no code path can widen it silently
+
+The MVP's first real validation of the whole publishing chain (OAuth → channel verification → compliance gate → resumable upload → thumbnail set → idempotency record) was performed with `privacyStatus=private` as a hard requirement of that validation step, not merely the default - `--execute`'s `--privacy` flag defaults to `private` but must be passed explicitly to choose anything else, and no part of `YouTubeUploadAgent`/`GoogleYouTubeClient` ever changes an already-uploaded video's privacy status after the fact.
+
+## A pre-existing ComplianceResult-persistence gap was worked around honestly for the first real upload, then properly closed later
+
+At the time of this milestone, `ComplianceResult` had never been persisted to disk anywhere in the project (a pre-existing gap, not introduced here) - `ComplianceRecordStore`'s write side existed but nothing called it yet. Rather than fabricating a compliance result or weakening the upload gate to proceed without one, the exact real, already-produced `PASS` result from a genuine prior real pipeline run was recorded to disk verbatim (every field copied from that run's actual output) so the gate could be checked honestly against real data. This was treated as a stopgap, not a fix: the underlying gap (compliance results never persisted automatically) was properly closed later, during the Compliance Remediation checkpoint, which wired `ComplianceRecordStore.write()` directly into `compliance_node` for every PASS/REVIEW/BLOCK decision going forward.
+
 ## Known limitations
 
 - The BGM catalog is a manually curated local library (`assets/bgm/`) - there is no automatic licensed-music-provider integration yet. Populating it is a manual, one-time-per-track MVP step; the final production goal remains zero human intervention, with automated/licensed catalog sourcing deferred to a later milestone.
@@ -645,3 +677,8 @@ The implementation, tests, and one real end-to-end validation attempt were alrea
 - Whisper transcription accuracy depends on the TTS narration's clarity; it has not been validated against noisy or multi-speaker audio, which this pipeline does not produce.
 - The default `base` Whisper model occasionally produces minor punctuation/spacing artifacts and occasional single-word caption segments - both cosmetic, not correctness issues for caption sync or meaning, and not being tuned further at this stage.
 - Stock footage semantic relevance can vary run-to-run with live Pexels results; the visual pipeline is considered feature-complete/frozen for the MVP and is not planned for further optimization without a new, recurring, concrete problem.
+- The YouTube Upload & Scheduling Agent is standalone only - there is no automated hand-off from a completed pipeline run to an upload/scheduling action; a human (or a future orchestration layer) must still invoke `src/youtube_upload_demo.py` separately.
+- Metadata artifact discovery for the Upload Agent is best-effort (matched by recorded `topic`, most-recent-first), not an exact run-id link, since `MetadataAgent`'s JSON filename is not run-scoped the way provenance/compliance/publishing records already are - a pre-existing gap this milestone did not change.
+- Real scheduling has only been dry-run-previewed (local→UTC conversion, validation outcome, exact CLI command) - no real future `publishAt` has actually been accepted by the live YouTube API yet in this project.
+- The OAuth project backing real uploads is very likely unverified (a standard state for a personal/MVP Google Cloud project), which may force uploads private regardless of the requested privacy status - a non-issue for this MVP since private was already the deliberate target, but worth knowing before ever requesting `public`/`unlisted`.
+- `videos.insert` costs ~1600 quota units against a default 10,000-units/day project quota (~6 uploads/day) - a real constraint on how many real end-to-end validation runs can reasonably be performed per day.

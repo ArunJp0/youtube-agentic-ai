@@ -53,3 +53,7 @@ CLAUDE.local.md
 
 # Local BGM assets
 assets/bgm/tracks/
+
+# Secrets JSON
+secrets/
+token*.json

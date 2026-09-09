@@ -85,7 +85,7 @@ All stages run together as one LangGraph pipeline (`python -m src.pipeline_demo 
 
 Downloaded stock media and generated narration audio are treated as temporary working assets for the MVP (safe to clean up once consumed downstream); final videos should be retained per a future retention policy. No automated cleanup/retention is implemented yet.
 
-YouTube upload, scheduling, and automated cleanup/retention are not implemented yet. The next planned milestone is a standalone YouTube Upload & Scheduling Agent, which must only publish when the current run's Compliance decision is `PASS`.
+A standalone YouTube Upload & Scheduling Agent has been implemented and real-validated (real OAuth authentication, real channel verification, a real private upload with its thumbnail applied, idempotent publishing records, and validated - though not yet real-executed - scheduling support), but it is **not wired into the main content-generation pipeline above**: it is a separate CLI (`src/youtube_upload_demo.py`) that discovers a completed run's own artifacts (final video, metadata, thumbnail, provenance manifest, and persisted compliance record) and publishes only when that run's `compliance_result.publish_decision == "PASS"` - a `REVIEW` or `BLOCK` decision always refuses to upload, with no bypass. A bounded Compliance Remediation loop (REVIEW → targeted script correction → fresh re-evaluation, capped at 2 attempts) was also added directly to the main pipeline's Compliance stage. Automated cleanup/retention is not implemented yet. The next planned milestone is a final publishing-flow audit/integration verification pass - see `docs/PROGRESS.md`.
 
 ## Project Structure
 
