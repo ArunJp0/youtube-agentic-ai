@@ -62,6 +62,20 @@ class Settings:
     # Logging
     log_level: str = field(default_factory=lambda: os.environ.get("LOG_LEVEL", "INFO"))
 
+    # YouTube Data API v3 OAuth (installed-app/Desktop flow) - upload requires
+    # user-authorized OAuth credentials, never a plain API key, so this is
+    # separate from the unused youtube_api_key placeholder below.
+    youtube_oauth_client_secret_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "YOUTUBE_OAUTH_CLIENT_SECRET_PATH", os.path.join("secrets", "youtube_client_secret.json")
+        )
+    )
+    youtube_oauth_token_path: str = field(
+        default_factory=lambda: os.environ.get(
+            "YOUTUBE_OAUTH_TOKEN_PATH", os.path.join("secrets", "youtube_token.json")
+        )
+    )
+
     # External API keys (placeholders, not used in MVP)
     youtube_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("YOUTUBE_API_KEY"))
     elevenlabs_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("ELEVENLABS_API_KEY"))

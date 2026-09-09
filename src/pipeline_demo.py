@@ -163,6 +163,9 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         metadata_result=accumulated.get("metadata_result"),
         thumbnail_result=accumulated.get("thumbnail_result"),
         compliance_result=accumulated.get("compliance_result"),
+        remediation_attempt=accumulated.get("remediation_attempt", 0),
+        remediation_parent_run_id=accumulated.get("remediation_parent_run_id"),
+        remediation_history=accumulated.get("remediation_history", []),
         status=accumulated.get("status", "unknown"),
         error=accumulated.get("error"),
     )
@@ -309,6 +312,12 @@ def _print_final_summary(state: PipelineState) -> None:
             print(f"Compliance error: {compliance.error}")
     else:
         print("Compliance success: False")
+
+    if state.remediation_attempt > 0:
+        print(f"Compliance Remediation: {state.remediation_attempt} attempt(s), parent run: {state.remediation_parent_run_id}")
+        for record in state.remediation_history:
+            corrected = ", ".join(c.section_heading for c in record.corrections) or "(none)"
+            print(f"   Attempt {record.attempt_number}: corrected [{corrected}] -> {record.resulting_decision}")
 
 
 async def main() -> None:

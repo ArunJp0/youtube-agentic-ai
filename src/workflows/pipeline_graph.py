@@ -13,8 +13,9 @@
 # each stage's output directly into the next stage's input.
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
 
 from langgraph.graph import END, StateGraph
 
@@ -29,6 +30,12 @@ from src.models.compliance import ComplianceResult
 from src.models.media import VisualResult
 from src.models.metadata import MetadataResult
 from src.models.music import AudioMixResult
+from src.models.remediation import (
+    DEFAULT_MAX_REMEDIATION_ATTEMPTS,
+    LocalizedFinding,
+    RemediationAttemptRecord,
+    ScriptCorrection,
+)
 from src.models.research import ResearchResult
 from src.models.script import ScriptResult
 from src.models.thumbnail import ThumbnailResult
@@ -38,8 +45,11 @@ from src.models.visual_qc import VisualQCResult
 from src.models.voice import VoiceResult
 from src.services.audio_mixing_service import AudioMixingService, AudioMixingServiceError
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR, CaptionService, CaptionServiceError
+from src.services.compliance_record_store import DEFAULT_COMPLIANCE_RECORD_DIR, ComplianceRecordStore
+from src.services.finding_localizer import has_grounding_evidence, localize_findings
 from src.services.provenance_collection import persist_provenance_if_completed
 from src.services.provenance_store import DEFAULT_PROVENANCE_OUTPUT_DIR, ProvenanceManifestStore, ProvenanceStoreError
+from src.services.script_context_reconstruction import original_base_name
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
     VideoAssemblyService,
@@ -119,11 +129,27 @@ class PipelineState:
     # separate top-level PASS/REVIEW/BLOCK fields, consistent with every
     # other stage's result. A future Upload Agent reads this directly.
     compliance_result: Optional[ComplianceResult] = None
+    # Compliance Remediation state (see script_revision_node/
+    # route_after_compliance below). remediation_attempt counts corrected
+    # candidates actually produced so far (0 = the original, never-
+    # remediated evaluation). remediation_parent_run_id is set once, on the
+    # first remediation attempt, to the ORIGINAL run's own run_id - every
+    # subsequent attempt's PersistedComplianceRecord links back to that
+    # same parent, never to the immediately-prior attempt. remediation_history
+    # is this run's full audit trail (typed, not just log lines) - never
+    # cleared, appended to only.
+    remediation_attempt: int = 0
+    remediation_parent_run_id: Optional[str] = None
+    remediation_history: List[RemediationAttemptRecord] = field(default_factory=list)
     # pending -> researching -> researched -> scripted -> voiced ->
     # visualized -> qc_passed -> assembled -> captioned -> mixed ->
-    # metadata_generated -> thumbnail_generated -> completed (Compliance
-    # PASS) -> review_required (Compliance REVIEW) -> blocked (Compliance
-    # BLOCK) -> failed (a technical failure at any stage)
+    # metadata_generated -> thumbnail_generated -> revising (mid-
+    # remediation, transient) -> completed (Compliance PASS) ->
+    # review_required (Compliance REVIEW, no actionable findings or
+    # remediation disabled) -> review_exhausted (Compliance REVIEW,
+    # actionable findings existed but max_remediation_attempts was used up)
+    # -> blocked (Compliance BLOCK, never remediated) -> failed (a
+    # technical failure at any stage)
     status: str = "pending"
     error: Optional[str] = None
 
@@ -145,6 +171,8 @@ def build_pipeline_graph(
     thumbnail_output_dir: str = DEFAULT_THUMBNAIL_OUTPUT_DIR,
     metadata_output_dir: str = DEFAULT_METADATA_OUTPUT_DIR,
     provenance_output_dir: str = DEFAULT_PROVENANCE_OUTPUT_DIR,
+    compliance_output_dir: str = DEFAULT_COMPLIANCE_RECORD_DIR,
+    max_remediation_attempts: int = DEFAULT_MAX_REMEDIATION_ATTEMPTS,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
@@ -197,9 +225,13 @@ def build_pipeline_graph(
     re-synthesized, re-downloaded, or re-assembled.
 
     Graph structure:
-        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm ─(ok)─→ metadata ─(ok)─→ thumbnail ─(ok)─→ compliance → END
+        START → research ─(ok)─→ script ─(ok)─→ voice ─(ok)─→ media ─(ok)─→ visual_qc ─(ok)─→ video_assembly ─(ok)─→ captions ─(ok)─→ bgm ─(ok)─→ metadata ─(ok)─→ thumbnail ─(ok)─→ compliance ─(PASS/BLOCK)─→ END
                     │                  │               │              │                │                  │                  │              │                  │                  │
                     └──────(error)─────┴──────(error)───┴───(error)────┴────(error)─────┴──────(error)─────┴──────(error)─────┴──────(error)──┴──────(error)──────┴──────(error)────┴──────(error)──→ END
+
+        compliance ─(REVIEW, actionable finding(s), attempts remain)─→ script_revision ─(corrected)─→ voice (loop)
+        compliance ─(REVIEW, no actionable finding, or attempts exhausted)─→ END
+        script_revision ─(correction failed)─→ END
 
     Args:
         search_provider: SearchProvider implementation for the Research Agent
@@ -230,6 +262,14 @@ def build_pipeline_graph(
         provenance_output_dir: Directory the provenance manifest is written into
             (by ``thumbnail_node``, on its own success) and read from (by
             ``compliance_node``)
+        compliance_output_dir: Directory ComplianceRecordStore persists a
+            durable record into for every PASS/REVIEW/BLOCK decision
+            (written by ``compliance_node``, for every attempt)
+        max_remediation_attempts: Bounded retry limit for Compliance
+            Remediation (see ``script_revision_node``/
+            ``route_after_compliance``) - 0 disables remediation entirely
+            (a REVIEW always stops immediately, exactly as before this
+            milestone)
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -285,6 +325,7 @@ def build_pipeline_graph(
     # call per run, via the injected ComplianceReviewer) - no new provider/
     # API key path and no duplicated catalog-reading logic.
     compliance_agent = ComplianceAgent(music_catalog_provider=music_catalog_provider, llm_provider=llm_provider)
+    compliance_record_store = ComplianceRecordStore(compliance_output_dir)
 
     async def research_node(state: PipelineState) -> dict:
         try:
@@ -557,7 +598,17 @@ def build_pipeline_graph(
             # the real BGM-mixed video's own probed duration - the LLM
             # supplies only chapter labels, never timestamps.
             duration = state.audio_mix_result.output_duration_seconds or state.audio_mix_result.source_duration_seconds
-            result = metadata_agent.generate_metadata(state.topic, state.script_result, duration_seconds=duration)
+            # video_slug pins the metadata JSON's filename to THIS exact
+            # run's own video (never a content-derived slug that could
+            # collide with another run/remediation attempt whose LLM
+            # happened to generate a similar title - see thumbnail_node's
+            # identical fix for the corruption this previously caused).
+            video_slug = (
+                original_base_name(state.audio_mix_result.output_path) if state.audio_mix_result.output_path else None
+            )
+            result = metadata_agent.generate_metadata(
+                state.topic, state.script_result, duration_seconds=duration, video_slug=video_slug
+            )
         except MetadataAgentError as e:
             return {"metadata_result": None, "status": "failed", "error": f"Metadata generation failed: {e}"}
         except Exception as e:
@@ -592,11 +643,23 @@ def build_pipeline_graph(
             # thumbnail planning), and the real MetadataResult already
             # produced by the metadata stage supplies extra title/SEO
             # context - Metadata is never re-run either.
+            # video_slug pins the thumbnail's filename to THIS exact run's
+            # own video (never a hook-text-derived slug, which two
+            # different runs/remediation attempts can independently
+            # generate identically and silently overwrite each other's
+            # file on disk - a real corruption observed and root-caused in
+            # an earlier milestone).
+            video_slug = (
+                original_base_name(state.audio_mix_result.output_path)
+                if state.audio_mix_result and state.audio_mix_result.output_path
+                else None
+            )
             result = await thumbnail_agent.generate_thumbnail(
                 state.topic,
                 state.script_result,
                 metadata_title=state.metadata_result.title,
                 seo_summary=state.metadata_result.seo_summary,
+                video_slug=video_slug,
             )
         except ThumbnailAgentError as e:
             return {"thumbnail_result": None, "status": "failed", "error": f"Thumbnail generation failed: {e}"}
@@ -678,14 +741,53 @@ def build_pipeline_graph(
                 "error": f"Unexpected compliance error: {e}",
             }
 
+        # Persist a durable compliance record for THIS exact candidate -
+        # for every decision (PASS/REVIEW/BLOCK), not just PASS. Best-
+        # effort/non-fatal (never retroactively fails an already-completed
+        # review), exactly like provenance persistence above. run_id is the
+        # same identifier ProvenanceManifestStore/PublishingRecordStore
+        # already key by (original_base_name of this exact video), so a
+        # later Upload Agent's compliance-gate lookup for this candidate
+        # always finds the record this exact evaluation just wrote.
+        run_id = original_base_name(video_path) if video_path else None
+        if run_id:
+            try:
+                compliance_record_store.write(
+                    run_id,
+                    result,
+                    parent_run_id=state.remediation_parent_run_id,
+                    attempt_number=state.remediation_attempt,
+                    evaluated_at=datetime.now(timezone.utc).isoformat(),
+                )
+            except OSError:
+                pass
+
+        # Backfill the outcome of whichever remediation attempt led to THIS
+        # evaluation (if any) - the attempt record itself was created by
+        # script_revision_node before this candidate existed, and only now
+        # do we know what it actually produced.
+        remediation_history = state.remediation_history
+        if remediation_history and remediation_history[-1].resulting_decision is None:
+            updated_last = remediation_history[-1].model_copy(
+                update={
+                    "resulting_run_id": run_id,
+                    "resulting_decision": result.publish_decision,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            remediation_history = remediation_history[:-1] + [updated_last]
+
         if result.publish_decision == "BLOCK":
             # A known deterministic compliance blocker was found - never
-            # treated as PASS. Every earlier artifact (final video,
-            # metadata, thumbnail) is preserved untouched; only the
-            # pipeline's own status/error reflect the blocked outcome.
+            # treated as PASS, and NEVER remediated (a blocker is outside
+            # what a script rewrite can fix - see route_after_compliance).
+            # Every earlier artifact (final video, metadata, thumbnail) is
+            # preserved untouched; only the pipeline's own status/error
+            # reflect the blocked outcome.
             blocker_summary = "; ".join(result.blockers) or "see compliance_result for details"
             return {
                 "compliance_result": result,
+                "remediation_history": remediation_history,
                 "status": "blocked",
                 "error": f"Compliance blocked publishing: {blocker_summary}",
             }
@@ -693,14 +795,144 @@ def build_pipeline_graph(
         if result.publish_decision == "REVIEW":
             # Uncertainty or a non-blocking concern requiring human/another
             # system review - never silently treated as approved.
+            # route_after_compliance (below) independently makes the exact
+            # same actionability/attempt-budget check to decide whether to
+            # loop back into script_revision; this only determines the
+            # STATUS this evaluation reports if the pipeline stops here
+            # (either because it's about to loop - in which case a LATER
+            # compliance_node call overwrites this - or because it's truly
+            # terminal).
+            actionable, _ = _remediation_eligibility(result, state.script_result)
+            attempts_exhausted = state.remediation_attempt >= max_remediation_attempts
+            final_status = "review_exhausted" if (actionable and attempts_exhausted) else "review_required"
             warning_summary = "; ".join(result.warnings) or "see compliance_result for details"
             return {
                 "compliance_result": result,
-                "status": "review_required",
-                "error": f"Compliance requires human review: {warning_summary}",
+                "remediation_history": remediation_history,
+                "status": final_status,
+                "error": f"Compliance requires review ({final_status}): {warning_summary}",
             }
 
-        return {"compliance_result": result, "status": "completed", "error": None}
+        return {
+            "compliance_result": result,
+            "remediation_history": remediation_history,
+            "status": "completed",
+            "error": None,
+        }
+
+    async def script_revision_node(state: PipelineState) -> dict:
+        """Targeted Compliance Remediation: revise ONLY the ScriptSection(s)
+        route_after_compliance already confirmed are confidently localized
+        and actionable, grounded in the original ResearchResult (or one
+        bounded, single-claim research refresh when that evidence is
+        insufficient), then loop back into Voice so every downstream
+        artifact this correction invalidates gets a genuinely fresh
+        candidate - never a patched/spliced one.
+
+        Never fabricates a correction: if the LLM revision call itself
+        fails, this attempt stops here (routes to END via
+        route_after_script_revision) with the prior REVIEW result/status
+        left exactly as compliance_node reported it - never retried
+        silently, never treated as fixed.
+        """
+        result = state.compliance_result
+        findings = result.semantic_review.findings if result and result.semantic_review else []
+        localized = localize_findings(findings, state.script_result)
+        actionable = [f for f in localized if f.actionable]
+
+        current_run_id = (
+            original_base_name(state.audio_mix_result.output_path)
+            if state.audio_mix_result and state.audio_mix_result.output_path
+            else None
+        )
+        # parent_run_id always points at the ORIGINAL (attempt 0) run,
+        # never at the immediately-prior attempt - set once, on the first
+        # remediation attempt, and carried forward unchanged after that.
+        parent_run_id = state.remediation_parent_run_id or current_run_id
+        attempt_number = state.remediation_attempt + 1
+        started_at = datetime.now(timezone.utc).isoformat()
+
+        revised_script = state.script_result
+        corrections: List[ScriptCorrection] = []
+        for localized_finding in actionable:
+            section = revised_script.sections[localized_finding.section_index]
+            refreshed_fact = None
+            used_refresh = False
+            refresh_reason = None
+            if not has_grounding_evidence(state.research_result, localized_finding.finding_description):
+                # Existing research doesn't obviously cover this claim -
+                # one bounded, single-claim refresh (never a full
+                # re-research) before attempting the correction.
+                refreshed_fact = await research_agent.research_focused_claim(
+                    state.topic, localized_finding.finding_description
+                )
+                used_refresh = True
+                if refreshed_fact is None:
+                    refresh_reason = "Bounded research refresh found no usable evidence for this claim"
+
+            try:
+                revised_script = script_agent.revise_section(
+                    revised_script,
+                    state.research_result,
+                    localized_finding.section_index,
+                    localized_finding.finding_description,
+                    refreshed_fact=refreshed_fact,
+                )
+            except ScriptAgentError as e:
+                # Cannot safely correct this finding - stop remediation for
+                # this attempt cleanly rather than fabricate a fix. The
+                # prior REVIEW compliance_result/status are left untouched,
+                # so the pipeline still reports a genuine, real outcome.
+                return {
+                    "remediation_attempt": attempt_number,
+                    "remediation_parent_run_id": parent_run_id,
+                    "error": f"Compliance remediation attempt {attempt_number} could not revise "
+                    f"section '{section.heading}': {e}",
+                }
+
+            corrections.append(
+                ScriptCorrection(
+                    section_index=localized_finding.section_index,
+                    section_heading=section.heading,
+                    original_narration=section.narration,
+                    revised_narration=revised_script.sections[localized_finding.section_index].narration,
+                    finding_description=localized_finding.finding_description,
+                    used_research_refresh=used_refresh,
+                    research_refresh_reason=refresh_reason,
+                )
+            )
+
+        record = RemediationAttemptRecord(
+            attempt_number=attempt_number,
+            parent_run_id=parent_run_id,
+            triggering_decision="REVIEW",
+            findings_considered=len(findings),
+            findings_localized=len(actionable),
+            corrections=corrections,
+            started_at=started_at,
+        )
+
+        return {
+            "script_result": revised_script,
+            "remediation_attempt": attempt_number,
+            "remediation_parent_run_id": parent_run_id,
+            "remediation_history": state.remediation_history + [record],
+            "status": "revising",
+            "error": None,
+        }
+
+    def _remediation_eligibility(
+        result: Optional[ComplianceResult], script_result: Optional[ScriptResult]
+    ) -> Tuple[bool, List[LocalizedFinding]]:
+        """Whether ``result`` has at least one confidently-localized,
+        actionable semantic finding a script correction could address -
+        the single shared check compliance_node/route_after_compliance
+        both use, so "is this remediable" is decided in exactly one place."""
+        if result is None or result.publish_decision != "REVIEW" or script_result is None:
+            return False, []
+        findings = result.semantic_review.findings if result.semantic_review else []
+        localized = localize_findings(findings, script_result)
+        return any(f.actionable for f in localized), localized
 
     def route_after_research(state: PipelineState) -> str:
         """Only proceed to scripting if research actually produced a result."""
@@ -760,6 +992,26 @@ def build_pipeline_graph(
         missing/failed thumbnail generation."""
         return "compliance" if state.thumbnail_result is not None and state.thumbnail_result.success else END
 
+    def route_after_compliance(state: PipelineState) -> str:
+        """PASS or BLOCK always end here - a BLOCK is never remediated
+        (see compliance_node). A REVIEW loops back into script_revision
+        only when at least one finding is confidently localized/actionable
+        AND the attempt budget isn't exhausted yet; otherwise it ends here
+        too (compliance_node has already set the correct terminal status -
+        review_required or review_exhausted)."""
+        if state.remediation_attempt >= max_remediation_attempts:
+            return END
+        actionable, _ = _remediation_eligibility(state.compliance_result, state.script_result)
+        return "script_revision" if actionable else END
+
+    def route_after_script_revision(state: PipelineState) -> str:
+        """Only loop back into Voice if script_revision_node actually
+        produced a corrected candidate (status == "revising") - a revision
+        failure routes straight to END, preserving the prior genuine
+        REVIEW result/status untouched rather than looping on a fabricated
+        or partial correction."""
+        return "voice" if state.status == "revising" else END
+
     graph = StateGraph(PipelineState)
     graph.add_node("research", research_node)
     graph.add_node("script", script_node)
@@ -772,6 +1024,7 @@ def build_pipeline_graph(
     graph.add_node("metadata", metadata_node)
     graph.add_node("thumbnail", thumbnail_node)
     graph.add_node("compliance", compliance_node)
+    graph.add_node("script_revision", script_revision_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
@@ -788,7 +1041,15 @@ def build_pipeline_graph(
     graph.add_conditional_edges("bgm", route_after_bgm, {"metadata": "metadata", END: END})
     graph.add_conditional_edges("metadata", route_after_metadata, {"thumbnail": "thumbnail", END: END})
     graph.add_conditional_edges("thumbnail", route_after_thumbnail, {"compliance": "compliance", END: END})
-    graph.set_finish_point("compliance")
+    # Bounded cycle: compliance -> script_revision -> voice -> ... ->
+    # compliance again, at most max_remediation_attempts times (see
+    # route_after_compliance/route_after_script_revision) - reuses every
+    # existing downstream node unchanged, since a corrected script_result
+    # flowing back through voice_node/media_node/etc. is transparent to them.
+    graph.add_conditional_edges(
+        "compliance", route_after_compliance, {"script_revision": "script_revision", END: END}
+    )
+    graph.add_conditional_edges("script_revision", route_after_script_revision, {"voice": "voice", END: END})
 
     return graph
 
@@ -811,6 +1072,8 @@ async def run_pipeline(
     thumbnail_output_dir: str = DEFAULT_THUMBNAIL_OUTPUT_DIR,
     metadata_output_dir: str = DEFAULT_METADATA_OUTPUT_DIR,
     provenance_output_dir: str = DEFAULT_PROVENANCE_OUTPUT_DIR,
+    compliance_output_dir: str = DEFAULT_COMPLIANCE_RECORD_DIR,
+    max_remediation_attempts: int = DEFAULT_MAX_REMEDIATION_ATTEMPTS,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
@@ -882,6 +1145,10 @@ async def run_pipeline(
         metadata_output_dir: Directory the Metadata Agent writes its JSON artifact into
         provenance_output_dir: Directory the provenance manifest is written into
             (by thumbnail_node) and read from (by compliance_node)
+        compliance_output_dir: Directory ComplianceRecordStore persists a
+            durable record into for every PASS/REVIEW/BLOCK decision
+        max_remediation_attempts: Bounded retry limit for Compliance
+            Remediation - 0 disables remediation entirely
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -903,6 +1170,8 @@ async def run_pipeline(
         thumbnail_output_dir,
         metadata_output_dir,
         provenance_output_dir,
+        compliance_output_dir,
+        max_remediation_attempts,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
@@ -923,6 +1192,9 @@ async def run_pipeline(
         metadata_result=raw_result.get("metadata_result"),
         thumbnail_result=raw_result.get("thumbnail_result"),
         compliance_result=raw_result.get("compliance_result"),
+        remediation_attempt=raw_result.get("remediation_attempt", 0),
+        remediation_parent_run_id=raw_result.get("remediation_parent_run_id"),
+        remediation_history=raw_result.get("remediation_history", []),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )

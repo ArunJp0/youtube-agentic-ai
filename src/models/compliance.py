@@ -48,6 +48,15 @@ class SemanticReviewFinding(BaseModel):
     category: str = Field(min_length=1, description="e.g. 'title_content_mismatch', 'unsupported_claim'")
     description: str = Field(min_length=1)
     severity: str = Field(default="medium", description="'low', 'medium', or 'high'")
+    related_section_heading: Optional[str] = Field(
+        default=None,
+        description=(
+            "The exact ScriptSection.heading this finding concerns, if any (verbatim, as supplied in the "
+            "review prompt) - None if the finding concerns the title/thumbnail/overall content rather than "
+            "one specific section. Used only for remediation's finding-to-section localization; never "
+            "affects the PASS/REVIEW/BLOCK decision itself."
+        ),
+    )
 
 
 class SemanticReviewResult(BaseModel):

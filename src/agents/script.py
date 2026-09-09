@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import difflib
-from typing import List
+from typing import List, Optional
 
 from src.llm.provider import LLMProvider
-from src.models.research import ResearchResult
+from src.models.research import ResearchFact, ResearchResult
 from src.models.script import ScriptResult, ScriptSection
 
 DEFAULT_WORDS_PER_MINUTE = 150.0
@@ -323,6 +323,103 @@ class ScriptAgent:
             "comment. Do not state any research facts, only the call to action."
         )
         return self.llm_provider.generate_text(prompt)
+
+    # ---- targeted remediation revision ---------------------------------------
+
+    def revise_section(
+        self,
+        script: ScriptResult,
+        research: ResearchResult,
+        section_index: int,
+        finding_description: str,
+        refreshed_fact: Optional[ResearchFact] = None,
+    ) -> ScriptResult:
+        """Return a corrected ScriptResult for Compliance Remediation, with
+        ONLY ``sections[section_index]``'s narration (and its own/the
+        script's total ``estimated_duration_seconds``) changed - every
+        other field (hook, introduction, other sections, conclusion,
+        call_to_action, sources) is byte-identical to ``script``.
+
+        Grounded strictly in ``research`` (plus ``refreshed_fact``, when a
+        bounded research refresh was needed) - never a blind rewrite of the
+        whole script, and never a correction unsupported by the evidence
+        it's given.
+
+        Args:
+            script: The ScriptResult a Compliance REVIEW flagged
+            research: The original ResearchResult this script was grounded in
+            section_index: Index into ``script.sections`` to revise
+            finding_description: The specific compliance finding to address
+            refreshed_fact: Optional additional evidence from a bounded
+                research refresh (see ResearchAgent.research_focused_claim),
+                when the original research didn't already cover this claim
+
+        Returns:
+            A new ScriptResult with only the targeted section revised
+
+        Raises:
+            ScriptAgentError: If inputs are invalid, the LLM call fails, or
+                the correction comes back empty - never a fabricated fix.
+        """
+        if script is None or research is None:
+            raise ScriptAgentError("ScriptResult and ResearchResult are both required")
+        if not (0 <= section_index < len(script.sections)):
+            raise ScriptAgentError(f"section_index {section_index} is out of range for this script")
+
+        context = self._build_context(research)
+        section = script.sections[section_index]
+        prompt = self._build_correction_prompt(section, finding_description, context, refreshed_fact)
+
+        try:
+            candidate = self._clean_line(self.llm_provider.generate_text(prompt), keep_multiline=True)
+        except Exception as e:
+            raise ScriptAgentError(f"Section revision LLM processing failed: {e}")
+
+        if not candidate:
+            raise ScriptAgentError("Section revision produced empty narration")
+
+        revised_section = section.model_copy(
+            update={"narration": candidate, "estimated_duration_seconds": self._estimate_duration(candidate)}
+        )
+        new_sections = list(script.sections)
+        new_sections[section_index] = revised_section
+
+        total_duration = (
+            self._estimate_duration(script.hook)
+            + self._estimate_duration(script.introduction)
+            + sum(s.estimated_duration_seconds for s in new_sections)
+            + self._estimate_duration(script.conclusion)
+            + self._estimate_duration(script.call_to_action)
+        )
+        return script.model_copy(
+            update={"sections": new_sections, "estimated_duration_seconds": round(total_duration, 1)}
+        )
+
+    @staticmethod
+    def _build_correction_prompt(
+        section: ScriptSection,
+        finding_description: str,
+        context: str,
+        refreshed_fact: Optional[ResearchFact],
+    ) -> str:
+        refreshed_note = (
+            f"\n\nAdditional verified evidence for this correction: {refreshed_fact.claim}"
+            if refreshed_fact is not None
+            else ""
+        )
+        return (
+            "The following section of a YouTube video script has a specific factual/consistency problem "
+            "that a compliance review identified and that MUST be corrected:\n\n"
+            f"Section heading: '{section.heading}'\n"
+            f"Current narration: {section.narration}\n\n"
+            f"Problem identified by compliance review: {finding_description}"
+            f"{refreshed_note}\n\n"
+            "Rewrite ONLY this section's narration (2-3 sentences, natural spoken YouTube narration, not "
+            "article style) so the problem above is fixed. Stay strictly grounded in the research below - "
+            "do not introduce any new claim the research doesn't support, and do not change what topic "
+            f"this section otherwise covers.\n\n{context}\n\n"
+            "Return ONLY the corrected narration text, nothing else."
+        )
 
     # ---- helpers -------------------------------------------------------------
 

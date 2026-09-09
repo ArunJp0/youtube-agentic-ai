@@ -5,6 +5,7 @@
 # Whisper/Gemini calls.
 from __future__ import annotations
 
+import glob
 import json
 import os
 
@@ -24,6 +25,9 @@ from src.models.thumbnail import ThumbnailResult
 from src.models.video import VideoAssemblyResult
 from src.models.visual_qc import RawAssetVerdict, VisualQCResult
 from src.models.voice import VoiceResult
+from src.services.compliance_record_store import ComplianceRecordStore
+from src.services.provenance_store import ProvenanceManifestStore
+from src.services.script_context_reconstruction import original_base_name
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.music_catalog_provider import MockMusicCatalogProvider, MusicCatalogProvider
@@ -278,6 +282,62 @@ class ConfigurableComplianceLLMProvider(LLMProvider):
             if self.compliance_error is not None:
                 raise self.compliance_error
             return _default_compliance_json(**(self.compliance_payload or {}))
+        return self._delegate.generate_text(prompt)
+
+
+# ScriptAgent.revise_section's correction prompt always contains this exact
+# phrase (see src/agents/script.py's _build_correction_prompt) - a unique
+# marker letting test doubles distinguish a remediation correction call
+# from every other prompt sharing the same LLMProvider.
+_REVISION_PROMPT_MARKER = "MUST be corrected"
+
+
+class RemediatingComplianceLLMProvider(LLMProvider):
+    """Delegates Research/Script/BGM/Metadata/Thumbnail prompts to
+    ResearchMockWithVariedSections unchanged, but drives Compliance
+    Remediation deterministically:
+
+    - ComplianceReviewer's prompt: returns a REVIEW-triggering finding
+      (with an exact ``related_section_heading``, so localization is
+      unambiguous) for the first ``reviews_before_pass`` calls, then a
+      clean PASS-triggering response after that - unless ``always_review``
+      is set, in which case every call returns the same REVIEW finding
+      (for exhaustion tests).
+    - script_revision_node's correction prompt: returns a distinct
+      corrected narration each time, recorded for inspection.
+    """
+
+    def __init__(
+        self,
+        related_section_heading: str,
+        reviews_before_pass: int = 1,
+        always_review: bool = False,
+    ) -> None:
+        self._delegate = ResearchMockWithVariedSections()
+        self.related_section_heading = related_section_heading
+        self.reviews_before_pass = reviews_before_pass
+        self.always_review = always_review
+        self.compliance_calls: list[str] = []
+        self.revision_calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        if _REVISION_PROMPT_MARKER in prompt:
+            self.revision_calls.append(prompt)
+            return f"A corrected, research-grounded statement (revision {len(self.revision_calls)})."
+        if _COMPLIANCE_PROMPT_MARKER in prompt:
+            self.compliance_calls.append(prompt)
+            call_index = len(self.compliance_calls)
+            if self.always_review or call_index <= self.reviews_before_pass:
+                findings = [
+                    {
+                        "category": "factual_consistency_error",
+                        "description": "This section states a claim more strongly than the research supports.",
+                        "severity": "medium",
+                        "related_section_heading": self.related_section_heading,
+                    }
+                ]
+                return _default_compliance_json(findings=findings, summary="Needs a targeted correction")
+            return _default_compliance_json()
         return self._delegate.generate_text(prompt)
 
 
@@ -595,6 +655,11 @@ class TestPipelineWorkflow:
         thumbnail_dir = os.path.join(os.path.dirname(voice_dir), "thumbnails")
         metadata_dir = os.path.join(os.path.dirname(voice_dir), "metadata")
         provenance_dir = os.path.join(os.path.dirname(voice_dir), "provenance")
+        # Under tmp_path just like every other dir above - without this,
+        # compliance_node's new persistence write would default to the
+        # real project's output/compliance/ directory and pollute it on
+        # every test run.
+        compliance_dir = os.path.join(os.path.dirname(voice_dir), "compliance")
         return run_pipeline(
             topic,
             overrides.get("search_provider", search_provider),
@@ -613,6 +678,8 @@ class TestPipelineWorkflow:
             overrides.get("thumbnail_output_dir", thumbnail_dir),
             overrides.get("metadata_output_dir", metadata_dir),
             overrides.get("provenance_output_dir", provenance_dir),
+            overrides.get("compliance_output_dir", compliance_dir),
+            overrides.get("max_remediation_attempts", 2),
         )
 
     @pytest.mark.asyncio
@@ -2263,3 +2330,317 @@ class TestCompliancePipelineIntegration:
 
         assert len(_STAGE_LABELS) == 11
         assert _STAGE_LABELS["compliance"] == "[11/11] Copyright / Compliance"
+
+
+# The heading ScriptAgent.generate_script always produces for the first
+# research key point under MockLLMProvider's fixed "key point" canned
+# response ("Dreams occur mainly during REM sleep cycles") - real,
+# deterministic, and short enough to never be truncated by ScriptSection's
+# heading[:60] slicing. Used as an exact, unambiguous
+# related_section_heading so remediation tests never depend on the
+# fallback keyword-overlap localizer's fuzziness.
+_REMEDIABLE_SECTION_HEADING = "Dreams occur mainly during REM sleep cycles"
+
+
+class TestComplianceRemediation:
+    """Tests for the bounded REVIEW -> targeted script correction -> fresh
+    Compliance re-evaluation loop (script_revision_node/
+    route_after_compliance in src/workflows/pipeline_graph.py). All mocked
+    - no real LLM/network/FFmpeg calls."""
+
+    @pytest.fixture
+    def providers(self, tmp_path):
+        return (
+            MockSearchProvider(),
+            ResearchMockWithVariedSections(),
+            MockVoiceProvider(),
+            ThumbnailCapableMediaProvider(),
+            FakeVideoAssembler(),
+            MockVisualRelevanceEvaluator(default_score=0.9),
+            MockTranscriptionProvider(),
+            _music_catalog_provider(tmp_path),
+            str(tmp_path / "audio"),
+            str(tmp_path / "media"),
+            str(tmp_path / "video"),
+            str(tmp_path / "subtitles"),
+        )
+
+    @staticmethod
+    async def _run(providers, topic="Why do humans dream?", max_remediation_attempts=2, **overrides):
+        (
+            search_provider, llm_provider, voice_provider, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        ) = providers
+        thumbnail_dir = os.path.join(os.path.dirname(voice_dir), "thumbnails")
+        metadata_dir = os.path.join(os.path.dirname(voice_dir), "metadata")
+        provenance_dir = os.path.join(os.path.dirname(voice_dir), "provenance")
+        compliance_dir = os.path.join(os.path.dirname(voice_dir), "compliance")
+        state = await run_pipeline(
+            topic,
+            overrides.get("search_provider", search_provider),
+            overrides.get("llm_provider", llm_provider),
+            overrides.get("voice_provider", voice_provider),
+            TEST_VOICE_NAME,
+            overrides.get("media_provider", media_provider),
+            overrides.get("assembler", assembler),
+            overrides.get("visual_relevance_evaluator", visual_relevance_evaluator),
+            overrides.get("transcription_provider", transcription_provider),
+            overrides.get("music_catalog_provider", music_catalog_provider),
+            voice_dir, media_dir, video_dir, subtitle_dir,
+            overrides.get("thumbnail_output_dir", thumbnail_dir),
+            overrides.get("metadata_output_dir", metadata_dir),
+            overrides.get("provenance_output_dir", provenance_dir),
+            overrides.get("compliance_output_dir", compliance_dir),
+            max_remediation_attempts,
+        )
+        return state, thumbnail_dir, metadata_dir, provenance_dir, compliance_dir, video_dir
+
+    # ---- A. REVIEW -> corrected candidate -> PASS ------------------------------
+
+    @pytest.mark.asyncio
+    async def test_review_with_actionable_finding_remediates_to_pass(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, *_ = await self._run(providers, llm_provider=provider)
+
+        assert state.status == "completed"
+        assert state.compliance_result.publish_decision == "PASS"
+        assert state.remediation_attempt == 1
+        assert len(provider.compliance_calls) == 2  # original REVIEW + 1 re-evaluation
+        assert len(provider.revision_calls) == 1  # exactly one targeted correction
+
+    @pytest.mark.asyncio
+    async def test_remediation_history_records_the_attempt(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, *_ = await self._run(providers, llm_provider=provider)
+
+        assert len(state.remediation_history) == 1
+        attempt = state.remediation_history[0]
+        assert attempt.attempt_number == 1
+        assert attempt.findings_considered == 1
+        assert attempt.findings_localized == 1
+        assert len(attempt.corrections) == 1
+        assert attempt.corrections[0].section_heading == _REMEDIABLE_SECTION_HEADING
+        assert attempt.resulting_decision == "PASS"
+        assert attempt.resulting_run_id is not None
+        assert attempt.parent_run_id is not None
+        assert attempt.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_only_targeted_section_narration_changed(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, *_ = await self._run(providers, llm_provider=provider)
+
+        correction = state.remediation_history[0].corrections[0]
+        assert correction.original_narration != correction.revised_narration
+        # Every other section's narration in the final ScriptResult is
+        # untouched (only the localized section was ever revised).
+        other_sections = [s for s in state.script_result.sections if s.heading != _REMEDIABLE_SECTION_HEADING]
+        assert all("distinct detail worth covering on its own" in s.narration for s in other_sections)
+
+    # ---- B. Bounded exhaustion --------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_review_exhaustion_at_max_two_attempts(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, always_review=True
+        )
+        state, *_ = await self._run(providers, llm_provider=provider, max_remediation_attempts=2)
+
+        assert state.status == "review_exhausted"
+        assert state.compliance_result.publish_decision == "REVIEW"
+        assert state.remediation_attempt == 2
+        assert len(state.remediation_history) == 2
+        assert len(provider.compliance_calls) == 3  # attempt0 + attempt1 + attempt2 evaluations
+        assert len(provider.revision_calls) == 2
+        assert state.remediation_history[-1].resulting_decision == "REVIEW"
+
+    @pytest.mark.asyncio
+    async def test_zero_max_attempts_disables_remediation_entirely(self, providers) -> None:
+        """max_remediation_attempts=0 means the budget is exhausted before
+        any attempt can be spent - script_revision_node never runs, but
+        since a genuinely actionable finding did exist, the terminal
+        status is review_exhausted (not review_required, which is reserved
+        for "nothing a script correction could have fixed anyway")."""
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, always_review=True
+        )
+        state, *_ = await self._run(providers, llm_provider=provider, max_remediation_attempts=0)
+
+        assert state.status == "review_exhausted"
+        assert state.remediation_attempt == 0
+        assert state.remediation_history == []
+        assert len(provider.compliance_calls) == 1
+        assert len(provider.revision_calls) == 0
+
+    # ---- C. BLOCK never remediated ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_block_stops_immediately_no_remediation(self, providers, tmp_path) -> None:
+        track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        catalog = DisappearingTrackMusicCatalogProvider(track)
+        state, *_ = await self._run(providers, music_catalog_provider=catalog)
+
+        assert state.status == "blocked"
+        assert state.compliance_result.publish_decision == "BLOCK"
+        assert state.remediation_attempt == 0
+        assert state.remediation_history == []
+
+    # ---- D. No actionable findings -> review_required, zero attempts spent -----
+
+    @pytest.mark.asyncio
+    async def test_no_actionable_findings_stops_as_review_required(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported by the script"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        state, *_ = await self._run(providers, llm_provider=provider)
+
+        assert state.status == "review_required"
+        assert state.remediation_attempt == 0
+        assert state.remediation_history == []
+
+    # ---- E. Compliance persistence for PASS / REVIEW / BLOCK -------------------
+
+    @pytest.mark.asyncio
+    async def test_persists_compliance_record_for_pass(self, providers) -> None:
+        state, *_rest, compliance_dir, _video_dir = await self._run(providers)
+
+        run_id = original_base_name(state.audio_mix_result.output_path)
+        record = ComplianceRecordStore(compliance_dir).read(run_id)
+        assert record is not None
+        assert record.publish_decision == "PASS"
+
+    @pytest.mark.asyncio
+    async def test_persists_compliance_record_for_review(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported by the script"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        state, *_rest, compliance_dir, _video_dir = await self._run(providers, llm_provider=provider)
+
+        run_id = original_base_name(state.audio_mix_result.output_path)
+        record = ComplianceRecordStore(compliance_dir).read(run_id)
+        assert record is not None
+        assert record.publish_decision == "REVIEW"
+
+    @pytest.mark.asyncio
+    async def test_persists_compliance_record_for_block(self, providers, tmp_path) -> None:
+        track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        catalog = DisappearingTrackMusicCatalogProvider(track)
+        state, *_rest, compliance_dir, _video_dir = await self._run(providers, music_catalog_provider=catalog)
+
+        run_id = original_base_name(state.audio_mix_result.output_path)
+        record = ComplianceRecordStore(compliance_dir).read(run_id)
+        assert record is not None
+        assert record.publish_decision == "BLOCK"
+
+    # ---- F. Envelope round-trip: parent_run_id / attempt_number / evaluated_at -
+
+    @pytest.mark.asyncio
+    async def test_envelope_round_trips_parent_attempt_and_timestamp(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, *_rest, compliance_dir, _video_dir = await self._run(providers, llm_provider=provider)
+
+        attempt = state.remediation_history[0]
+        store = ComplianceRecordStore(compliance_dir)
+
+        original_envelope = store.read_envelope(attempt.parent_run_id)
+        assert original_envelope.attempt_number == 0
+        assert original_envelope.parent_run_id is None
+        assert original_envelope.evaluated_at  # non-empty real timestamp
+        assert original_envelope.result.publish_decision == "REVIEW"
+
+        corrected_envelope = store.read_envelope(attempt.resulting_run_id)
+        assert corrected_envelope.attempt_number == 1
+        assert corrected_envelope.parent_run_id == attempt.parent_run_id
+        assert corrected_envelope.evaluated_at
+        assert corrected_envelope.result.publish_decision == "PASS"
+
+        # Two genuinely distinct candidates, never the same identity reused.
+        assert attempt.parent_run_id != attempt.resulting_run_id
+
+    # ---- G. Unique artifact identity / no collisions / old artifacts preserved -
+
+    @pytest.mark.asyncio
+    async def test_unique_video_filenames_across_attempts(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        _state, _thumb_dir, _meta_dir, _prov_dir, _comp_dir, video_dir = await self._run(
+            providers, llm_provider=provider
+        )
+
+        final_videos = glob.glob(os.path.join(video_dir, "*-captioned-bgm.mp4"))
+        assert len(final_videos) == 2  # original run's video + the corrected candidate's - neither overwritten
+
+    @pytest.mark.asyncio
+    async def test_no_metadata_or_thumbnail_collision_across_attempts(self, providers) -> None:
+        """Regression test for the video_slug wiring gap: before this
+        milestone, thumbnail_node/metadata_node never passed video_slug, so
+        two runs whose LLM-generated hook/title happened to match could
+        silently overwrite each other's file. RemediatingComplianceLLMProvider
+        reuses ResearchMockWithVariedSections's fixed metadata/thumbnail
+        payloads for BOTH attempts, so without the fix this test would see
+        only 1 file where 2 are expected."""
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        _state, thumbnail_dir, metadata_dir, _prov_dir, _comp_dir, _video_dir = await self._run(
+            providers, llm_provider=provider
+        )
+
+        assert len(glob.glob(os.path.join(thumbnail_dir, "*.jpg"))) == 2
+        assert len(glob.glob(os.path.join(metadata_dir, "*.json"))) == 2
+
+    @pytest.mark.asyncio
+    async def test_old_rejected_run_artifacts_remain_on_disk_untouched(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, _thumb_dir, _meta_dir, _prov_dir, compliance_dir, video_dir = await self._run(
+            providers, llm_provider=provider
+        )
+
+        attempt = state.remediation_history[0]
+        # The original (REVIEW, rejected) run's own video is still present
+        # and still a genuine, distinct file - never deleted/overwritten.
+        original_video = glob.glob(os.path.join(video_dir, f"{attempt.parent_run_id}*-captioned-bgm.mp4"))
+        assert len(original_video) == 1
+        assert os.path.exists(original_video[0])
+
+        # Its own compliance record still reports the real original REVIEW
+        # decision - never rewritten to PASS after the fact.
+        original_record = ComplianceRecordStore(compliance_dir).read(attempt.parent_run_id)
+        assert original_record.publish_decision == "REVIEW"
+
+    # ---- H. Full end-to-end: every final artifact shares the corrected run_id --
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_final_artifacts_share_corrected_run_id(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, _thumb_dir, _meta_dir, provenance_dir, compliance_dir, _video_dir = await self._run(
+            providers, llm_provider=provider
+        )
+
+        assert state.compliance_result.publish_decision == "PASS"
+        winning_run_id = original_base_name(state.audio_mix_result.output_path)
+
+        # Metadata JSON is named after this exact run (video_slug fix).
+        assert os.path.splitext(os.path.basename(state.metadata_result.output_path))[0] == winning_run_id
+        # Thumbnail is named after this exact run (video_slug fix).
+        assert os.path.splitext(os.path.basename(state.thumbnail_result.output_path))[0] == winning_run_id
+        # Provenance manifest belongs to this exact run.
+        manifest = ProvenanceManifestStore(provenance_dir).find_for_video(state.audio_mix_result.output_path)
+        assert manifest.run_id == winning_run_id
+        # Persisted compliance record belongs to this exact run and is PASS.
+        record = ComplianceRecordStore(compliance_dir).read(winning_run_id)
+        assert record.publish_decision == "PASS"
+        # It's also the winning candidate the remediation history points to.
+        assert state.remediation_history[0].resulting_run_id == winning_run_id

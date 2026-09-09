@@ -137,3 +137,103 @@ class TestResearchAgent:
         """Agent should have a reasonable string representation."""
         repr_str = repr(research_agent)
         assert "ResearchAgent" in repr_str
+
+
+class _EmptySearchProvider:
+    """Test double: search always returns no results."""
+
+    async def search(self, query: str, num_results: int = 5):
+        return []
+
+
+class _ExplodingSearchProvider:
+    """Test double: search always raises, simulating a provider outage."""
+
+    async def search(self, query: str, num_results: int = 5):
+        raise RuntimeError("simulated search outage")
+
+
+class _RecordingLLMProvider:
+    """Test double returning a fixed canned response and recording prompts."""
+
+    def __init__(self, response: str = "A corrected fact.") -> None:
+        self.response = response
+        self.calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        return self.response
+
+
+class _ExplodingLLMProvider:
+    """Test double: generate_text always raises."""
+
+    def generate_text(self, prompt: str) -> str:
+        raise RuntimeError("simulated LLM outage")
+
+
+class TestResearchFocusedClaim:
+    """Tests for ResearchAgent.research_focused_claim - Compliance
+    Remediation's bounded, single-claim research refresh (used only when
+    the original ResearchResult doesn't already ground a correction)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_grounded_fact_on_success(self) -> None:
+        llm = _RecordingLLMProvider(response="Atmospheric scattering reddens the moon, not blues it.")
+        agent = ResearchAgent(search_provider=MockSearchProvider(), llm_provider=llm)
+
+        fact = await agent.research_focused_claim("Why is the sky blue?", "the moon has a blue tinge")
+
+        assert isinstance(fact, ResearchFact)
+        assert fact.claim == "Atmospheric scattering reddens the moon, not blues it."
+
+    @pytest.mark.asyncio
+    async def test_bounded_to_exactly_one_search_and_one_llm_call(self) -> None:
+        search = MockSearchProvider()
+        llm = _RecordingLLMProvider()
+        agent = ResearchAgent(search_provider=search, llm_provider=llm)
+
+        await agent.research_focused_claim("Why is the sky blue?", "the moon has a blue tinge")
+
+        assert len(llm.calls) == 1
+        assert "the moon has a blue tinge" in llm.calls[0]
+
+    @pytest.mark.asyncio
+    async def test_no_search_results_returns_none(self) -> None:
+        agent = ResearchAgent(search_provider=_EmptySearchProvider(), llm_provider=_RecordingLLMProvider())
+
+        fact = await agent.research_focused_claim("Why is the sky blue?", "an obscure claim")
+
+        assert fact is None
+
+    @pytest.mark.asyncio
+    async def test_search_failure_returns_none_never_raises(self) -> None:
+        agent = ResearchAgent(search_provider=_ExplodingSearchProvider(), llm_provider=_RecordingLLMProvider())
+
+        fact = await agent.research_focused_claim("Why is the sky blue?", "a claim")
+
+        assert fact is None
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_returns_none_never_raises(self) -> None:
+        agent = ResearchAgent(search_provider=MockSearchProvider(), llm_provider=_ExplodingLLMProvider())
+
+        fact = await agent.research_focused_claim("Why is the sky blue?", "a claim")
+
+        assert fact is None
+
+    @pytest.mark.asyncio
+    async def test_no_evidence_response_returns_none(self) -> None:
+        llm = _RecordingLLMProvider(response="NO_EVIDENCE")
+        agent = ResearchAgent(search_provider=MockSearchProvider(), llm_provider=llm)
+
+        fact = await agent.research_focused_claim("Why is the sky blue?", "an unrelated claim")
+
+        assert fact is None
+
+    @pytest.mark.asyncio
+    async def test_empty_topic_or_claim_returns_none(self) -> None:
+        agent = ResearchAgent(search_provider=MockSearchProvider(), llm_provider=_RecordingLLMProvider())
+
+        assert await agent.research_focused_claim("", "a claim") is None
+        assert await agent.research_focused_claim("Why is the sky blue?", "") is None

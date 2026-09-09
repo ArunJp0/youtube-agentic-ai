@@ -116,6 +116,62 @@ class ResearchAgent:
             research_notes=research_notes,
         )
 
+    async def research_focused_claim(self, topic: str, claim: str) -> Optional[ResearchFact]:
+        """Bounded, single-claim research refresh for Compliance Remediation:
+        at most one search call and one LLM call, scoped to ``claim``
+        rather than re-researching the whole topic.
+
+        Never raises - returns ``None`` whenever the refresh can't produce
+        usable, source-grounded evidence (search failure/timeout, no
+        results, LLM failure, or the source material simply doesn't cover
+        this claim), so a caller can treat that as "cannot safely correct"
+        rather than inventing a fix.
+
+        Args:
+            topic: Overall video topic (for search/prompt context)
+            claim: The specific disputed claim to verify/correct
+
+        Returns:
+            A single source-grounded ResearchFact, or None
+        """
+        if not topic or not claim:
+            return None
+
+        try:
+            raw_results = await asyncio.wait_for(
+                self.search_provider.search(f"{topic}: {claim}", self.max_sources),
+                timeout=self.timeout_seconds,
+            )
+        except Exception:
+            return None
+
+        if not raw_results:
+            return None
+
+        snippets = [r["snippet"] for r in raw_results if "snippet" in r]
+        context = "\n\n".join(snippets)
+        if not context:
+            return None
+
+        prompt = (
+            f"You are fact-checking ONE specific claim about '{topic}' using only the source material below.\n\n"
+            f"Claim to verify/correct: {claim}\n\n"
+            f"Source material:\n{context}\n\n"
+            "Respond with ONE corrected, source-grounded factual statement about this specific point "
+            "(a single sentence). If the source material does not address this claim at all, respond "
+            "with exactly: NO_EVIDENCE"
+        )
+        try:
+            response = self.llm_provider.generate_text(prompt)
+        except Exception:
+            return None
+
+        cleaned = (response or "").strip()
+        if not cleaned or cleaned.upper().startswith("NO_EVIDENCE"):
+            return None
+
+        return ResearchFact(claim=cleaned, source=None, confidence=0.6)
+
     async def _generate_summary(self, topic: str, context: str) -> str:
         """Generate a high-level summary using LLM."""
         prompt = (

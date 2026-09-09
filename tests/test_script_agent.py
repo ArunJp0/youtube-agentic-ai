@@ -461,3 +461,135 @@ class TestScriptAgentSectionDeduplication:
         result = await agent.generate_script(research)
 
         assert len(result.sections) == 2
+
+
+def _sample_script(**overrides) -> ScriptResult:
+    defaults = dict(
+        topic="Why is the sky blue?",
+        video_title="Why Is The Sky Blue?",
+        hook="HOOK",
+        introduction="INTRO",
+        sections=[
+            ScriptSection(heading="Rayleigh Effect", narration="Blue light bends more than red light in the air."),
+            ScriptSection(
+                heading="Atmospheric Effects on the Moon",
+                narration="The moon can appear to have a blue tinge from atmospheric scattering.",
+            ),
+        ],
+        conclusion="CONCLUSION",
+        call_to_action="CTA",
+    )
+    defaults.update(overrides)
+    return ScriptResult(**defaults)
+
+
+class RecordingLLMProvider(LLMProvider):
+    """Test double returning a fixed canned response and recording prompts."""
+
+    def __init__(self, response: str = "A corrected, grounded sentence.") -> None:
+        self.response = response
+        self.calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        return self.response
+
+
+class TestReviseSection:
+    """Tests for ScriptAgent.revise_section - Compliance Remediation's
+    targeted, section-only script correction."""
+
+    def test_only_targeted_section_narration_changes(self) -> None:
+        provider = RecordingLLMProvider(response="Atmospheric scattering actually reddens the moon, not blues it.")
+        agent = ScriptAgent(llm_provider=provider)
+        script = _sample_script()
+        research = _sample_research()
+
+        revised = agent.revise_section(
+            script, research, section_index=1, finding_description="Moon 'blue tinge' claim is scientifically wrong"
+        )
+
+        # Only the targeted section's narration/duration changed.
+        assert revised.sections[1].narration == "Atmospheric scattering actually reddens the moon, not blues it."
+        assert revised.sections[1].narration != script.sections[1].narration
+
+        # Every other field is byte-identical to the input.
+        assert revised.sections[0] == script.sections[0]
+        assert revised.hook == script.hook
+        assert revised.introduction == script.introduction
+        assert revised.conclusion == script.conclusion
+        assert revised.call_to_action == script.call_to_action
+        assert revised.sources == script.sources
+        assert revised.topic == script.topic
+        assert revised.video_title == script.video_title
+
+    def test_prompt_grounded_in_research_and_states_the_problem(self) -> None:
+        provider = RecordingLLMProvider()
+        agent = ScriptAgent(llm_provider=provider)
+        script = _sample_script()
+        research = _sample_research()
+
+        agent.revise_section(script, research, section_index=1, finding_description="Moon 'blue tinge' claim is wrong")
+
+        prompt = provider.calls[0]
+        assert "Moon 'blue tinge' claim is wrong" in prompt
+        assert "Atmospheric Effects on the Moon" in prompt
+        assert research.summary in prompt
+
+    def test_refreshed_fact_included_in_prompt_when_supplied(self) -> None:
+        provider = RecordingLLMProvider()
+        agent = ScriptAgent(llm_provider=provider)
+        script = _sample_script()
+        research = _sample_research()
+        refreshed = ResearchFact(claim="Atmospheric scattering reddens the moon during a lunar eclipse.")
+
+        agent.revise_section(
+            script, research, section_index=1, finding_description="Moon color claim is wrong", refreshed_fact=refreshed
+        )
+
+        assert refreshed.claim in provider.calls[0]
+
+    def test_estimated_duration_recomputed_for_total_script(self) -> None:
+        provider = RecordingLLMProvider(response="A much, much longer corrected sentence with many more words in it.")
+        agent = ScriptAgent(llm_provider=provider)
+        script = _sample_script()
+        research = _sample_research()
+
+        revised = agent.revise_section(script, research, section_index=1, finding_description="wrong claim")
+
+        assert revised.estimated_duration_seconds != script.estimated_duration_seconds
+        assert revised.sections[1].estimated_duration_seconds > 0
+
+    def test_invalid_section_index_raises(self) -> None:
+        provider = RecordingLLMProvider()
+        agent = ScriptAgent(llm_provider=provider)
+        script = _sample_script()
+        research = _sample_research()
+
+        with pytest.raises(ScriptAgentError):
+            agent.revise_section(script, research, section_index=99, finding_description="x")
+
+    def test_missing_script_or_research_raises(self) -> None:
+        provider = RecordingLLMProvider()
+        agent = ScriptAgent(llm_provider=provider)
+
+        with pytest.raises(ScriptAgentError):
+            agent.revise_section(None, _sample_research(), section_index=0, finding_description="x")
+        with pytest.raises(ScriptAgentError):
+            agent.revise_section(_sample_script(), None, section_index=0, finding_description="x")
+
+    def test_llm_failure_raises_script_agent_error(self) -> None:
+        agent = ScriptAgent(llm_provider=ExplodingLLMProvider())
+        script = _sample_script()
+        research = _sample_research()
+
+        with pytest.raises(ScriptAgentError):
+            agent.revise_section(script, research, section_index=1, finding_description="wrong claim")
+
+    def test_empty_correction_raises_never_fabricates(self) -> None:
+        agent = ScriptAgent(llm_provider=RecordingLLMProvider(response="   "))
+        script = _sample_script()
+        research = _sample_research()
+
+        with pytest.raises(ScriptAgentError):
+            agent.revise_section(script, research, section_index=1, finding_description="wrong claim")

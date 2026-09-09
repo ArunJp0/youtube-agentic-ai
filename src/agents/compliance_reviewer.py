@@ -167,7 +167,10 @@ class ComplianceReviewer:
             '  "findings": [\n'
             '    {"category": "short category slug, e.g. title_content_mismatch", '
             '"description": "specific, concrete description of the observed risk", '
-            '"severity": "low, medium, or high"}\n'
+            '"severity": "low, medium, or high", '
+            '"related_section_heading": "the EXACT script section heading above this finding concerns, '
+            'copied verbatim, or null if it concerns the title/thumbnail/overall content rather than one '
+            'specific section"}\n'
             "  ],\n"
             '  "summary": "one or two sentence overall summary"\n'
             "}"
@@ -193,7 +196,18 @@ class ComplianceReviewer:
             severity = str(item.get("severity") or "medium").strip().lower()
             if severity not in _VALID_SEVERITIES:
                 severity = "medium"
-            findings.append(SemanticReviewFinding(category=category, description=description, severity=severity))
+            related_section_heading = item.get("related_section_heading")
+            related_section_heading = (
+                str(related_section_heading).strip() if related_section_heading not in (None, "") else None
+            )
+            findings.append(
+                SemanticReviewFinding(
+                    category=category,
+                    description=description,
+                    severity=severity,
+                    related_section_heading=related_section_heading,
+                )
+            )
 
         summary = str(data.get("summary") or "").strip()
         return findings, summary
