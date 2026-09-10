@@ -8,10 +8,12 @@ from __future__ import annotations
 import glob
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from PIL import Image
 
+from src.agents.youtube_upload_agent import YouTubeUploadAgent
 from src.llm.mock import MockLLMProvider
 from src.llm.provider import LLMProvider
 from src.models.captions import CaptionResult
@@ -25,9 +27,12 @@ from src.models.thumbnail import ThumbnailResult
 from src.models.video import VideoAssemblyResult
 from src.models.visual_qc import RawAssetVerdict, VisualQCResult
 from src.models.voice import VoiceResult
+from src.models.youtube_upload import PublishingIntent
 from src.services.compliance_record_store import ComplianceRecordStore
 from src.services.provenance_store import ProvenanceManifestStore
+from src.services.publishing_record_store import PublishingRecordStore
 from src.services.script_context_reconstruction import original_base_name
+from src.services.upload_artifact_discovery import DiscoveredRunArtifacts
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.music_catalog_provider import MockMusicCatalogProvider, MusicCatalogProvider
@@ -35,6 +40,7 @@ from src.tools.search_provider import MockSearchProvider, SearchProvider
 from src.tools.transcription_provider import MockTranscriptionProvider, TranscriptionProviderError
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
 from src.tools.voice_provider import MockVoiceProvider, VoiceProvider
+from src.tools.youtube_client import MockYouTubeClient
 from src.workflows.pipeline_graph import PipelineState, build_pipeline_graph, run_pipeline
 
 TEST_VOICE_NAME = "test-voice"
@@ -2643,4 +2649,296 @@ class TestComplianceRemediation:
         record = ComplianceRecordStore(compliance_dir).read(winning_run_id)
         assert record.publish_decision == "PASS"
         # It's also the winning candidate the remediation history points to.
+        assert state.remediation_history[0].resulting_run_id == winning_run_id
+
+
+class TestPublishingIntegration:
+    """Tests for the final YouTube publishing integration boundary
+    (publishing_node/route_after_compliance in
+    src/workflows/pipeline_graph.py). Reuses the existing standalone
+    YouTubeUploadAgent/MockYouTubeClient/PublishingRecordStore completely
+    unchanged - no second uploader. All mocked - no real YouTube/network
+    calls."""
+
+    @pytest.fixture
+    def providers(self, tmp_path):
+        return (
+            MockSearchProvider(),
+            ResearchMockWithVariedSections(),
+            MockVoiceProvider(),
+            ThumbnailCapableMediaProvider(),
+            FakeVideoAssembler(),
+            MockVisualRelevanceEvaluator(default_score=0.9),
+            MockTranscriptionProvider(),
+            _music_catalog_provider(tmp_path),
+            str(tmp_path / "audio"),
+            str(tmp_path / "media"),
+            str(tmp_path / "video"),
+            str(tmp_path / "subtitles"),
+        )
+
+    @staticmethod
+    async def _run(
+        providers,
+        topic="Why do humans dream?",
+        max_remediation_attempts=2,
+        youtube_client=None,
+        publishing_intent=None,
+        **overrides,
+    ):
+        (
+            search_provider, llm_provider, voice_provider, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        ) = providers
+        thumbnail_dir = os.path.join(os.path.dirname(voice_dir), "thumbnails")
+        metadata_dir = os.path.join(os.path.dirname(voice_dir), "metadata")
+        provenance_dir = os.path.join(os.path.dirname(voice_dir), "provenance")
+        compliance_dir = os.path.join(os.path.dirname(voice_dir), "compliance")
+        publishing_dir = os.path.join(os.path.dirname(voice_dir), "publishing")
+        state = await run_pipeline(
+            topic,
+            overrides.get("search_provider", search_provider),
+            overrides.get("llm_provider", llm_provider),
+            overrides.get("voice_provider", voice_provider),
+            TEST_VOICE_NAME,
+            overrides.get("media_provider", media_provider),
+            overrides.get("assembler", assembler),
+            overrides.get("visual_relevance_evaluator", visual_relevance_evaluator),
+            overrides.get("transcription_provider", transcription_provider),
+            overrides.get("music_catalog_provider", music_catalog_provider),
+            voice_dir, media_dir, video_dir, subtitle_dir,
+            overrides.get("thumbnail_output_dir", thumbnail_dir),
+            overrides.get("metadata_output_dir", metadata_dir),
+            overrides.get("provenance_output_dir", provenance_dir),
+            overrides.get("compliance_output_dir", compliance_dir),
+            max_remediation_attempts,
+            youtube_client,
+            publishing_intent,
+            overrides.get("publishing_record_dir", publishing_dir),
+        )
+        return state, thumbnail_dir, metadata_dir, provenance_dir, compliance_dir, video_dir, publishing_dir
+
+    # ---- A. Publishing disabled / prevented -------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pass_with_publishing_disabled_makes_no_youtube_call(self, providers) -> None:
+        client = MockYouTubeClient()
+        state, *_ = await self._run(providers, youtube_client=client, publishing_intent=PublishingIntent())
+
+        assert state.compliance_result.publish_decision == "PASS"
+        assert state.status == "completed"
+        assert state.publishing_result is None
+        assert client.inserted_videos == []
+        assert client.thumbnails_set == []
+
+    @pytest.mark.asyncio
+    async def test_pass_with_no_publishing_intent_at_all_makes_no_youtube_call(self, providers) -> None:
+        """The true default (no youtube_client, no publishing_intent at
+        all) - the normal way run_pipeline is already called everywhere
+        else in this project - must remain exactly as inert as before this
+        integration milestone."""
+        state, *_ = await self._run(providers)
+
+        assert state.compliance_result.publish_decision == "PASS"
+        assert state.status == "completed"
+        assert state.publishing_result is None
+
+    @pytest.mark.asyncio
+    async def test_review_makes_no_youtube_call_even_with_publishing_enabled(self, providers) -> None:
+        findings = [{"category": "unsupported_claim", "description": "Claim not fully supported by the script"}]
+        provider = ConfigurableComplianceLLMProvider(compliance_payload={"findings": findings})
+        client = MockYouTubeClient()
+        state, *_ = await self._run(
+            providers, llm_provider=provider, youtube_client=client, publishing_intent=PublishingIntent(mode="private")
+        )
+
+        assert state.compliance_result.publish_decision == "REVIEW"
+        assert state.status == "review_required"
+        assert state.publishing_result is None
+        assert client.inserted_videos == []
+
+    @pytest.mark.asyncio
+    async def test_block_makes_no_youtube_call_even_with_publishing_enabled(self, providers, tmp_path) -> None:
+        track = _music_catalog_provider(tmp_path).list_tracks()[0]
+        catalog = DisappearingTrackMusicCatalogProvider(track)
+        client = MockYouTubeClient()
+        state, *_ = await self._run(
+            providers, music_catalog_provider=catalog, youtube_client=client,
+            publishing_intent=PublishingIntent(mode="private"),
+        )
+
+        assert state.compliance_result.publish_decision == "BLOCK"
+        assert state.status == "blocked"
+        assert state.publishing_result is None
+        assert client.inserted_videos == []
+
+    @pytest.mark.asyncio
+    async def test_exhausted_review_never_publishes(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, always_review=True
+        )
+        client = MockYouTubeClient()
+        state, *_ = await self._run(
+            providers, llm_provider=provider, youtube_client=client,
+            publishing_intent=PublishingIntent(mode="private"), max_remediation_attempts=2,
+        )
+
+        assert state.status == "review_exhausted"
+        assert state.publishing_result is None
+        assert client.inserted_videos == []
+
+    @pytest.mark.asyncio
+    async def test_publishing_enabled_without_youtube_client_raises_at_build_time(self, providers) -> None:
+        (
+            search_provider, llm_provider, voice_provider, media_provider, assembler,
+            visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+            voice_dir, media_dir, video_dir, subtitle_dir,
+        ) = providers
+        with pytest.raises(ValueError):
+            build_pipeline_graph(
+                search_provider, llm_provider, voice_provider, TEST_VOICE_NAME, media_provider, assembler,
+                visual_relevance_evaluator, transcription_provider, music_catalog_provider,
+                voice_dir, media_dir, video_dir, subtitle_dir,
+                publishing_intent=PublishingIntent(mode="private"),
+            )
+
+    # ---- B. Private upload ------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pass_with_private_intent_invokes_uploader_exactly_once(self, providers) -> None:
+        client = MockYouTubeClient()
+        state, *_ = await self._run(providers, youtube_client=client, publishing_intent=PublishingIntent(mode="private"))
+
+        assert state.status == "published"
+        assert state.publishing_result is not None
+        assert state.publishing_result.success is True
+        assert state.publishing_result.status == "private_uploaded"
+        assert state.publishing_result.privacy_status == "private"
+        assert len(client.inserted_videos) == 1
+        assert client.inserted_videos[0].privacy_status == "private"
+        assert client.inserted_videos[0].scheduled_publish_at is None
+        assert len(client.thumbnails_set) == 1
+
+    @pytest.mark.asyncio
+    async def test_private_upload_uses_real_final_artifacts(self, providers) -> None:
+        client = MockYouTubeClient()
+        state, *_ = await self._run(providers, youtube_client=client, publishing_intent=PublishingIntent(mode="private"))
+
+        request = client.inserted_videos[0]
+        assert request.video_path == state.audio_mix_result.output_path
+        assert request.title == state.metadata_result.title
+        assert request.thumbnail_path == state.thumbnail_result.output_path
+
+    # ---- C. Scheduled publication ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pass_with_scheduled_intent_sends_correct_request(self, providers) -> None:
+        future_time = datetime.now(timezone.utc) + timedelta(days=1)
+        client = MockYouTubeClient()
+        state, *_ = await self._run(
+            providers, youtube_client=client,
+            publishing_intent=PublishingIntent(mode="scheduled", scheduled_publish_at=future_time),
+        )
+
+        assert state.status == "published"
+        assert state.publishing_result.status == "scheduled"
+        assert len(client.inserted_videos) == 1
+        request = client.inserted_videos[0]
+        # YouTube requires privacy=private while a future publishAt is set -
+        # the existing centralized validate_scheduling rule, unchanged.
+        assert request.privacy_status == "private"
+        assert request.scheduled_publish_at == future_time
+
+    # ---- D. Idempotency / retry --------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_retry_of_same_run_does_not_create_duplicate_video(self, providers) -> None:
+        client = MockYouTubeClient()
+        state, _thumb_dir, _meta_dir, _prov_dir, _comp_dir, _video_dir, publishing_dir = await self._run(
+            providers, youtube_client=client, publishing_intent=PublishingIntent(mode="private")
+        )
+        assert len(client.inserted_videos) == 1
+        first_video_id = state.publishing_result.video_id
+
+        # Simulate a retry of publishing for the exact same already-published
+        # run (e.g. an operator/process re-triggering) - reusing the SAME
+        # YouTubeClient/PublishingRecordStore the graph itself used, exactly
+        # as YouTubeUploadAgent's own idempotency guard is designed for.
+        run_id = original_base_name(state.audio_mix_result.output_path)
+        artifacts = DiscoveredRunArtifacts(
+            run_id=run_id,
+            topic=state.topic,
+            final_video_path=state.audio_mix_result.output_path,
+            metadata_result=state.metadata_result,
+            thumbnail_path=state.thumbnail_result.output_path,
+            compliance_result=state.compliance_result,
+        )
+        agent = YouTubeUploadAgent(client, PublishingRecordStore(publishing_dir))
+        retry_result = agent.publish(artifacts, privacy_status="private")
+
+        assert len(client.inserted_videos) == 1  # still exactly 1 - no duplicate created
+        assert retry_result.success is True
+        assert retry_result.video_id == first_video_id
+        assert any("already published" in w for w in retry_result.warnings)
+
+    # ---- E. Publishing failure never regenerates content -------------------
+
+    @pytest.mark.asyncio
+    async def test_publishing_failure_does_not_regenerate_content(self, providers) -> None:
+        recording_search = RecordingSearchProvider()
+        client = MockYouTubeClient(fail_upload=True)
+        state, *_ = await self._run(
+            providers, search_provider=recording_search, youtube_client=client,
+            publishing_intent=PublishingIntent(mode="private"),
+        )
+
+        assert state.status == "publishing_failed"
+        assert state.publishing_result is not None
+        assert state.publishing_result.success is False
+        assert state.publishing_result.error is not None
+
+        # Every earlier content artifact is preserved untouched - a
+        # publishing failure is represented as its own result, never a
+        # reason to discard or redo already-successful content generation.
+        assert state.research_result is not None
+        assert state.script_result is not None
+        assert state.voice_result is not None and state.voice_result.success is True
+        assert state.video_assembly_result is not None and state.video_assembly_result.success is True
+        assert state.caption_result is not None and state.caption_result.success is True
+        assert state.audio_mix_result is not None and state.audio_mix_result.success is True
+        assert state.metadata_result is not None and state.metadata_result.success is True
+        assert state.thumbnail_result is not None and state.thumbnail_result.success is True
+        assert os.path.exists(state.audio_mix_result.output_path)
+
+        # ResearchAgent is the only caller of SearchProvider.search() - a
+        # publishing failure never triggers any upstream re-generation.
+        assert len(recording_search.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_publishing_failure_never_marks_completed_or_published(self, providers) -> None:
+        client = MockYouTubeClient(fail_upload=True)
+        state, *_ = await self._run(providers, youtube_client=client, publishing_intent=PublishingIntent(mode="private"))
+
+        assert state.status not in ("completed", "published")
+
+    # ---- F. Compliance Remediation reaching PASS can then publish ----------
+
+    @pytest.mark.asyncio
+    async def test_remediated_pass_proceeds_to_publishing(self, providers) -> None:
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        client = MockYouTubeClient()
+        state, *_ = await self._run(
+            providers, llm_provider=provider, youtube_client=client, publishing_intent=PublishingIntent(mode="private")
+        )
+
+        assert state.compliance_result.publish_decision == "PASS"
+        assert state.remediation_attempt == 1
+        assert state.status == "published"
+        # Only the corrected/winning candidate is ever published - the
+        # rejected first REVIEW attempt's video is never uploaded.
+        assert len(client.inserted_videos) == 1
+        winning_run_id = original_base_name(state.audio_mix_result.output_path)
         assert state.remediation_history[0].resulting_run_id == winning_run_id

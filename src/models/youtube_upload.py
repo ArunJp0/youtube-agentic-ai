@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 PrivacyStatus = Literal["private", "unlisted", "public"]
 
@@ -105,6 +105,50 @@ class UploadResult(BaseModel):
     thumbnail_set: bool = Field(default=False)
     warnings: List[str] = Field(default_factory=list)
     error: Optional[str] = Field(default=None)
+
+
+PublishingMode = Literal["disabled", "private", "scheduled"]
+
+
+class PublishingIntent(BaseModel):
+    """Explicit, opt-in publishing configuration for one pipeline run - the
+    ONLY way a pipeline run can trigger a real YouTube API call.
+
+    Defaults to ``mode="disabled"``, so simply running the normal
+    content-generation pipeline (even all the way to a genuine Compliance
+    PASS) never has an external side effect on its own - a caller must
+    explicitly construct a non-disabled ``PublishingIntent`` and pass it
+    into ``build_pipeline_graph``/``run_pipeline`` to request publishing.
+
+    Both non-disabled modes always publish as ``private`` (this MVP never
+    requests ``public``/``unlisted`` through the pipeline, consistent with
+    the standalone Upload Agent's own first-real-upload precedent) -
+    ``mode="scheduled"`` additionally requires ``scheduled_publish_at``,
+    which YouTube itself requires to stay private until that time anyway.
+    """
+
+    mode: PublishingMode = Field(default="disabled")
+    scheduled_publish_at: Optional[datetime] = Field(
+        default=None, description="Required when mode='scheduled'; must be timezone-aware and in the future"
+    )
+    force: bool = Field(
+        default=False, description="Upload again even if this run already has a PublishingRecord (normally refused)"
+    )
+
+    @field_validator("scheduled_publish_at")
+    @classmethod
+    def _require_timezone_aware(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("scheduled_publish_at must be timezone-aware (offset-aware)")
+        return value
+
+    @model_validator(mode="after")
+    def _scheduled_mode_requires_datetime(self) -> "PublishingIntent":
+        if self.mode == "scheduled" and self.scheduled_publish_at is None:
+            raise ValueError("mode='scheduled' requires scheduled_publish_at to be set")
+        if self.mode != "scheduled" and self.scheduled_publish_at is not None:
+            raise ValueError("scheduled_publish_at is only meaningful when mode='scheduled'")
+        return self
 
 
 class PublishingRecord(BaseModel):

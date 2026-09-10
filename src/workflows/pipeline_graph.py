@@ -25,6 +25,7 @@ from src.agents.research import ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent, ScriptAgentError
 from src.agents.thumbnail_agent import DEFAULT_THUMBNAIL_OUTPUT_DIR, ThumbnailAgent, ThumbnailAgentError
 from src.agents.visual_context_planner import VisualContextPlanner
+from src.agents.youtube_upload_agent import YouTubeUploadAgent, YouTubeUploadAgentError
 from src.models.captions import CaptionResult
 from src.models.compliance import ComplianceResult
 from src.models.media import VisualResult
@@ -43,13 +44,16 @@ from src.models.video import VideoAssemblyResult
 from src.models.visual_plan import VisualPlan
 from src.models.visual_qc import VisualQCResult
 from src.models.voice import VoiceResult
+from src.models.youtube_upload import DEFAULT_PRIVACY_STATUS, PublishingIntent, UploadResult
 from src.services.audio_mixing_service import AudioMixingService, AudioMixingServiceError
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR, CaptionService, CaptionServiceError
 from src.services.compliance_record_store import DEFAULT_COMPLIANCE_RECORD_DIR, ComplianceRecordStore
 from src.services.finding_localizer import has_grounding_evidence, localize_findings
 from src.services.provenance_collection import persist_provenance_if_completed
 from src.services.provenance_store import DEFAULT_PROVENANCE_OUTPUT_DIR, ProvenanceManifestStore, ProvenanceStoreError
+from src.services.publishing_record_store import DEFAULT_PUBLISHING_RECORD_DIR, PublishingRecordStore
 from src.services.script_context_reconstruction import original_base_name
+from src.services.upload_artifact_discovery import DiscoveredRunArtifacts
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
     VideoAssemblyService,
@@ -68,6 +72,7 @@ from src.tools.music_catalog_provider import MusicCatalogProvider
 from src.tools.transcription_provider import TranscriptionProvider
 from src.tools.visual_relevance_evaluator import VisualRelevanceEvaluator
 from src.tools.voice_provider import VoiceProvider
+from src.tools.youtube_client import YouTubeClient
 
 
 def _captioned_video_result(caption_result: CaptionResult) -> VideoAssemblyResult:
@@ -141,15 +146,31 @@ class PipelineState:
     remediation_attempt: int = 0
     remediation_parent_run_id: Optional[str] = None
     remediation_history: List[RemediationAttemptRecord] = field(default_factory=list)
+    # Set only if publishing_node actually ran (see route_after_compliance/
+    # publishing_node below) - which itself only ever happens after a
+    # genuine Compliance PASS AND an explicit, non-"disabled"
+    # PublishingIntent was supplied to build_pipeline_graph/run_pipeline.
+    # Stays None for every other outcome (REVIEW/BLOCK/PASS-with-publishing-
+    # disabled) - None here is what distinguishes "publishing was never
+    # attempted" from "publishing was attempted" (success or failure, see
+    # UploadResult.success/.status for which). Reuses the exact same typed
+    # UploadResult the standalone YouTubeUploadAgent already returns - no
+    # second/parallel result shape.
+    publishing_result: Optional[UploadResult] = None
     # pending -> researching -> researched -> scripted -> voiced ->
     # visualized -> qc_passed -> assembled -> captioned -> mixed ->
     # metadata_generated -> thumbnail_generated -> revising (mid-
-    # remediation, transient) -> completed (Compliance PASS) ->
-    # review_required (Compliance REVIEW, no actionable findings or
-    # remediation disabled) -> review_exhausted (Compliance REVIEW,
-    # actionable findings existed but max_remediation_attempts was used up)
-    # -> blocked (Compliance BLOCK, never remediated) -> failed (a
-    # technical failure at any stage)
+    # remediation, transient) -> completed (Compliance PASS, publishing
+    # disabled or not requested) -> published (Compliance PASS, publishing
+    # requested and succeeded - see publishing_result.status for
+    # private_uploaded/scheduled/thumbnail_failed detail) ->
+    # publishing_failed (Compliance PASS, publishing requested but failed -
+    # see publishing_result.error) -> review_required (Compliance REVIEW,
+    # no actionable findings or remediation disabled) -> review_exhausted
+    # (Compliance REVIEW, actionable findings existed but
+    # max_remediation_attempts was used up) -> blocked (Compliance BLOCK,
+    # never remediated, never published) -> failed (a technical failure at
+    # any stage)
     status: str = "pending"
     error: Optional[str] = None
 
@@ -173,6 +194,9 @@ def build_pipeline_graph(
     provenance_output_dir: str = DEFAULT_PROVENANCE_OUTPUT_DIR,
     compliance_output_dir: str = DEFAULT_COMPLIANCE_RECORD_DIR,
     max_remediation_attempts: int = DEFAULT_MAX_REMEDIATION_ATTEMPTS,
+    youtube_client: Optional[YouTubeClient] = None,
+    publishing_intent: Optional[PublishingIntent] = None,
+    publishing_record_dir: str = DEFAULT_PUBLISHING_RECORD_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
@@ -270,6 +294,19 @@ def build_pipeline_graph(
             ``route_after_compliance``) - 0 disables remediation entirely
             (a REVIEW always stops immediately, exactly as before this
             milestone)
+        youtube_client: Optional YouTubeClient (real or mock) for the
+            standalone YouTubeUploadAgent, reused as-is. Required only if
+            ``publishing_intent`` requests anything other than the default
+            ``mode="disabled"`` - omitted (the default), the graph never
+            constructs an upload agent and the ``publishing`` node is never
+            reachable, so a normal pipeline run has zero YouTube exposure.
+        publishing_intent: Explicit, opt-in publishing configuration (see
+            ``src.models.youtube_upload.PublishingIntent``). Defaults to
+            ``None`` (equivalent to ``mode="disabled"``) - a genuine
+            Compliance PASS alone never causes a YouTube API call; a caller
+            must explicitly opt in to ``mode="private"``/``"scheduled"``.
+        publishing_record_dir: Directory PublishingRecordStore persists
+            idempotency records into (mirrors every other ``*_output_dir``)
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -326,6 +363,20 @@ def build_pipeline_graph(
     # API key path and no duplicated catalog-reading logic.
     compliance_agent = ComplianceAgent(music_catalog_provider=music_catalog_provider, llm_provider=llm_provider)
     compliance_record_store = ComplianceRecordStore(compliance_output_dir)
+
+    # Publishing stays fully inert (no client, no agent, no node ever
+    # reachable) unless a caller explicitly opts in - see PublishingIntent's
+    # own docstring for why "disabled" is the default. A non-"disabled"
+    # intent with no youtube_client is a genuine configuration error,
+    # caught here at build time rather than surfacing deep inside a node.
+    publishing_intent = publishing_intent or PublishingIntent()
+    publishing_enabled = publishing_intent.mode != "disabled"
+    if publishing_enabled and youtube_client is None:
+        raise ValueError(
+            f"publishing_intent.mode='{publishing_intent.mode}' requires a youtube_client, but none was provided"
+        )
+    publishing_record_store = PublishingRecordStore(publishing_record_dir)
+    upload_agent = YouTubeUploadAgent(youtube_client, publishing_record_store) if youtube_client is not None else None
 
     async def research_node(state: PipelineState) -> dict:
         try:
@@ -921,6 +972,65 @@ def build_pipeline_graph(
             "error": None,
         }
 
+    async def publishing_node(state: PipelineState) -> dict:
+        """Publish the exact winning candidate to YouTube via the existing
+        standalone ``YouTubeUploadAgent`` - reused completely unchanged, no
+        second uploader/duplicated OAuth/idempotency/scheduling logic.
+
+        Only ever reached when route_after_compliance has already confirmed
+        a genuine Compliance PASS AND a non-"disabled" PublishingIntent was
+        supplied at graph-build time (see ``upload_agent``/
+        ``publishing_enabled`` above) - a normal disabled-publishing run
+        never reaches this node at all.
+
+        Builds a ``DiscoveredRunArtifacts`` directly from this run's own
+        real in-memory results (never via ``discover_latest_run_artifacts``,
+        which globs the filesystem for a standalone caller with no
+        PipelineState to read from) - the exact same typed input
+        ``YouTubeUploadAgent.publish()`` already expects, so idempotency
+        (``PublishingRecordStore``), the compliance-PASS gate, scheduling
+        validation, and thumbnail-preserving-video_id partial-failure
+        handling all apply identically to however the standalone CLI
+        already exercises them. A publishing failure is captured in
+        ``publishing_result`` only - it never regenerates or re-touches any
+        earlier stage's already-produced artifacts.
+        """
+        video_path = state.audio_mix_result.output_path if state.audio_mix_result else None
+        if not video_path:
+            # Structurally shouldn't happen (Compliance PASS already implies
+            # check_final_video passed), but never crash on a missing path.
+            result = UploadResult(success=False, status="upload_failed", error="No final video available to publish")
+            return {"publishing_result": result, "status": "publishing_failed", "error": result.error}
+
+        run_id = original_base_name(video_path)
+        artifacts = DiscoveredRunArtifacts(
+            run_id=run_id,
+            topic=state.topic,
+            final_video_path=video_path,
+            metadata_result=state.metadata_result,
+            metadata_json_path=state.metadata_result.output_path if state.metadata_result else None,
+            thumbnail_path=state.thumbnail_result.output_path if state.thumbnail_result else None,
+            thumbnail_exact_match=True,
+            compliance_result=state.compliance_result,
+            warnings=[],
+        )
+
+        try:
+            result = upload_agent.publish(
+                artifacts,
+                privacy_status=DEFAULT_PRIVACY_STATUS,
+                scheduled_publish_at=publishing_intent.scheduled_publish_at,
+                force=publishing_intent.force,
+            )
+        except YouTubeUploadAgentError as e:
+            result = UploadResult(success=False, status="upload_failed", error=f"Publishing failed: {e}")
+
+        return {
+            "publishing_result": result,
+            "status": "published" if result.success else "publishing_failed",
+            "error": result.error,
+        }
+
     def _remediation_eligibility(
         result: Optional[ComplianceResult], script_result: Optional[ScriptResult]
     ) -> Tuple[bool, List[LocalizedFinding]]:
@@ -993,12 +1103,18 @@ def build_pipeline_graph(
         return "compliance" if state.thumbnail_result is not None and state.thumbnail_result.success else END
 
     def route_after_compliance(state: PipelineState) -> str:
-        """PASS or BLOCK always end here - a BLOCK is never remediated
-        (see compliance_node). A REVIEW loops back into script_revision
-        only when at least one finding is confidently localized/actionable
-        AND the attempt budget isn't exhausted yet; otherwise it ends here
-        too (compliance_node has already set the correct terminal status -
+        """A genuine PASS routes to ``publishing`` only if publishing was
+        explicitly enabled at graph-build time - otherwise (the default)
+        it ends here exactly as before, so a normal pipeline run's only
+        externally-visible outcome of a PASS is its own "completed" status,
+        never a YouTube API call. BLOCK is never remediated and never
+        published. A REVIEW loops back into script_revision only when at
+        least one finding is confidently localized/actionable AND the
+        attempt budget isn't exhausted yet; otherwise it ends here too
+        (compliance_node has already set the correct terminal status -
         review_required or review_exhausted)."""
+        if state.compliance_result is not None and state.compliance_result.publish_decision == "PASS":
+            return "publishing" if publishing_enabled else END
         if state.remediation_attempt >= max_remediation_attempts:
             return END
         actionable, _ = _remediation_eligibility(state.compliance_result, state.script_result)
@@ -1025,6 +1141,7 @@ def build_pipeline_graph(
     graph.add_node("thumbnail", thumbnail_node)
     graph.add_node("compliance", compliance_node)
     graph.add_node("script_revision", script_revision_node)
+    graph.add_node("publishing", publishing_node)
 
     graph.set_entry_point("research")
     graph.add_conditional_edges("research", route_after_research, {"script": "script", END: END})
@@ -1047,9 +1164,13 @@ def build_pipeline_graph(
     # existing downstream node unchanged, since a corrected script_result
     # flowing back through voice_node/media_node/etc. is transparent to them.
     graph.add_conditional_edges(
-        "compliance", route_after_compliance, {"script_revision": "script_revision", END: END}
+        "compliance",
+        route_after_compliance,
+        {"script_revision": "script_revision", "publishing": "publishing", END: END},
     )
     graph.add_conditional_edges("script_revision", route_after_script_revision, {"voice": "voice", END: END})
+    # publishing is always terminal - no further stage consumes its result.
+    graph.add_edge("publishing", END)
 
     return graph
 
@@ -1074,6 +1195,9 @@ async def run_pipeline(
     provenance_output_dir: str = DEFAULT_PROVENANCE_OUTPUT_DIR,
     compliance_output_dir: str = DEFAULT_COMPLIANCE_RECORD_DIR,
     max_remediation_attempts: int = DEFAULT_MAX_REMEDIATION_ATTEMPTS,
+    youtube_client: Optional[YouTubeClient] = None,
+    publishing_intent: Optional[PublishingIntent] = None,
+    publishing_record_dir: str = DEFAULT_PUBLISHING_RECORD_DIR,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
@@ -1149,6 +1273,15 @@ async def run_pipeline(
             durable record into for every PASS/REVIEW/BLOCK decision
         max_remediation_attempts: Bounded retry limit for Compliance
             Remediation - 0 disables remediation entirely
+        youtube_client: Optional YouTubeClient for the standalone
+            YouTubeUploadAgent - required only if ``publishing_intent``
+            requests anything other than the default ``mode="disabled"``
+        publishing_intent: Explicit, opt-in publishing configuration (see
+            ``src.models.youtube_upload.PublishingIntent``) - defaults to
+            fully disabled, so a normal call to ``run_pipeline`` never
+            causes a YouTube API call even on a genuine Compliance PASS
+        publishing_record_dir: Directory PublishingRecordStore persists
+            idempotency records into
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -1172,6 +1305,9 @@ async def run_pipeline(
         provenance_output_dir,
         compliance_output_dir,
         max_remediation_attempts,
+        youtube_client,
+        publishing_intent,
+        publishing_record_dir,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 
@@ -1195,6 +1331,7 @@ async def run_pipeline(
         remediation_attempt=raw_result.get("remediation_attempt", 0),
         remediation_parent_run_id=raw_result.get("remediation_parent_run_id"),
         remediation_history=raw_result.get("remediation_history", []),
+        publishing_result=raw_result.get("publishing_result"),
         status=raw_result.get("status", "unknown"),
         error=raw_result.get("error"),
     )
