@@ -81,3 +81,51 @@ class Settings:
     elevenlabs_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("ELEVENLABS_API_KEY"))
     serper_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("SERPER_API_KEY"))
     brave_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("BRAVE_API_KEY"))
+
+    # Topic Planner Agent: chooses one topic automatically instead of a
+    # human typing one before each run. Disabled by default - existing
+    # entry points (pipeline_demo.py/main.py) are entirely unaffected
+    # unless a caller explicitly opts in.
+    topic_planner_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TOPIC_PLANNER_ENABLED", "false").strip().lower() == "true"
+    )
+    # Topic source: "mock" or "youtube" - mirrors every other provider's
+    # mock/real naming convention.
+    topic_planner_source: str = field(default_factory=lambda: os.environ.get("TOPIC_PLANNER_SOURCE", "mock"))
+    topic_planner_niche: Optional[str] = field(default_factory=lambda: os.environ.get("TOPIC_PLANNER_NICHE") or None)
+    topic_planner_region: Optional[str] = field(
+        default_factory=lambda: os.environ.get("TOPIC_PLANNER_REGION") or None
+    )
+    topic_planner_candidate_limit: int = field(
+        default_factory=lambda: int(os.environ.get("TOPIC_PLANNER_CANDIDATE_LIMIT", "15"))
+    )
+    topic_planner_history_limit: int = field(
+        default_factory=lambda: int(os.environ.get("TOPIC_PLANNER_HISTORY_LIMIT", "50"))
+    )
+
+    # Current/trending news discovery extension. TOPIC_MODE controls
+    # whether the planner sources evergreen-only (default, preserves prior
+    # behavior exactly), trending-only, or both merged together.
+    # TOPIC_NEWS_SOURCES_ENABLED gates whether a news source is even
+    # constructed - default "false" so an existing deployment's behavior
+    # is byte-for-byte unchanged unless explicitly opted in.
+    topic_mode: str = field(default_factory=lambda: os.environ.get("TOPIC_MODE", "evergreen"))
+    topic_news_sources_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TOPIC_NEWS_SOURCES_ENABLED", "false").strip().lower() == "true"
+    )
+    # Comma-separated target markets - plain config strings the planner
+    # never interprets beyond passing through to the source provider, so
+    # no region (India/Tamil Nadu/UK/etc.) is ever assumed or hardcoded in
+    # planner logic. "global" (the default) requests a market-agnostic feed.
+    topic_target_markets: str = field(default_factory=lambda: os.environ.get("TOPIC_TARGET_MARKETS", "global"))
+    # BCP-47-ish language code (e.g. "en", "ta") - passed through to the
+    # news source's own language parameter; never assumed/hardcoded beyond
+    # this configured default.
+    topic_language: str = field(default_factory=lambda: os.environ.get("TOPIC_LANGUAGE", "en"))
+    # Comma-separated preferred categories (e.g. "technology,science,space")
+    # - a scoring PREFERENCE, never a hard filter; empty means no category
+    # preference at all (fully neutral).
+    topic_categories: str = field(default_factory=lambda: os.environ.get("TOPIC_CATEGORIES", ""))
+    topic_freshness_hours: float = field(
+        default_factory=lambda: float(os.environ.get("TOPIC_FRESHNESS_HOURS", "48"))
+    )
