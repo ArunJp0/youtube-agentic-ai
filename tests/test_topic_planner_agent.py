@@ -24,7 +24,12 @@ from src.services.topic_plan_store import TopicPlanStore
 from src.tools.search_provider import MockSearchProvider
 from src.tools.topic_source_provider import CompositeTopicSourceProvider, MockTopicSourceProvider, TopicSourceProviderError
 
-NOW = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+# Computed at import time (not a frozen past literal) - TopicPlannerAgent's
+# freshness scoring (src.services.topic_freshness) measures age against the
+# real wall clock with no injectable "now", so every candidate's
+# `hours_old` offset here must stay relative to whenever the suite actually
+# runs, not a fixed date that silently drifts stale as real time passes.
+NOW = datetime.now(timezone.utc)
 
 
 def _news_candidate(

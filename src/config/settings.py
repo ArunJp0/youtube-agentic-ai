@@ -129,3 +129,38 @@ class Settings:
     topic_freshness_hours: float = field(
         default_factory=lambda: float(os.environ.get("TOPIC_FRESHNESS_HOURS", "48"))
     )
+
+    # Autonomous Orchestration: removes the need for a human to manually run
+    # pipeline_demo.py or type a topic. Disabled by default - existing
+    # manual entry points are entirely unaffected unless explicitly opted
+    # in, and even when enabled, publishing defaults to "disabled" below so
+    # a fresh deployment never accidentally publishes publicly.
+    autonomous_enabled: bool = field(
+        default_factory=lambda: os.environ.get("AUTONOMOUS_ENABLED", "false").strip().lower() == "true"
+    )
+    # Cron-style schedule string (e.g. "0 */6 * * *"), interpreted by
+    # AutonomousScheduler - never parsed/assumed by the controller itself.
+    autonomous_schedule: str = field(
+        default_factory=lambda: os.environ.get("AUTONOMOUS_SCHEDULE", "0 * * * *")
+    )
+    # IANA timezone name the schedule is evaluated in - never hardcoded to
+    # any specific region.
+    autonomous_timezone: str = field(
+        default_factory=lambda: os.environ.get("AUTONOMOUS_TIMEZONE", "UTC")
+    )
+    # "disabled" (default, never publishes), "private", or "scheduled" -
+    # mirrors PublishingIntent.mode exactly so the controller can pass it
+    # straight through.
+    autonomous_publishing_mode: str = field(
+        default_factory=lambda: os.environ.get("AUTONOMOUS_PUBLISHING_MODE", "disabled")
+    )
+    # Seconds. A soft ceiling a caller can use to time-box one run; the
+    # controller does not itself pre-empt a running pipeline mid-flight.
+    autonomous_max_run_duration: int = field(
+        default_factory=lambda: int(os.environ.get("AUTONOMOUS_MAX_RUN_DURATION", "7200"))
+    )
+    # Seconds. A run lock older than this is considered stale and may be
+    # recovered by a subsequent run.
+    autonomous_lock_timeout: int = field(
+        default_factory=lambda: int(os.environ.get("AUTONOMOUS_LOCK_TIMEOUT", "10800"))
+    )

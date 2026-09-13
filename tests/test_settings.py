@@ -72,3 +72,37 @@ class TestSettings:
         settings = Settings()
         assert settings.media_provider == "pexels"
         assert settings.pexels_api_key == "test-pexels-key"
+
+    def test_autonomous_defaults_are_disabled_and_never_auto_publish(self, monkeypatch) -> None:
+        """A fresh deployment must never accidentally start autonomous
+        execution or publish publicly."""
+        for var in (
+            "AUTONOMOUS_ENABLED",
+            "AUTONOMOUS_SCHEDULE",
+            "AUTONOMOUS_TIMEZONE",
+            "AUTONOMOUS_PUBLISHING_MODE",
+            "AUTONOMOUS_MAX_RUN_DURATION",
+            "AUTONOMOUS_LOCK_TIMEOUT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        settings = Settings()
+        assert settings.autonomous_enabled is False
+        assert settings.autonomous_publishing_mode == "disabled"
+        assert settings.autonomous_timezone == "UTC"
+        assert settings.autonomous_max_run_duration > 0
+        assert settings.autonomous_lock_timeout > 0
+
+    def test_autonomous_env_vars_are_read(self, monkeypatch) -> None:
+        monkeypatch.setenv("AUTONOMOUS_ENABLED", "true")
+        monkeypatch.setenv("AUTONOMOUS_SCHEDULE", "0 */6 * * *")
+        monkeypatch.setenv("AUTONOMOUS_TIMEZONE", "Asia/Kolkata")
+        monkeypatch.setenv("AUTONOMOUS_PUBLISHING_MODE", "private")
+        monkeypatch.setenv("AUTONOMOUS_MAX_RUN_DURATION", "3600")
+        monkeypatch.setenv("AUTONOMOUS_LOCK_TIMEOUT", "600")
+        settings = Settings()
+        assert settings.autonomous_enabled is True
+        assert settings.autonomous_schedule == "0 */6 * * *"
+        assert settings.autonomous_timezone == "Asia/Kolkata"
+        assert settings.autonomous_publishing_mode == "private"
+        assert settings.autonomous_max_run_duration == 3600
+        assert settings.autonomous_lock_timeout == 600
