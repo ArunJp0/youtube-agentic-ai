@@ -10,7 +10,8 @@ import pytest
 
 from src.models.topic_planner import TopicCandidate
 from src.services.topic_normalization import normalize_topic
-from src.tools.current_news_topic_source_provider import CurrentNewsTopicSourceProvider
+from src.tools.current_news_topic_source_provider import CurrentNewsSearchProvider, CurrentNewsSearchError, CurrentNewsTopicSourceProvider
+from src.tools.search_provider import SearchProvider
 from src.tools.topic_source_provider import (
     CompositeTopicSourceProvider,
     MockTopicSourceProvider,
@@ -513,3 +514,122 @@ class TestCurrentNewsTopicSourceProvider:
 
         dumped = candidates[0].model_dump()
         assert "Full copyrighted article text" not in str(dumped)
+
+
+# ---- CurrentNewsSearchProvider (Research's use of the same RSS infra) ----
+
+
+def _rss_item_with_description(
+    title: str,
+    link: str = "https://example.com/a",
+    pub_date: str = "Thu, 10 Sep 2026 10:00:00 GMT",
+    source: str | None = "Example News",
+    description: str = "A short snippet describing the story in a sentence or two.",
+) -> str:
+    source_xml = f'<source url="https://example.com">{source}</source>' if source else ""
+    return (
+        f"<item><title>{title}</title><link>{link}</link><pubDate>{pub_date}</pubDate>"
+        f"<description>{description}</description>{source_xml}</item>"
+    )
+
+
+class TestCurrentNewsSearchProvider:
+    """Research's use of the SAME shared RSS fetch/parse infrastructure as
+    CurrentNewsTopicSourceProvider, exercised via the SearchProvider
+    interface ResearchAgent actually calls. Unlike topic discovery, this
+    provider DOES surface the <description> snippet (STEP 2: research may
+    use current-news snippets/content where appropriate) - the opposite of
+    the topic-discovery constraint verified above."""
+
+    def test_is_a_search_provider(self) -> None:
+        assert isinstance(CurrentNewsSearchProvider(client=FakeTextClient()), SearchProvider)
+
+    def test_name_is_current_news(self) -> None:
+        assert CurrentNewsSearchProvider(client=FakeTextClient()).name == "current_news"
+
+    def test_search_returns_title_url_snippet_and_metadata(self) -> None:
+        feed = _rss_feed(_rss_item_with_description("Big Story Today", description="Details about the big story."))
+        client = FakeTextClient(response=FakeTextResponse(feed))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        results = asyncio.run(provider.search("big story"))
+
+        assert len(results) == 1
+        assert results[0]["title"] == "Big Story Today"
+        assert results[0]["url"] == "https://example.com/a"
+        assert results[0]["snippet"] == "Details about the big story."
+        assert results[0]["source_name"] == "Example News"
+
+    def test_published_at_parsed_to_iso(self) -> None:
+        feed = _rss_feed(_rss_item_with_description("Story", pub_date="Thu, 10 Sep 2026 10:00:00 GMT"))
+        client = FakeTextClient(response=FakeTextResponse(feed))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        results = asyncio.run(provider.search("story"))
+
+        assert results[0]["published_at"] == "2026-09-10T10:00:00+00:00"
+
+    def test_missing_description_falls_back_to_title_as_snippet(self) -> None:
+        feed = _rss_feed(
+            "<item><title>Story With No Description</title><link>https://example.com/b</link>"
+            "<pubDate>Thu, 10 Sep 2026 10:00:00 GMT</pubDate></item>"
+        )
+        client = FakeTextClient(response=FakeTextResponse(feed))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        results = asyncio.run(provider.search("story"))
+
+        assert results[0]["snippet"] == "Story With No Description"
+
+    def test_html_in_description_is_cleaned(self) -> None:
+        feed = _rss_feed(
+            _rss_item_with_description(
+                "Story", description="A &lt;b&gt;bold&lt;/b&gt; claim &amp; more &lt;a href='x'&gt;details&lt;/a&gt;."
+            )
+        )
+        client = FakeTextClient(response=FakeTextResponse(feed))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        results = asyncio.run(provider.search("story"))
+
+        assert "<b>" not in results[0]["snippet"]
+        assert "<a " not in results[0]["snippet"]
+        assert "&amp;" not in results[0]["snippet"]
+
+    def test_respects_num_results_limit(self) -> None:
+        feed = _rss_feed(_rss_item_with_description("A") + _rss_item_with_description("B", link="https://example.com/b"))
+        client = FakeTextClient(response=FakeTextResponse(feed))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        results = asyncio.run(provider.search("query", num_results=1))
+
+        assert len(results) == 1
+
+    def test_empty_query_returns_empty_without_network_call(self) -> None:
+        client = FakeTextClient(response=FakeTextResponse(_rss_feed("")))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        results = asyncio.run(provider.search("   "))
+
+        assert results == []
+        assert client.last_url is None
+
+    def test_network_error_raises_current_news_search_error(self) -> None:
+        client = FakeTextClient(exc=httpx.ConnectError("connection refused"))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        with pytest.raises(CurrentNewsSearchError):
+            asyncio.run(provider.search("story"))
+
+    def test_items_missing_link_are_skipped(self) -> None:
+        feed = _rss_feed(
+            "<item><title>No Link Story</title><pubDate>Thu, 10 Sep 2026 10:00:00 GMT</pubDate>"
+            "<description>Some text.</description></item>" + _rss_item_with_description("Real Story", link="https://example.com/c")
+        )
+        client = FakeTextClient(response=FakeTextResponse(feed))
+        provider = CurrentNewsSearchProvider(client=client)
+
+        results = asyncio.run(provider.search("story"))
+
+        assert len(results) == 1
+        assert results[0]["title"] == "Real Story"

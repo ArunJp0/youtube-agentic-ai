@@ -256,6 +256,30 @@ def get_topic_planner_source(settings: Optional[Settings] = None) -> TopicSource
     raise ProviderConfigError(f"Unknown TOPIC_MODE: '{settings.topic_mode}'. Expected 'evergreen', 'trending', or 'mixed'.")
 
 
+def get_current_news_search_provider(settings: Optional[Settings] = None) -> SearchProvider:
+    """Build the SearchProvider ResearchAgent uses for a topic classified
+    as ``topic_source="current_news"`` (see
+    ``TopicSelectionResult.selected_topic_source``).
+
+    Reuses the same TOPIC_PLANNER_SOURCE mock/real toggle every other
+    topic-source factory here already uses, rather than a new setting -
+    "mock" keeps Research fully offline/deterministic in tests/dev, a real
+    configuration uses the real Google News RSS-backed
+    ``CurrentNewsSearchProvider`` (the exact same infrastructure
+    ``get_current_news_topic_source_provider`` already uses for topic
+    discovery - not a second implementation).
+    """
+    settings = settings or Settings()
+    provider_name = (settings.topic_planner_source or "mock").strip().lower()
+
+    if provider_name == "mock":
+        return MockSearchProvider()
+
+    from src.tools.current_news_topic_source_provider import CurrentNewsSearchProvider
+
+    return CurrentNewsSearchProvider(language=settings.topic_language)
+
+
 def get_ai_video_provider(settings: Optional[Settings] = None) -> Optional[AIVideoProvider]:
     """Build the configured AIVideoProvider, or ``None`` when AI video
     generation is disabled (the safe default) - callers must treat

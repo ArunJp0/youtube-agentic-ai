@@ -251,6 +251,32 @@ class TestScriptAgent:
         assert result.script_notes == "Some gaps remain in the literature."
 
     @pytest.mark.asyncio
+    async def test_generate_script_accepts_current_news_research_result(self, script_agent) -> None:
+        """ScriptAgent must accept a ResearchResult carrying the new
+        current-news provenance fields (source_provider/source_published_at)
+        exactly like any other ResearchResult - these fields are additive
+        and ScriptAgent never needs to read them itself."""
+        research = ResearchResult(
+            topic="Major AI Breakthrough Announced",
+            summary="A major AI breakthrough was announced today by researchers.",
+            key_points=[
+                "Researchers announced a new AI breakthrough today",
+                "The breakthrough was independently reported by two outlets",
+                "Experts say the result could accelerate future research",
+            ],
+            facts=[ResearchFact(claim="The announcement was made today", source="Example News", confidence=0.8)],
+            sources=["https://news.example.com/ai-breakthrough", "https://news.example.com/analysis"],
+            source_provider="current_news",
+            source_published_at=["2026-09-16T08:00:00+00:00", None],
+        )
+
+        result = await script_agent.generate_script(research)
+
+        assert isinstance(result, ScriptResult)
+        assert len(result.sections) > 0
+        assert len(result.sources) == 2
+
+    @pytest.mark.asyncio
     async def test_generate_script_llm_failure_wrapped(self) -> None:
         agent = ScriptAgent(llm_provider=ExplodingLLMProvider())
         research = _sample_research()

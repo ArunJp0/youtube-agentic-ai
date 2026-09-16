@@ -58,8 +58,10 @@ class StubPipelineRunner:
         self.error = error
         self.calls: List[tuple] = []
 
-    async def __call__(self, topic: str, publishing_intent: Optional[PublishingIntent]) -> PipelineState:
-        self.calls.append((topic, publishing_intent))
+    async def __call__(
+        self, topic: str, topic_source: Optional[str], publishing_intent: Optional[PublishingIntent]
+    ) -> PipelineState:
+        self.calls.append((topic, topic_source, publishing_intent))
         if self.error is not None:
             raise self.error
         assert self.state is not None
@@ -161,7 +163,7 @@ async def test_controller_selects_topic_then_calls_existing_pipeline(tmp_path):
     record = await controller.run_once("manual")
 
     assert planner.calls == 1
-    assert pipeline.calls == [("Why is the ocean salty?", controller._publishing_intent)]
+    assert pipeline.calls == [("Why is the ocean salty?", None, controller._publishing_intent)]
     assert record.selected_topic == "Why is the ocean salty?"
     assert record.status == "publishing_disabled"
 
@@ -353,7 +355,7 @@ async def test_lock_released_after_controller_exception(tmp_path):
     planner = StubTopicPlannerAgent(result=make_topic_result())
 
     class ExplodingPipelineRunner:
-        async def __call__(self, topic, publishing_intent):
+        async def __call__(self, topic, topic_source, publishing_intent):
             raise RuntimeError("unexpected crash")
 
     lock_path = str(tmp_path / "run.lock")
@@ -390,7 +392,7 @@ async def test_same_scheduled_occurrence_does_not_duplicate_completed_run(tmp_pa
 
     assert second.run_id == first.run_id
     assert planner.calls == 1  # not called again
-    assert pipeline.calls == [(first.selected_topic, controller._publishing_intent)]  # still just one call
+    assert pipeline.calls == [(first.selected_topic, None, controller._publishing_intent)]  # still just one call
 
 
 async def test_in_progress_scheduled_occurrence_is_retried_not_skipped(tmp_path):

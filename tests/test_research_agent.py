@@ -7,7 +7,7 @@ import pytest
 
 from src.agents.research import ResearchAgent, ResearchAgentError
 from src.llm.mock import MockLLMProvider
-from src.tools.search_provider import MockSearchProvider
+from src.tools.search_provider import MockSearchProvider, SearchProvider
 from src.models.research import ResearchResult, ResearchFact
 
 
@@ -237,3 +237,293 @@ class TestResearchFocusedClaim:
 
         assert await agent.research_focused_claim("", "a claim") is None
         assert await agent.research_focused_claim("Why is the sky blue?", "") is None
+
+
+class _FixedSearchProvider(SearchProvider):
+    """Test double: returns a fixed, caller-supplied result list (or raises
+    a caller-supplied exception), and records every query it was called
+    with - for deterministic, network-free provider-routing/substance-gate
+    tests."""
+
+    def __init__(self, name: str, results=None, error: Exception | None = None) -> None:
+        self._name = name
+        self._results = results if results is not None else []
+        self._error = error
+        self.calls: list[str] = []
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    async def search(self, query: str, num_results: int = 5):
+        self.calls.append(query)
+        if self._error:
+            raise self._error
+        return self._results[:num_results]
+
+
+def _rich_result(url: str, published_at: str | None = None, words: int = 60) -> dict:
+    """A single search result whose snippet has >= ``words`` words -
+    comfortably above DEFAULT_MIN_CONTEXT_WORDS on its own."""
+    snippet = " ".join(["substantive"] * words)
+    return {
+        "title": f"Article about {url}",
+        "url": url,
+        "snippet": snippet,
+        "published_at": published_at,
+        "source_name": "Example News",
+    }
+
+
+def _thin_result(url: str, words: int = 3) -> dict:
+    """A single search result whose snippet is far too short to clear
+    DEFAULT_MIN_CONTEXT_WORDS on its own."""
+    return {"title": f"Thin result {url}", "url": url, "snippet": " ".join(["x"] * words)}
+
+
+class TestTopicSourceAwareProviderRouting:
+    """Covers STEP 2's core routing requirement: which SearchProvider(s)
+    ResearchAgent tries is driven purely by the ``topic_source``
+    classification hint, never by the topic's own text/content."""
+
+    @pytest.mark.asyncio
+    async def test_evergreen_topic_source_uses_default_provider_only(self) -> None:
+        """topic_source=None (evergreen/no classification) must behave
+        exactly as before: only the default search_provider is ever
+        called, even when a current_news_search_provider is configured."""
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_rich_result("https://en.wikipedia.org/wiki/X")])
+        current_news = _FixedSearchProvider("current_news", results=[_rich_result("https://news.example.com/a")])
+        agent = ResearchAgent(
+            search_provider=wikipedia,
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news,
+        )
+
+        result = await agent.research("Why do cats purr?", topic_source=None)
+
+        assert result.source_provider == "wikipedia"
+        assert wikipedia.calls == ["Why do cats purr?"]
+        assert current_news.calls == []  # never invoked for a non-current-news topic
+
+    @pytest.mark.asyncio
+    async def test_current_news_topic_source_routes_to_current_news_provider_first(self) -> None:
+        """topic_source='current_news' with a sufficient current-news result
+        must be satisfied by current_news alone - Wikipedia is never even
+        called once current_news already has enough substance."""
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_rich_result("https://en.wikipedia.org/wiki/X")])
+        current_news = _FixedSearchProvider(
+            "current_news", results=[_rich_result("https://news.example.com/a", published_at="2026-09-15T12:00:00+00:00")]
+        )
+        agent = ResearchAgent(
+            search_provider=wikipedia,
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news,
+        )
+
+        result = await agent.research("Company announces new product today", topic_source="current_news")
+
+        assert result.source_provider == "current_news"
+        assert current_news.calls == ["Company announces new product today"]
+        assert wikipedia.calls == []  # thin/absent Wikipedia can't have "killed" a result it was never asked for
+
+    @pytest.mark.asyncio
+    async def test_current_news_topic_source_with_no_configured_provider_falls_back_to_default(self) -> None:
+        """A current-news classified topic with no current_news_search_provider
+        wired in (e.g. not configured for this environment) degrades
+        gracefully to the exact original single-provider behavior."""
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_rich_result("https://en.wikipedia.org/wiki/X")])
+        agent = ResearchAgent(search_provider=wikipedia, llm_provider=MockLLMProvider())
+
+        result = await agent.research("Some current event", topic_source="current_news")
+
+        assert result.source_provider == "wikipedia"
+
+    @pytest.mark.asyncio
+    async def test_mixed_topic_path_evergreen_selection_uses_default_provider(self) -> None:
+        """The 'mixed' Topic Planner mode can select either an evergreen or
+        a current-news candidate; when it selects evergreen (topic_source is
+        the evergreen candidate's own source, not 'current_news'), research
+        must route to the default provider exactly like a pure-evergreen
+        topic would."""
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_rich_result("https://en.wikipedia.org/wiki/Y")])
+        current_news = _FixedSearchProvider("current_news", results=[_rich_result("https://news.example.com/b")])
+        agent = ResearchAgent(
+            search_provider=wikipedia,
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news,
+        )
+
+        result = await agent.research("Why is the ocean salty?", topic_source="youtube")
+
+        assert result.source_provider == "wikipedia"
+        assert current_news.calls == []
+
+
+class TestThinWikipediaDoesNotKillValidCurrentNewsResearch:
+    @pytest.mark.asyncio
+    async def test_exploding_wikipedia_does_not_prevent_sufficient_current_news_result(self) -> None:
+        """Even if Wikipedia would outright error for a current-news query,
+        that must never surface as a failure when current_news alone
+        already cleared the substance bar - Wikipedia isn't consulted."""
+        wikipedia = _FixedSearchProvider("wikipedia", error=RuntimeError("simulated Wikipedia outage"))
+        current_news = _FixedSearchProvider(
+            "current_news", results=[_rich_result("https://news.example.com/c", published_at="2026-09-16T00:00:00+00:00")]
+        )
+        agent = ResearchAgent(
+            search_provider=wikipedia,
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news,
+        )
+
+        result = await agent.research("Breaking story today", topic_source="current_news")
+
+        assert result.source_provider == "current_news"
+        assert len(result.sources) == 1
+
+    @pytest.mark.asyncio
+    async def test_thin_current_news_is_supplemented_by_wikipedia_not_discarded(self) -> None:
+        """A thin (but non-empty) current_news result should not be thrown
+        away outright - the chain continues to try Wikipedia as a bounded
+        second attempt, and if Wikipedia alone is sufficient, it is used."""
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_rich_result("https://en.wikipedia.org/wiki/Z")])
+        current_news = _FixedSearchProvider("current_news", results=[_thin_result("https://news.example.com/d")])
+        agent = ResearchAgent(
+            search_provider=wikipedia,
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news,
+        )
+
+        result = await agent.research("Developing story", topic_source="current_news")
+
+        assert result.source_provider == "wikipedia"
+        assert current_news.calls == ["Developing story"]
+        assert wikipedia.calls == ["Developing story"]
+
+
+class TestInsufficientResearchExplicitFailure:
+    @pytest.mark.asyncio
+    async def test_insufficient_material_across_all_providers_raises_explicit_error(self) -> None:
+        """When neither current_news nor Wikipedia can produce enough
+        combined substance, ResearchAgent must fail loudly and
+        deterministically rather than silently synthesizing a script from
+        thin/tangential material."""
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_thin_result("https://en.wikipedia.org/wiki/Thin")])
+        current_news = _FixedSearchProvider("current_news", results=[_thin_result("https://news.example.com/e")])
+        agent = ResearchAgent(
+            search_provider=wikipedia,
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news,
+        )
+
+        with pytest.raises(ResearchAgentError, match="Insufficient research material"):
+            await agent.research("Obscure breaking micro-story", topic_source="current_news")
+
+    @pytest.mark.asyncio
+    async def test_default_single_provider_path_never_raises_for_thin_results(self) -> None:
+        """Regression guard: the pre-existing, default (no topic_source)
+        single-provider path must keep its original tolerant behavior -
+        thin Wikipedia results alone were never an explicit-failure
+        condition before this milestone, and still aren't."""
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_thin_result("https://en.wikipedia.org/wiki/Thin")])
+        agent = ResearchAgent(search_provider=wikipedia, llm_provider=MockLLMProvider())
+
+        result = await agent.research("Why do cats purr?")
+
+        assert result.topic == "Why do cats purr?"
+        assert result.source_provider == "wikipedia"
+
+
+class TestProvenancePreserved:
+    @pytest.mark.asyncio
+    async def test_source_urls_and_published_at_preserved_and_aligned(self) -> None:
+        current_news = _FixedSearchProvider(
+            "current_news",
+            results=[
+                _rich_result("https://news.example.com/f", published_at="2026-09-14T08:30:00+00:00"),
+                _rich_result("https://news.example.com/g", published_at=None),
+            ],
+        )
+        agent = ResearchAgent(
+            search_provider=_FixedSearchProvider("wikipedia"),
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news,
+        )
+
+        result = await agent.research("Major event unfolds", topic_source="current_news")
+
+        assert result.source_provider == "current_news"
+        assert len(result.sources) == 2
+        assert len(result.source_published_at) == len(result.sources)
+        assert result.source_published_at[0] == "2026-09-14T08:30:00+00:00"
+        assert result.source_published_at[1] is None
+        assert str(result.sources[0]) == "https://news.example.com/f"
+
+    @pytest.mark.asyncio
+    async def test_legacy_default_path_still_reports_source_provider(self) -> None:
+        """source_provider is populated on every path, including the
+        pre-existing default single-provider one - useful diagnostic
+        metadata, not a behavior change for existing callers who simply
+        ignore the new field."""
+        agent = ResearchAgent(search_provider=MockSearchProvider(), llm_provider=MockLLMProvider())
+
+        result = await agent.research("Why do humans dream?")
+
+        assert result.source_provider is not None
+
+
+class TestKeyPointPreambleParsingRegression:
+    """Regression test for the real, reproducible Gemini habit of prefixing
+    a key-points response with an unmarked, colon-terminated meta-commentary
+    line (e.g. 'Based on the provided source material, here are 5 key
+    points:') that was previously counted as a fabricated first point."""
+
+    def test_leading_preamble_line_is_dropped(self) -> None:
+        text = (
+            "Based on the provided source material, here are 5 key points:\n"
+            "1. Dreams occur mainly during REM sleep.\n"
+            "2. Dreaming helps consolidate memories.\n"
+            "3. Most adults dream for about two hours a night.\n"
+        )
+
+        points = ResearchAgent._parse_bullet_points(text)
+
+        assert points == [
+            "Dreams occur mainly during REM sleep.",
+            "Dreaming helps consolidate memories.",
+            "Most adults dream for about two hours a night.",
+        ]
+
+    def test_leading_blank_lines_before_preamble_still_stripped(self) -> None:
+        """The fix tracks the first NON-BLANK line, not raw line index - a
+        response with leading blank lines before the preamble must still
+        drop the preamble correctly."""
+        text = (
+            "\n\n"
+            "Here are the key points:\n"
+            "- Point one.\n"
+            "- Point two.\n"
+        )
+
+        points = ResearchAgent._parse_bullet_points(text)
+
+        assert points == ["Point one.", "Point two."]
+
+    def test_a_real_bullet_first_line_is_never_dropped(self) -> None:
+        """A genuine first bullet point that happens to end with ':' (e.g.
+        a point introducing a list of examples) must NOT be stripped -
+        only an unmarked line is eligible."""
+        text = "- Key finding one: temperatures rose significantly.\n- Key finding two.\n"
+
+        points = ResearchAgent._parse_bullet_points(text)
+
+        assert points == [
+            "Key finding one: temperatures rose significantly.",
+            "Key finding two.",
+        ]
+
+    def test_no_preamble_present_all_points_kept(self) -> None:
+        text = "- Point one.\n- Point two.\n- Point three.\n"
+
+        points = ResearchAgent._parse_bullet_points(text)
+
+        assert points == ["Point one.", "Point two.", "Point three."]

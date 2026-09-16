@@ -2,13 +2,30 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import HttpUrl
 
 from src.models.research import ResearchResult, ResearchFact
 from src.tools.search_provider import SearchProvider
 from src.llm.provider import LLMProvider
+
+# Deterministic minimum-substance gate for the multi-provider (topic-source-
+# aware) search chain only - never applied to the default single-provider
+# path, which keeps its exact prior tolerant behavior. Combined snippet
+# word count below this is treated as "insufficient reliable research",
+# not silently handed to the LLM to make the best of scattered/tangential
+# material (see research()'s explicit-failure branch).
+DEFAULT_MIN_CONTEXT_WORDS = 40
+
+
+def _has_sufficient_substance(results: List[Dict[str, Any]], min_words: int) -> bool:
+    """Deterministic, provider-agnostic substance check: total combined
+    snippet word count across ``results`` at/above ``min_words``. Never
+    inspects content/meaning - purely a length gate, so it can never
+    become a topic-specific heuristic."""
+    total_words = sum(len((r.get("snippet") or "").split()) for r in results)
+    return total_words >= min_words
 
 
 class ResearchAgentError(Exception):
@@ -24,6 +41,18 @@ class ResearchAgent:
     2. Queries search provider for relevant sources
     3. Uses LLM to organize/summarize findings
     4. Returns structured ResearchResult
+
+    Source selection is topic-CHARACTERISTIC-aware, not topic-text-aware:
+    ``research(topic, topic_source=...)``'s optional ``topic_source`` hint
+    (e.g. ``"current_news"``, mirroring ``TopicCandidate.source``/
+    ``TopicSelectionResult.selected_topic_source`` - the Topic Planner's own
+    real classification of where the topic came from) decides which
+    provider(s) to try, never a keyword/content heuristic over the topic
+    string itself. Wikipedia (the default ``search_provider``) remains the
+    sole source for the default/evergreen path (topic_source is anything
+    other than "current_news", or no ``current_news_search_provider`` is
+    configured) - existing behavior for every current call site is
+    byte-for-byte unchanged.
     """
 
     def __init__(
@@ -32,59 +61,129 @@ class ResearchAgent:
         llm_provider: LLMProvider,
         max_sources: int = 5,
         timeout_seconds: float = 30.0,
+        current_news_search_provider: Optional[SearchProvider] = None,
+        min_context_words: int = DEFAULT_MIN_CONTEXT_WORDS,
     ) -> None:
         """Initialize the Research Agent.
 
         Args:
-            search_provider: Implementation of SearchProvider for retrieving sources
+            search_provider: Implementation of SearchProvider for retrieving
+                sources - the default/evergreen path (e.g. Wikipedia)
             llm_provider: Implementation of LLMProvider for synthesis
             max_sources: Maximum number of sources to retrieve
             timeout_seconds: Timeout for search operations
+            current_news_search_provider: Optional SearchProvider used only
+                when ``research(topic, topic_source="current_news")`` is
+                called - e.g. ``CurrentNewsSearchProvider``, reusing the
+                same real Google News RSS infrastructure the Topic Planner
+                already trusts. ``None`` (default) means current-news topics
+                fall back to the same single default provider as before -
+                never a hard requirement, always a graceful degrade.
+            min_context_words: Deterministic minimum combined-snippet word
+                count required before proceeding to LLM synthesis, when
+                more than one provider is in play (see class docstring) -
+                never applied to the default single-provider path.
         """
         self.search_provider = search_provider
         self.llm_provider = llm_provider
         self.max_sources = max_sources
         self.timeout_seconds = timeout_seconds
+        self.current_news_search_provider = current_news_search_provider
+        self.min_context_words = min_context_words
 
-    async def research(self, topic: str) -> ResearchResult:
+    async def research(self, topic: str, topic_source: Optional[str] = None) -> ResearchResult:
         """Execute full research workflow for a topic.
 
         Args:
             topic: Research topic/query
+            topic_source: Optional classification of where this topic came
+                from (mirrors ``TopicCandidate.source``, e.g.
+                ``"current_news"``) - selects which search provider(s) to
+                try; ``None`` (default) preserves the exact original
+                single-provider behavior.
 
         Returns:
             Structured ResearchResult with findings
 
         Raises:
-            ResearchAgentError: If research fails
+            ResearchAgentError: If research fails, or - only on the
+                multi-provider current-news-aware path - if every provider
+                tried produced insufficient reliable material (explicit,
+                deterministic failure rather than silently proceeding on
+                thin/tangential content).
         """
         if not topic or not topic.strip():
             raise ResearchAgentError("Topic cannot be empty")
 
-        # Step 1: Search for sources
-        try:
-            raw_results = await asyncio.wait_for(
-                self.search_provider.search(topic, self.max_sources),
-                timeout=self.timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            raise ResearchAgentError(f"Search timed out after {self.timeout_seconds}s")
-        except Exception as e:
-            raise ResearchAgentError(f"Search failed: {e}")
+        providers = self._select_search_providers(topic_source)
+
+        # Step 1: Search for sources - try each candidate provider in
+        # order, stopping at the first with sufficient substance. A
+        # provider failing outright (timeout/exception) is isolated and
+        # skipped, never crashing the whole call, mirroring
+        # CompositeTopicSourceProvider's own per-source failure isolation.
+        raw_results: List[Dict[str, Any]] = []
+        used_provider_label: Optional[str] = None
+        providers_tried: List[str] = []
+        last_error: Optional[str] = None
+
+        for provider in providers:
+            label = getattr(provider, "name", type(provider).__name__)
+            providers_tried.append(label)
+            try:
+                results = await asyncio.wait_for(
+                    provider.search(topic, self.max_sources),
+                    timeout=self.timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                last_error = f"{label} search timed out after {self.timeout_seconds}s"
+                continue
+            except Exception as e:
+                last_error = f"{label} search failed: {e}"
+                continue
+
+            if not raw_results and results:
+                # Keep the first non-empty result as a best-effort
+                # candidate even if it turns out too thin - never discard
+                # real results just because a later provider might do
+                # better.
+                raw_results, used_provider_label = results, label
+            if _has_sufficient_substance(results, self.min_context_words):
+                raw_results, used_provider_label = results, label
+                break
 
         if not raw_results:
-            # Return empty but valid result
+            # Existing, unchanged explicit-empty-result path - a genuine
+            # zero-results case across every provider tried.
+            tried = ", ".join(providers_tried) or "none"
+            notes = f"Search returned no results. Providers tried: {tried}."
+            if last_error:
+                notes += f" Last error: {last_error}"
             return ResearchResult(
                 topic=topic,
                 summary="No sources found for this topic.",
                 key_points=[],
                 facts=[],
                 sources=[],
-                research_notes="Search returned no results.",
+                research_notes=notes,
+                source_provider=used_provider_label,
+            )
+
+        if len(providers) > 1 and not _has_sufficient_substance(raw_results, self.min_context_words):
+            # Multi-provider (topic-source-aware) chain only - explicit,
+            # deterministic failure rather than silently synthesizing from
+            # thin/tangential material (STEP 2's explicit requirement).
+            # The default single-provider path never reaches this branch,
+            # preserving its original tolerant behavior exactly.
+            word_count = sum(len((r.get("snippet") or "").split()) for r in raw_results)
+            raise ResearchAgentError(
+                f"Insufficient research material for '{topic}' after trying {', '.join(providers_tried)} "
+                f"({word_count} context words, below the {self.min_context_words}-word minimum)."
             )
 
         # Step 2: Extract sources and snippets
         sources: List[HttpUrl] = []
+        source_published_at: List[Optional[str]] = []
         snippets: List[str] = []
 
         for result in raw_results:
@@ -92,7 +191,8 @@ class ResearchAgent:
                 try:
                     sources.append(HttpUrl(result["url"]))
                 except Exception:
-                    pass  # Skip invalid URLs
+                    continue  # Skip invalid URLs - and their paired published_at, so lists stay aligned
+                source_published_at.append(result.get("published_at"))
             if "snippet" in result:
                 snippets.append(result["snippet"])
 
@@ -114,7 +214,20 @@ class ResearchAgent:
             facts=facts,
             sources=sources,
             research_notes=research_notes,
+            source_provider=used_provider_label,
+            source_published_at=source_published_at,
         )
+
+    def _select_search_providers(self, topic_source: Optional[str]) -> List[SearchProvider]:
+        """Choose which provider(s) to try, based purely on the topic's own
+        SOURCE CLASSIFICATION (never its text/content) - see class
+        docstring. Returns exactly one provider (the existing default)
+        unless a current-news topic AND a configured news provider both
+        apply, in which case current-news is tried first, Wikipedia second
+        as a bounded background/fallback attempt."""
+        if topic_source == "current_news" and self.current_news_search_provider is not None:
+            return [self.current_news_search_provider, self.search_provider]
+        return [self.search_provider]
 
     async def research_focused_claim(self, topic: str, claim: str) -> Optional[ResearchFact]:
         """Bounded, single-claim research refresh for Compliance Remediation:
@@ -213,20 +326,44 @@ class ResearchAgent:
 
     @staticmethod
     def _parse_bullet_points(text: str) -> List[str]:
-        """Parse bullet points from LLM response."""
-        points = []
-        for line in text.split("\n"):
-            line = line.strip()
+        """Parse bullet points from LLM response.
+
+        A leading line that isn't itself a bullet/numbered item (e.g. "Here
+        are 5 key points extracted from the provided text:") is a real,
+        reproducible LLM habit - observed directly with real Gemini
+        responses - and was previously kept as if it were a genuine point.
+        Only the very FIRST line is ever eligible to be dropped this way
+        (a real point appearing later that happens to end in ":" is never
+        touched), and only when it has no bullet/number marker of its own -
+        a narrow, targeted fix, not a rewrite of the parser.
+        """
+        points: List[str] = []
+        seen_first_nonblank_line = False
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
             if not line:
                 continue
+            is_first_nonblank_line = not seen_first_nonblank_line
+            seen_first_nonblank_line = True
+
+            has_marker = False
             # Remove common bullet prefixes
             for prefix in ("•", "-", "*", "–", "—"):
                 if line.startswith(prefix):
                     line = line[len(prefix):].strip()
+                    has_marker = True
                     break
             # Remove numbering like "1."
-            if line and line[0].isdigit() and "." in line[:3]:
+            if not has_marker and line and line[0].isdigit() and "." in line[:3]:
                 line = line.split(".", 1)[1].strip()
+                has_marker = True
+
+            if is_first_nonblank_line and not has_marker and line.endswith(":"):
+                # Unmarked, colon-terminated opening line - introductory
+                # meta-commentary, not a real point (e.g. "Based on the
+                # provided source material, here are 5 key points:").
+                continue
+
             if line:
                 points.append(line)
         return points[:7]  # Cap at 7 points

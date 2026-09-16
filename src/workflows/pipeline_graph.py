@@ -71,6 +71,7 @@ from src.services.voice_service import DEFAULT_OUTPUT_DIR, VoiceService, VoiceSe
 from src.tools.ffmpeg_video_assembler import VideoAssembler
 from src.tools.media_provider import MediaProvider
 from src.tools.music_catalog_provider import MusicCatalogProvider
+from src.tools.search_provider import SearchProvider
 from src.tools.transcription_provider import TranscriptionProvider
 from src.tools.visual_relevance_evaluator import VisualRelevanceEvaluator
 from src.tools.voice_provider import VoiceProvider
@@ -203,6 +204,8 @@ def build_pipeline_graph(
     ai_video_provider: Optional[AIVideoProvider] = None,
     ai_video_max_retries: int = 2,
     stock_fallback_enabled: bool = True,
+    topic_source: Optional[str] = None,
+    current_news_search_provider: Optional[SearchProvider] = None,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
@@ -330,11 +333,29 @@ def build_pipeline_graph(
             exhausts its retries, fall back to ``media_provider`` if True
             (default); if False, that slot fails cleanly instead of
             silently fetching stock footage.
+        topic_source: Optional classification of where ``topic`` came from
+            (mirrors ``TopicCandidate.source``/
+            ``TopicSelectionResult.selected_topic_source``, e.g.
+            ``"current_news"``) - passed through to
+            ``ResearchAgent.research()`` to select an appropriate search
+            provider. ``None`` (default) preserves the exact existing
+            single-provider (Wikipedia) research behavior.
+        current_news_search_provider: Optional SearchProvider used only
+            when ``topic_source == "current_news"`` (e.g.
+            ``CurrentNewsSearchProvider``) - reuses the real current-news
+            infrastructure instead of asking Wikipedia about a recent
+            event it cannot reasonably contain yet. ``None`` (default)
+            means current-news topics fall back to the same single
+            ``search_provider`` as before.
 
     Returns:
         StateGraph ready to be ``.compile()``d
     """
-    research_agent = ResearchAgent(search_provider=search_provider, llm_provider=llm_provider)
+    research_agent = ResearchAgent(
+        search_provider=search_provider,
+        llm_provider=llm_provider,
+        current_news_search_provider=current_news_search_provider,
+    )
     script_agent = ScriptAgent(llm_provider=llm_provider, word_budget=script_word_budget)
     voice_service = VoiceService(
         voice_provider=voice_provider, voice_name=voice_name, output_dir=voice_output_dir
@@ -408,7 +429,7 @@ def build_pipeline_graph(
 
     async def research_node(state: PipelineState) -> dict:
         try:
-            result = await research_agent.research(state.topic)
+            result = await research_agent.research(state.topic, topic_source=topic_source)
             return {"research_result": result, "status": "researched", "error": None}
         except ResearchAgentError as e:
             return {"research_result": None, "status": "failed", "error": f"Research failed: {e}"}
@@ -1230,6 +1251,8 @@ async def run_pipeline(
     ai_video_provider: Optional[AIVideoProvider] = None,
     ai_video_max_retries: int = 2,
     stock_fallback_enabled: bool = True,
+    topic_source: Optional[str] = None,
+    current_news_search_provider: Optional[SearchProvider] = None,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
@@ -1328,6 +1351,12 @@ async def run_pipeline(
         stock_fallback_enabled: Fall back to stock media when AI
             generation exhausts its retries (default True); if False, the
             slot fails cleanly instead of silently fetching stock footage.
+        topic_source: Optional classification of where ``topic`` came from
+            (e.g. ``"current_news"``) - selects an appropriate research
+            search provider; ``None`` (default) preserves existing
+            single-provider (Wikipedia) research behavior.
+        current_news_search_provider: Optional SearchProvider used only
+            when ``topic_source == "current_news"``.
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -1358,6 +1387,8 @@ async def run_pipeline(
         ai_video_provider,
         ai_video_max_retries,
         stock_fallback_enabled,
+        topic_source,
+        current_news_search_provider,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 

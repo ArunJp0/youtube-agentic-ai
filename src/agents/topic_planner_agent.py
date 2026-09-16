@@ -281,6 +281,9 @@ class TopicPlannerAgent:
             top_candidates=scores[:5],
             is_sensitive=best.candidate.is_sensitive,
             sensitivity_reasons=best.candidate.sensitivity_reasons,
+            selected_topic_source=best.candidate.source,
+            selected_topic_source_url=best.candidate.source_url,
+            selected_topic_published_at=best.candidate.published_at,
         )
         return self._persist(result)
 

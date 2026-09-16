@@ -43,3 +43,13 @@ class ResearchResult(BaseModel):
         default=None,
         description="Additional notes from the research process",
     )
+    source_provider: Optional[str] = Field(
+        default=None,
+        description="Which SearchProvider(s) actually supplied the source material used, e.g. "
+        "'wikipedia' or 'current_news' - None for a legacy/pre-existing result that predates this field",
+    )
+    source_published_at: List[Optional[str]] = Field(
+        default_factory=list,
+        description="ISO 8601 UTC publish timestamp parallel to `sources` (same index, same length when "
+        "populated) - None per-entry when a given source has no known publish date (e.g. Wikipedia)",
+    )

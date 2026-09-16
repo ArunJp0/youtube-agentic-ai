@@ -28,11 +28,14 @@ from src.services.run_lock import RunLock, RunLockError
 from src.services.script_context_reconstruction import original_base_name
 from src.workflows.pipeline_graph import PipelineState
 
-# (topic, publishing_intent) -> final PipelineState. In production this
-# closes over real providers built from Settings (see
+# (topic, topic_source, publishing_intent) -> final PipelineState.
+# topic_source mirrors TopicSelectionResult.selected_topic_source (e.g.
+# "current_news") - threaded through so run_pipeline can route Research to
+# an appropriate search provider; None for a topic with no classification.
+# In production this closes over real providers built from Settings (see
 # build_default_pipeline_runner below); tests inject a stub directly, so
 # the controller itself never imports/constructs a single provider.
-PipelineRunner = Callable[[str, Optional[PublishingIntent]], Awaitable[PipelineState]]
+PipelineRunner = Callable[[str, Optional[str], Optional[PublishingIntent]], Awaitable[PipelineState]]
 
 # PipelineState.status values that mean "Compliance did not clear this run
 # for publishing" - review_exhausted is the bounded-remediation-loop's own
@@ -165,7 +168,9 @@ class AutonomousRunController:
             return self._finish(record)
 
         try:
-            pipeline_state = await self._pipeline_runner(topic_result.selected_topic, self._publishing_intent)
+            pipeline_state = await self._pipeline_runner(
+                topic_result.selected_topic, topic_result.selected_topic_source, self._publishing_intent
+            )
         except Exception as e:
             # STEP 8: pipeline generation failure -> record FAILED -> never publish.
             return self._fail(record, e)

@@ -137,3 +137,19 @@ class TopicSelectionResult(BaseModel):
         "to signal downstream Research/Compliance to apply stricter treatment",
     )
     sensitivity_reasons: List[str] = Field(default_factory=list)
+
+    # ---- selected candidate's own source classification/provenance -----
+    # Mirrors the winning TopicCandidate's own fields (also inspectable via
+    # top_candidates[0].candidate, but surfaced directly here so a caller
+    # never has to reach into top_candidates just to learn "was this a
+    # current-news topic" - the signal ResearchAgent's provider selection
+    # is driven by; see src.agents.research.ResearchAgent).
+    selected_topic_source: Optional[str] = Field(
+        default=None, description="The winning candidate's own TopicSourceProvider name, e.g. 'current_news'"
+    )
+    selected_topic_source_url: Optional[str] = Field(
+        default=None, description="The winning candidate's source URL, when it came from a real news source"
+    )
+    selected_topic_published_at: Optional[str] = Field(
+        default=None, description="The winning candidate's ISO 8601 UTC publish timestamp, when known"
+    )

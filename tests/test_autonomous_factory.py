@@ -119,7 +119,7 @@ class TestBuildPipelineRunnerDurationWiring:
             "src.orchestration.autonomous_factory.run_pipeline", new_callable=AsyncMock
         ) as mock_run_pipeline:
             runner = build_pipeline_runner(settings)
-            asyncio.run(runner("Some topic", None))
+            asyncio.run(runner("Some topic", None, None))
 
         _, kwargs = mock_run_pipeline.call_args
         assert kwargs["script_word_budget"] == expected_budget
@@ -141,7 +141,7 @@ class TestBuildPipelineRunnerDurationWiring:
             "src.orchestration.autonomous_factory.run_pipeline", new_callable=AsyncMock
         ) as mock_run_pipeline:
             runner = build_pipeline_runner(settings)
-            asyncio.run(runner("Some topic", None))
+            asyncio.run(runner("Some topic", None, None))
 
         _, kwargs = mock_run_pipeline.call_args
         assert kwargs["ai_video_provider"] is not None
@@ -162,7 +162,7 @@ class TestBuildPipelineRunnerDurationWiring:
             "src.orchestration.autonomous_factory.run_pipeline", new_callable=AsyncMock
         ) as mock_run_pipeline:
             runner = build_pipeline_runner(settings)
-            asyncio.run(runner("Some topic", None))
+            asyncio.run(runner("Some topic", None, None))
 
         _, kwargs = mock_run_pipeline.call_args
         assert kwargs["ai_video_provider"] is None
@@ -182,7 +182,7 @@ class TestBuildPipelineRunnerDurationWiring:
             "src.orchestration.autonomous_factory.run_pipeline", new_callable=AsyncMock
         ) as mock_run_pipeline:
             runner = build_pipeline_runner(settings)
-            asyncio.run(runner("Some topic", None))
+            asyncio.run(runner("Some topic", None, None))
 
         _, kwargs = mock_run_pipeline.call_args
         assert kwargs["script_word_budget"].target_duration_minutes == 9.0

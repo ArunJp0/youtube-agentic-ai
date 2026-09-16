@@ -14,6 +14,7 @@ from src.agents.topic_planner_agent import TopicPlannerAgent
 from src.agents.topic_ranking_planner import TopicRankingPlanner
 from src.config.providers import (
     get_ai_video_provider,
+    get_current_news_search_provider,
     get_llm_provider,
     get_media_provider,
     get_search_provider,
@@ -111,8 +112,11 @@ def build_pipeline_runner(settings: Settings) -> PipelineRunner:
         resolve_target_duration_minutes(settings.script_duration_profile, settings.script_target_duration_minutes)
     )
     ai_video_provider = get_ai_video_provider(settings)
+    current_news_search_provider = get_current_news_search_provider(settings)
 
-    async def _run(topic: str, publishing_intent: Optional[PublishingIntent]) -> PipelineState:
+    async def _run(
+        topic: str, topic_source: Optional[str], publishing_intent: Optional[PublishingIntent]
+    ) -> PipelineState:
         youtube_client = _build_youtube_client(settings) if publishing_intent and publishing_intent.mode != "disabled" else None
         return await run_pipeline(
             topic,
@@ -131,6 +135,8 @@ def build_pipeline_runner(settings: Settings) -> PipelineRunner:
             ai_video_provider=ai_video_provider,
             ai_video_max_retries=settings.ai_video_max_retries,
             stock_fallback_enabled=settings.stock_fallback_enabled,
+            topic_source=topic_source,
+            current_news_search_provider=current_news_search_provider,
         )
 
     return _run

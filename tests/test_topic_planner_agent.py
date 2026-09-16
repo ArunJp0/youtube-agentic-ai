@@ -1028,3 +1028,94 @@ class TestMixedModeSelection:
         assert result.success is True
         assert result.duplicate_count == 1
         assert result.selected_topic != "Why Do Cats Purr"
+
+
+class TestResearchHandoffProvenance:
+    """Proves the TopicPlanner -> ResearchAgent handoff carries the winning
+    candidate's own source classification/provenance through, rather than
+    discarding everything except the bare topic string - the exact gap this
+    milestone closes so ResearchAgent can route current-news topics to an
+    appropriate provider."""
+
+    def test_current_news_selection_surfaces_topic_source_for_research_routing(self, tmp_path) -> None:
+        news = _news_candidate("Major AI Breakthrough Announced", hours_old=1, source_name="Source A")
+        news.source_url = "https://source-a.example.com/ai-breakthrough"
+        provider = MockTopicSourceProvider(candidates=[news])
+        agent = TopicPlannerAgent(
+            topic_source_provider=provider,
+            topic_plan_store=TopicPlanStore(str(tmp_path / "plans")),
+            provenance_output_dir=str(tmp_path / "provenance"),
+            mode="trending",
+        )
+
+        result = asyncio.run(agent.plan_topic())
+
+        assert result.success is True
+        assert result.selected_topic_source == "current_news"
+        assert result.selected_topic_source_url == "https://source-a.example.com/ai-breakthrough"
+        assert result.selected_topic_published_at == news.published_at
+
+    def test_evergreen_selection_has_no_current_news_routing_signal(self, tmp_path) -> None:
+        provider = MockTopicSourceProvider(candidates=[_candidate("Why do cats purr?")])
+        agent = TopicPlannerAgent(
+            topic_source_provider=provider,
+            topic_plan_store=TopicPlanStore(str(tmp_path / "plans")),
+            provenance_output_dir=str(tmp_path / "provenance"),
+        )
+
+        result = asyncio.run(agent.plan_topic())
+
+        assert result.success is True
+        assert result.selected_topic_source == "mock"
+        assert result.selected_topic_source != "current_news"
+
+    def test_mixed_mode_news_selection_routes_research_to_current_news_provider(self, tmp_path) -> None:
+        """End-to-end handoff: a mixed-mode run that selects a news
+        candidate must produce a `selected_topic_source` that, when passed
+        into ResearchAgent.research(), actually selects the current-news
+        search provider - the full path this milestone was asked to fix."""
+        from src.agents.research import ResearchAgent
+        from src.llm.mock import MockLLMProvider
+        from tests.test_research_agent import _FixedSearchProvider, _rich_result
+
+        evergreen = _candidate("Why do cats purr?", popularity=0.5)
+        # Two independent outlets reporting the same fresh story (cross-source
+        # corroboration), matching TestMixedModeSelection's own pattern for
+        # a fresh story to legitimately outweigh an evergreen candidate.
+        fresh_news_a = _news_candidate("Major AI Breakthrough Announced", hours_old=1, source_name="Source A")
+        fresh_news_b = _news_candidate("Major AI Breakthrough Announced Today", hours_old=1, source_name="Source B")
+        provider = CompositeTopicSourceProvider(
+            [
+                MockTopicSourceProvider(candidates=[evergreen], provider_name="evergreen"),
+                MockTopicSourceProvider(candidates=[fresh_news_a, fresh_news_b], provider_name="news"),
+            ]
+        )
+        llm = RecordingLLMProvider(response=_valid_ranking_response([evergreen, fresh_news_a, fresh_news_b]))
+        agent = TopicPlannerAgent(
+            topic_source_provider=provider,
+            ranking_planner=TopicRankingPlanner(llm),
+            topic_plan_store=TopicPlanStore(str(tmp_path / "plans")),
+            provenance_output_dir=str(tmp_path / "provenance"),
+            mode="mixed",
+            freshness_hours=48,
+        )
+
+        plan_result = asyncio.run(agent.plan_topic())
+        assert plan_result.selected_topic == "Major AI Breakthrough Announced"
+        assert plan_result.selected_topic_source == "current_news"
+
+        current_news_provider = _FixedSearchProvider(
+            "current_news", results=[_rich_result("https://news.example.com/ai-breakthrough")]
+        )
+        research_agent = ResearchAgent(
+            search_provider=MockSearchProvider(),
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=current_news_provider,
+        )
+
+        research_result = asyncio.run(
+            research_agent.research(plan_result.selected_topic, topic_source=plan_result.selected_topic_source)
+        )
+
+        assert research_result.source_provider == "current_news"
+        assert current_news_provider.calls == ["Major AI Breakthrough Announced"]
