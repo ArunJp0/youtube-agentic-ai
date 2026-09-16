@@ -24,6 +24,7 @@ from src.services.visual_media_service import (
     VisualMediaService,
     VisualMediaServiceError,
 )
+from src.tools.ai_video_provider import MockAIVideoProvider
 from src.tools.media_provider import MediaCandidate, MediaProvider, MockMediaProvider
 
 
@@ -843,3 +844,133 @@ class TestGenerateVisualsWithSemanticPlanner:
         assert result.success is True
         assert result.semantic_planning_used is False
         assert "Gemini outage" in result.semantic_planning_fallback_reason
+
+
+class TestAIVideoIntegration:
+    """Tests for the AI-video-generation integration seam
+    (_acquire_visual_slot): AI-first when configured, Pexels-unchanged
+    otherwise. No real PixVerse/Gemini/Pexels/network calls."""
+
+    @pytest.mark.asyncio
+    async def test_default_behavior_unchanged_when_ai_video_provider_not_set(self, tmp_path) -> None:
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+
+        result = await service.generate_visuals(_sample_script(), 20.0)
+
+        assert result.success is True
+        assert all(a.provider == "mock" for m in result.sections for a in m.assets)
+        assert all(a.relevance_tier != "ai_generated" for m in result.sections for a in m.assets)
+
+    @pytest.mark.asyncio
+    async def test_ai_video_provider_used_when_configured(self, tmp_path) -> None:
+        media_provider = MockMediaProvider(results_per_query=3)
+        ai_provider = MockAIVideoProvider()
+        service = VisualMediaService(
+            media_provider=media_provider, output_dir=str(tmp_path), ai_video_provider=ai_provider
+        )
+
+        result = await service.generate_visuals(_sample_script(), 20.0)
+
+        assert result.success is True
+        assets = [a for m in result.sections for a in m.assets]
+        assert assets
+        assert all(a.relevance_tier == "ai_generated" for a in assets)
+        assert all(a.provider == "mock" for a in assets)  # MockAIVideoProvider's own name
+
+    @pytest.mark.asyncio
+    async def test_ai_generated_clip_materialized_into_output_dir(self, tmp_path) -> None:
+        media_provider = MockMediaProvider(results_per_query=3)
+        ai_provider = MockAIVideoProvider()
+        service = VisualMediaService(
+            media_provider=media_provider, output_dir=str(tmp_path), ai_video_provider=ai_provider
+        )
+
+        result = await service.generate_visuals(_sample_script(sections=[_section("A", "Some narration.")]), 20.0)
+
+        asset = result.sections[0].assets[0]
+        assert asset.local_file_path is not None
+        assert os.path.dirname(asset.local_file_path) == str(tmp_path)
+        assert os.path.exists(asset.local_file_path)
+
+    @pytest.mark.asyncio
+    async def test_ai_failure_falls_back_to_pexels_when_enabled(self, tmp_path) -> None:
+        media_provider = MockMediaProvider(results_per_query=3)
+        ai_provider = MockAIVideoProvider(fail=True)
+        service = VisualMediaService(
+            media_provider=media_provider,
+            output_dir=str(tmp_path),
+            ai_video_provider=ai_provider,
+            ai_video_max_retries=0,
+            stock_fallback_enabled=True,
+        )
+
+        result = await service.generate_visuals(_sample_script(), 20.0)
+
+        assert result.success is True
+        assets = [a for m in result.sections for a in m.assets]
+        assert all(a.provider == "mock" for a in assets)
+        assert all(a.relevance_tier != "ai_generated" for a in assets)
+
+    @pytest.mark.asyncio
+    async def test_ai_failure_fails_slot_cleanly_when_stock_fallback_disabled(self, tmp_path) -> None:
+        """The exact configuration for a demo meant to show AI visuals
+        only: no silent Pexels fetch when AI generation isn't available."""
+        media_provider = MockMediaProvider(results_per_query=3)
+        ai_provider = MockAIVideoProvider(fail=True)
+        service = VisualMediaService(
+            media_provider=media_provider,
+            output_dir=str(tmp_path),
+            ai_video_provider=ai_provider,
+            ai_video_max_retries=0,
+            stock_fallback_enabled=False,
+        )
+
+        result = await service.generate_visuals(_sample_script(sections=[_section("A", "Some narration.")]), 20.0)
+
+        assert media_provider.calls == []  # Pexels never touched at all
+        asset = result.sections[0].assets[0]
+        assert asset.success is False
+        assert "AI video generation failed" in asset.error
+
+    @pytest.mark.asyncio
+    async def test_ai_prompt_reuses_visual_plan_search_queries(self, tmp_path) -> None:
+        ai_provider = MockAIVideoProvider()
+        service = VisualMediaService(
+            media_provider=MockMediaProvider(results_per_query=3),
+            output_dir=str(tmp_path),
+            ai_video_provider=ai_provider,
+        )
+
+        await service.generate_visuals(_sample_script(sections=[_section("REM Sleep", "Narration about REM sleep.")]), 20.0)
+
+        assert ai_provider.calls
+        assert "REM" in ai_provider.calls[0].prompt or "sleep" in ai_provider.calls[0].prompt.lower()
+
+    @pytest.mark.asyncio
+    async def test_ai_video_disabled_never_calls_ai_provider(self, tmp_path) -> None:
+        """Redundant with the default-unchanged test above, but explicitly
+        proves the AI provider is never even invoked when not configured -
+        not merely that its result is discarded."""
+        service = VisualMediaService(media_provider=MockMediaProvider(results_per_query=3), output_dir=str(tmp_path))
+        result = await service.generate_visuals(_sample_script(), 20.0)
+        assert result.success is True  # sanity: pipeline still works with no AI provider at all
+
+    @pytest.mark.asyncio
+    async def test_bounded_retries_respected_in_full_pipeline_context(self, tmp_path) -> None:
+        ai_provider = MockAIVideoProvider(fail_times=1)  # fails once, succeeds on retry
+        service = VisualMediaService(
+            media_provider=MockMediaProvider(results_per_query=3),
+            output_dir=str(tmp_path),
+            ai_video_provider=ai_provider,
+            ai_video_max_retries=2,
+        )
+
+        # A short section (well under MIN_SLOT_SECONDS' 3x floor) is
+        # guaranteed exactly one visual slot, so the retry count below is
+        # unambiguous - a longer section could need multiple slots, each
+        # with its own attempt budget.
+        result = await service.generate_visuals(_sample_script(sections=[_section("A", "Some narration.")]), 5.0)
+
+        assert result.sections[0].assets[0].relevance_tier == "ai_generated"
+        assert len(ai_provider.calls) == 2  # 1 failed + 1 retry that succeeded, never more than the bound

@@ -27,6 +27,12 @@ from src.models.metadata import Chapter, MetadataResult
 from src.models.script import ScriptResult
 from src.services.llm_json import extract_json_object
 from src.services.metadata_validation import (
+    DESCRIPTION_HARD_MAX_WORDS,
+    DESCRIPTION_TARGET_MAX_WORDS,
+    DESCRIPTION_TARGET_MIN_WORDS,
+    TITLE_HARD_MAX_CHARS,
+    TITLE_TARGET_MAX_CHARS,
+    TITLE_TARGET_MIN_CHARS,
     ChapterValidationError,
     format_youtube_timestamp,
     normalize_description,
@@ -245,10 +251,17 @@ class MetadataAgent:
             duration_line = f"Approximate video length: {minutes}m {seconds}s\n"
 
         schema_fields = [
-            '"title": "one final YouTube title, natural English, accurate, concise, no clickbait, '
-            'under 100 characters"',
-            '"description": "a professional multi-paragraph YouTube description grounded only in the '
-            'actual script content"',
+            '"title": "one final YouTube title as a natural curiosity/question-style hook (e.g. '
+            '\'Why Does Ice Float Instead of Sink?\') - the main topic/question must stay immediately '
+            f'clear, target {TITLE_TARGET_MIN_CHARS}-{TITLE_TARGET_MAX_CHARS} characters, never more than '
+            f'{TITLE_HARD_MAX_CHARS}, no unnecessary explanatory subtitle after \':\'/\'-\'/\'—\' if the '
+            'shorter title already communicates the topic, no clickbait/ALL CAPS/excessive punctuation/vague hooks"',
+            '"description": "1-2 short paragraphs, briefly stating what the video is about, the main '
+            f'question/context, and what the viewer will understand or learn - target {DESCRIPTION_TARGET_MIN_WORDS}-'
+            f'{DESCRIPTION_TARGET_MAX_WORDS} words, never more than {DESCRIPTION_HARD_MAX_WORDS} - grounded only in '
+            "the actual script content, but never copied or closely paraphrased from script sentences, never a "
+            'transcript or detailed summary, and never repeating facts already covered extensively; natural, '
+            'human-written, concise tone; relevant topic/SEO terms used naturally, never keyword-stuffed"',
             '"seo_summary": "one or two sentence SEO-friendly summary"',
             '"tags": ["focused list of semantically relevant tags/keywords, no spam"]',
             '"hashtags": ["3 to 5 relevant hashtags, each starting with #"]',

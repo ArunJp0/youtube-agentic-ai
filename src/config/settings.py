@@ -130,6 +130,58 @@ class Settings:
         default_factory=lambda: float(os.environ.get("TOPIC_FRESHNESS_HOURS", "48"))
     )
 
+    # Target video duration for the Script Agent's content/word budget (see
+    # src.services.script_duration) - "short"|"standard"|"long", or a
+    # direct SCRIPT_TARGET_DURATION_MINUTES override for finer control.
+    # "standard" (~5-8 minutes) is the current next-demo target; an empty/
+    # unset override falls back to the profile.
+    script_duration_profile: str = field(
+        default_factory=lambda: os.environ.get("SCRIPT_DURATION_PROFILE", "standard")
+    )
+    script_target_duration_minutes: Optional[float] = field(
+        default_factory=lambda: (
+            float(os.environ["SCRIPT_TARGET_DURATION_MINUTES"])
+            if os.environ.get("SCRIPT_TARGET_DURATION_MINUTES")
+            else None
+        )
+    )
+
+    # AI Video Generation: provider-agnostic architecture for generating
+    # visual clips instead of/alongside Pexels stock footage (see
+    # src.tools.ai_video_provider / src.models.ai_video). Disabled by
+    # default - existing Pexels-only behavior is completely unaffected
+    # unless explicitly opted in, and even when enabled,
+    # STOCK_FALLBACK_ENABLED defaults to true so a generation failure never
+    # leaves a visual slot empty.
+    ai_video_enabled: bool = field(
+        default_factory=lambda: os.environ.get("AI_VIDEO_ENABLED", "false").strip().lower() == "true"
+    )
+    # "mock" | "local" today; a real paid provider (e.g. a future "fal" or
+    # "pixverse") is added purely by implementing AIVideoProvider and
+    # extending get_ai_video_provider - never a Visual Planner change.
+    ai_video_provider: str = field(default_factory=lambda: os.environ.get("AI_VIDEO_PROVIDER", "mock"))
+    ai_video_model: Optional[str] = field(default_factory=lambda: os.environ.get("AI_VIDEO_MODEL") or None)
+    # Directory of pre-generated local demo clips for AI_VIDEO_PROVIDER=local
+    # (see LocalAIVideoProvider) - manually produced clips, never anything
+    # generated automatically by this setting itself.
+    ai_video_local_clips_dir: Optional[str] = field(
+        default_factory=lambda: os.environ.get("AI_VIDEO_LOCAL_CLIPS_DIR") or None
+    )
+    ai_video_max_clips_per_run: int = field(
+        default_factory=lambda: int(os.environ.get("AI_VIDEO_MAX_CLIPS_PER_RUN", "5"))
+    )
+    ai_video_max_retries: int = field(default_factory=lambda: int(os.environ.get("AI_VIDEO_MAX_RETRIES", "2")))
+    ai_video_max_cost_usd: Optional[float] = field(
+        default_factory=lambda: (
+            float(os.environ["AI_VIDEO_MAX_COST_USD"]) if os.environ.get("AI_VIDEO_MAX_COST_USD") else None
+        )
+    )
+    # Pexels stock-media fallback when AI generation is disabled/fails -
+    # true by default so a visual slot is never silently left empty.
+    stock_fallback_enabled: bool = field(
+        default_factory=lambda: os.environ.get("STOCK_FALLBACK_ENABLED", "true").strip().lower() == "true"
+    )
+
     # Autonomous Orchestration: removes the need for a human to manually run
     # pipeline_demo.py or type a topic. Disabled by default - existing
     # manual entry points are entirely unaffected unless explicitly opted

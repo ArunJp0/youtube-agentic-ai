@@ -7,8 +7,17 @@ from typing import List, Optional
 from src.llm.provider import LLMProvider
 from src.models.research import ResearchFact, ResearchResult
 from src.models.script import ScriptResult, ScriptSection
+from src.services.script_duration import (
+    DEFAULT_WORDS_PER_MINUTE,
+    WordBudget,
+    calculate_word_budget,
+    resolve_target_duration_minutes,
+)
 
-DEFAULT_WORDS_PER_MINUTE = 150.0
+# Preserved for backward compatibility (some callers may still import this
+# directly) - no longer ScriptAgent's own effective default section count,
+# which is now derived from ``word_budget`` (see __init__) unless
+# ``max_sections`` is passed explicitly.
 DEFAULT_MAX_SECTIONS = 5
 
 # Similarity ratio (difflib.SequenceMatcher, on normalized text) at/above
@@ -70,19 +79,37 @@ class ScriptAgent:
     def __init__(
         self,
         llm_provider: LLMProvider,
-        max_sections: int = DEFAULT_MAX_SECTIONS,
+        max_sections: Optional[int] = None,
         words_per_minute: float = DEFAULT_WORDS_PER_MINUTE,
+        word_budget: Optional[WordBudget] = None,
     ) -> None:
         """Initialize the Script Agent.
 
         Args:
             llm_provider: Implementation of LLMProvider for narration writing
-            max_sections: Maximum number of body sections to generate
-            words_per_minute: Speaking rate used to estimate narration duration
+            max_sections: Explicit maximum number of body sections to
+                generate - overrides ``word_budget``'s own requested
+                section count when given (backward-compatible escape
+                hatch). When omitted, the requested count comes from
+                ``word_budget``.
+            words_per_minute: Speaking rate used to estimate narration
+                duration (also the rate ``word_budget``, if not supplied,
+                is derived at).
+            word_budget: Centralized target-duration-derived content
+                budget (see ``src.services.script_duration``) driving both
+                the requested section count and each section's target word
+                depth. Defaults to the ``standard`` (~5-8 minute) profile
+                when omitted - callers wanting a different target should
+                build one via ``calculate_word_budget(resolve_target_duration_minutes(...))``
+                and pass it in, rather than this class deriving profile
+                names itself.
         """
         self.llm_provider = llm_provider
-        self.max_sections = max_sections
         self.words_per_minute = words_per_minute
+        self.word_budget = word_budget or calculate_word_budget(
+            resolve_target_duration_minutes(), words_per_minute=words_per_minute
+        )
+        self.max_sections = max_sections if max_sections is not None else self.word_budget.target_section_count
 
     async def generate_script(self, research: ResearchResult) -> ScriptResult:
         """Convert a ResearchResult into a structured ScriptResult.
@@ -219,6 +246,14 @@ class ScriptAgent:
                 )
             ]
 
+        # Redistribute the FULL body word budget across however many
+        # sections are actually available (never fewer than requested just
+        # because research returned fewer key points) - depth compensates,
+        # so a shorter research result still reaches roughly the same
+        # target duration via more substantial per-section narration,
+        # never by inventing extra sections or padding.
+        target_words_per_section = self.word_budget.words_per_section(len(key_points))
+
         sections: List[ScriptSection] = []
         kept_narrations: List[str] = []
         for point in key_points:
@@ -227,7 +262,7 @@ class ScriptAgent:
 
             for attempt in range(MAX_SECTION_GENERATION_ATTEMPTS):
                 prompt = self._build_section_prompt(
-                    point, other_points, context, is_retry=attempt > 0
+                    point, other_points, context, is_retry=attempt > 0, target_words=target_words_per_section
                 )
                 candidate = self._clean_line(
                     self.llm_provider.generate_text(prompt), keep_multiline=True
@@ -273,7 +308,7 @@ class ScriptAgent:
 
     @staticmethod
     def _build_section_prompt(
-        point: str, other_points: List[str], context: str, is_retry: bool
+        point: str, other_points: List[str], context: str, is_retry: bool, target_words: int
     ) -> str:
         """Build the prompt for one section, listing other points to avoid
         repeating and, on retry, explicitly asking for more distinct content.
@@ -281,6 +316,12 @@ class ScriptAgent:
         The point being expanded on is deliberately the very first thing in
         the prompt (rather than embedded mid-sentence), so each section's
         prompt is distinguishable from the very start.
+
+        ``target_words`` communicates DEPTH, not padding: the prompt asks
+        for substantive, well-developed coverage of this one point up to
+        roughly that length, while explicitly forbidding filler/repetition
+        if the research genuinely doesn't support that much detail - the
+        target is a ceiling to aim for, never a floor to pad up to.
         """
         other_points_note = ""
         if other_points:
@@ -302,10 +343,15 @@ class ScriptAgent:
         return (
             f"Point to expand on: '{point}'.\n"
             f"{retry_note}{other_points_note}"
-            "Write one short spoken YouTube narration paragraph (2-3 sentences) "
-            "about ONLY this specific point. Use natural spoken narration, not "
-            "article style, and do not add any claim that isn't supported by "
-            f"the research below.\n\n{context}"
+            f"Write a spoken YouTube narration paragraph, roughly {target_words} words, "
+            "about ONLY this specific point. Develop it naturally with real depth "
+            "(context, explanation, a concrete example or detail where the research "
+            "supports one) - not just 2-3 bare sentences, but also never pad, repeat "
+            "yourself, or add filler/generic statements just to reach the length; if "
+            "the research genuinely doesn't support this much detail, write a "
+            "shorter, still-complete paragraph instead. Use natural spoken narration, "
+            "not article style, and do not add any claim that isn't supported by the "
+            f"research below.\n\n{context}"
         )
 
     def _generate_conclusion(self, context: str) -> str:

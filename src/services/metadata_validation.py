@@ -4,13 +4,18 @@
 # borderline LLM output before it's accepted.
 from __future__ import annotations
 
+import re
 from typing import List, Optional, Tuple
 
 from src.models.metadata import Chapter
 
-# YouTube's real title character limit.
+# YouTube's real title character limit - the platform's absolute ceiling,
+# kept as a last-resort safety net. This project's own house style is much
+# stricter (see TITLE_HARD_MAX_CHARS below), so this constant is rarely the
+# operative limit in practice.
 MAX_TITLE_LENGTH = 100
-# YouTube's real description character limit.
+# YouTube's real description character limit - same role as above relative
+# to DESCRIPTION_HARD_MAX_WORDS.
 MAX_DESCRIPTION_LENGTH = 5000
 # Practical caps - not exactly YouTube's byte-based tag budget, but a safe
 # margin under it (YouTube's real limit is ~500 total characters across tags).
@@ -19,6 +24,48 @@ MAX_TAGS_TOTAL_CHARS = 460
 # "Typically 3-5" per project convention - capped, not just suggested.
 MAX_HASHTAGS = 5
 
+# House-style title/description targets - centralized here (never scattered
+# as magic numbers in the agent/prompt) so both prompt guidance and
+# deterministic repair reference the exact same numbers. These are this
+# project's own concise/curiosity-driven content-quality goals, not
+# YouTube's platform limits above.
+TITLE_TARGET_MIN_CHARS = 45
+TITLE_TARGET_MAX_CHARS = 60
+TITLE_HARD_MAX_CHARS = 65
+
+DESCRIPTION_TARGET_MIN_WORDS = 60
+DESCRIPTION_TARGET_MAX_WORDS = 90
+DESCRIPTION_HARD_MAX_WORDS = 110
+
+# Matches a "Title: Subtitle" or "Title - Subtitle"/"Title — Subtitle"
+# separator - a colon followed by whitespace, or a hyphen/en-dash/em-dash
+# surrounded by whitespace. Deliberately requires surrounding whitespace so
+# a mid-word hyphen (e.g. "e-commerce", "well-known") is never matched.
+_SUBTITLE_SPLIT_RE = re.compile(r":\s+|\s[-–—]\s")
+
+_PARAGRAPH_SPLIT_RE = re.compile(r"\n\s*\n")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _strip_trailing_subtitle(text: str) -> str:
+    """Drop a trailing explanatory subtitle after the first ':'/'-'/'–'/'—'
+    separator, when the remaining prefix alone is still substantial enough
+    to stand as a title on its own - never invents replacement text, only
+    removes a redundant trailing clause. Returns ``text`` unchanged if no
+    such separator exists or the prefix would be too thin to be meaningful.
+    """
+    match = _SUBTITLE_SPLIT_RE.search(text)
+    if not match:
+        return text
+    prefix = text[: match.start()].strip()
+    if len(prefix.split()) < 3:
+        return text
+    return prefix
+
+
+def _split_sentences(text: str) -> List[str]:
+    return [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+
 
 class ChapterValidationError(Exception):
     """Raised when a chapter list cannot be safely repaired - chapters
@@ -26,26 +73,77 @@ class ChapterValidationError(Exception):
 
 
 def normalize_title(raw: str) -> str:
-    """Trim, collapse whitespace, strip wrapping quotes, and enforce the
-    YouTube title length limit with a clean (non-mid-word) truncation."""
+    """Trim, collapse whitespace, strip wrapping quotes, and enforce this
+    project's house-style hard title limit (``TITLE_HARD_MAX_CHARS``).
+
+    An over-length title is repaired, never blindly truncated mid-sentence
+    as the first resort: a trailing explanatory subtitle after a ':'/'-'/
+    '–'/'—' separator is dropped first (see ``_strip_trailing_subtitle``)
+    when the remaining prefix already stands on its own - only if that
+    alone doesn't bring the title within the limit does a clean,
+    non-mid-word truncation apply as the final safety net.
+    """
     text = (raw or "").strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
         text = text[1:-1].strip()
     text = " ".join(text.split())
-    if len(text) <= MAX_TITLE_LENGTH:
+    if not text or len(text) <= TITLE_HARD_MAX_CHARS:
         return text
-    truncated = text[:MAX_TITLE_LENGTH].rsplit(" ", 1)[0].rstrip(" -–—:,")
-    return truncated or text[:MAX_TITLE_LENGTH]
+
+    shortened = _strip_trailing_subtitle(text)
+    if len(shortened) <= TITLE_HARD_MAX_CHARS:
+        return shortened
+
+    truncated = shortened[:TITLE_HARD_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" -–—:,")
+    return truncated or shortened[:TITLE_HARD_MAX_CHARS]
 
 
 def normalize_description(raw: str) -> str:
-    """Trim and enforce the YouTube description length limit with a clean
-    (non-mid-word) truncation."""
+    """Trim and enforce this project's house-style hard description word
+    limit (``DESCRIPTION_HARD_MAX_WORDS``), after first applying YouTube's
+    absolute character ceiling as an outer safety net.
+
+    An over-length description is repaired by dropping whole trailing
+    sentences (grouped by paragraph, so a kept prefix's paragraph structure
+    survives) until the word count fits - never a mid-sentence cut. Only
+    when a single sentence alone exceeds the word cap does a last-resort
+    clean word-boundary truncation apply.
+    """
     text = (raw or "").strip()
-    if len(text) <= MAX_DESCRIPTION_LENGTH:
+    if not text:
+        return ""
+
+    if len(text) > MAX_DESCRIPTION_LENGTH:
+        text = text[:MAX_DESCRIPTION_LENGTH].rsplit(" ", 1)[0] or text[:MAX_DESCRIPTION_LENGTH]
+
+    if len(text.split()) <= DESCRIPTION_HARD_MAX_WORDS:
         return text
-    truncated = text[:MAX_DESCRIPTION_LENGTH].rsplit(" ", 1)[0]
-    return truncated or text[:MAX_DESCRIPTION_LENGTH]
+
+    paragraphs = [p.strip() for p in _PARAGRAPH_SPLIT_RE.split(text) if p.strip()]
+    kept_paragraphs: List[str] = []
+    word_count = 0
+    for paragraph in paragraphs:
+        kept_sentences: List[str] = []
+        for sentence in _split_sentences(paragraph):
+            sentence_words = len(sentence.split())
+            if word_count == 0 and not kept_sentences:
+                # Always attempt the very first sentence overall, so a
+                # short description is never reduced to nothing - but if
+                # even this one sentence alone exceeds the cap, bail
+                # straight to last-resort word truncation instead of
+                # force-keeping a single over-cap "sentence".
+                if sentence_words > DESCRIPTION_HARD_MAX_WORDS:
+                    return " ".join(text.split()[:DESCRIPTION_HARD_MAX_WORDS])
+            elif word_count + sentence_words > DESCRIPTION_HARD_MAX_WORDS:
+                break
+            kept_sentences.append(sentence)
+            word_count += sentence_words
+        if kept_sentences:
+            kept_paragraphs.append(" ".join(kept_sentences))
+        if word_count >= DESCRIPTION_HARD_MAX_WORDS:
+            break
+
+    return "\n\n".join(kept_paragraphs) if kept_paragraphs else " ".join(text.split()[:DESCRIPTION_HARD_MAX_WORDS])
 
 
 def normalize_tags(raw_tags: List[str]) -> List[str]:

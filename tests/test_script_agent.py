@@ -7,6 +7,7 @@ from src.agents.script import ScriptAgent, ScriptAgentError
 from src.llm.provider import LLMProvider
 from src.models.research import ResearchFact, ResearchResult
 from src.models.script import ScriptResult, ScriptSection
+from src.services.script_duration import calculate_word_budget
 
 
 class ExplodingLLMProvider(LLMProvider):
@@ -593,3 +594,102 @@ class TestReviseSection:
 
         with pytest.raises(ScriptAgentError):
             agent.revise_section(script, research, section_index=1, finding_description="wrong claim")
+
+
+class RecordingVariedLLMProvider(LLMProvider):
+    """Combines VariedSectionLLMProvider's distinct-per-point narration
+    (so a full generate_script() call never trips the duplicate-detection
+    floor) with prompt recording, so tests can inspect exactly what each
+    section prompt asked for."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def generate_text(self, prompt: str) -> str:
+        self.calls.append(prompt)
+        if "Point to expand on: '" in prompt:
+            point = prompt.split("Point to expand on: '", 1)[1].split("'.", 1)[0]
+            return f"{point}. A distinct detail worth covering on its own, with enough substance to feel complete."
+        if "video title" in prompt.lower():
+            return "An Engaging Video Title"
+        if "HOOK" in prompt:
+            return "Here's a hook that grabs attention right away."
+        if "INTRODUCTION" in prompt:
+            return "Here's an introduction that sets up what this video covers."
+        if "CONCLUSION" in prompt:
+            return "Here's a conclusion that wraps everything up."
+        if "call-to-action" in prompt:
+            return "Please like and subscribe for more like this."
+        return "Some other generated narration text."
+
+
+class TestScriptAgentDurationBudget:
+    """Tests for the new target-duration -> word-budget wiring (Phase 2):
+    ScriptAgent's default section count/depth now comes from a
+    WordBudget, never a fixed hardcoded value, while staying fully
+    backward compatible with an explicit max_sections override."""
+
+    def test_default_max_sections_comes_from_standard_profile_word_budget(self) -> None:
+        agent = ScriptAgent(llm_provider=RecordingVariedLLMProvider())
+        standard_budget = calculate_word_budget(6.5, words_per_minute=agent.words_per_minute)
+        assert agent.max_sections == standard_budget.target_section_count
+
+    def test_explicit_word_budget_drives_max_sections(self) -> None:
+        long_budget = calculate_word_budget(12.5)
+        agent = ScriptAgent(llm_provider=RecordingVariedLLMProvider(), word_budget=long_budget)
+        assert agent.max_sections == long_budget.target_section_count
+
+    def test_explicit_max_sections_overrides_word_budget(self) -> None:
+        long_budget = calculate_word_budget(12.5)  # would otherwise request many sections
+        agent = ScriptAgent(llm_provider=RecordingVariedLLMProvider(), word_budget=long_budget, max_sections=2)
+        assert agent.max_sections == 2
+
+    @pytest.mark.asyncio
+    async def test_section_prompt_communicates_the_word_target(self) -> None:
+        llm = RecordingVariedLLMProvider()
+        agent = ScriptAgent(llm_provider=llm, max_sections=5)
+
+        await agent.generate_script(_sample_research())
+
+        section_prompts = [c for c in llm.calls if "Point to expand on: '" in c]
+        assert section_prompts
+        expected_words = agent.word_budget.words_per_section(3)  # _sample_research() has 3 key points
+        assert all(f"roughly {expected_words} words" in p for p in section_prompts)
+
+    @pytest.mark.asyncio
+    async def test_fewer_key_points_increase_words_per_section_in_prompt(self) -> None:
+        """Depth compensates when research provides fewer points than
+        requested - never fewer total words, never invented sections."""
+        many_key_points = [
+            "Dreams occur mainly during REM sleep",
+            "Dreaming helps consolidate memories",
+            "Most adults dream for about two hours a night",
+            "Nightmares are linked to elevated stress hormones",
+            "Lucid dreaming can be trained with practice",
+            "Sleep deprivation reduces dream recall",
+        ]
+        llm_many = RecordingVariedLLMProvider()
+        agent_many = ScriptAgent(llm_provider=llm_many, max_sections=8)
+        research_many = _sample_research(key_points=many_key_points)  # 6 real points, under max_sections=8
+        await agent_many.generate_script(research_many)
+
+        llm_few = RecordingVariedLLMProvider()
+        agent_few = ScriptAgent(llm_provider=llm_few, max_sections=8, word_budget=agent_many.word_budget)
+        research_few = _sample_research(key_points=many_key_points[:2])  # only 2 real points
+        await agent_few.generate_script(research_few)
+
+        many_prompt = next(c for c in llm_many.calls if "Point to expand on: '" in c)
+        few_prompt = next(c for c in llm_few.calls if "Point to expand on: '" in c)
+
+        def _extract_target_words(prompt: str) -> int:
+            marker = "roughly "
+            start = prompt.index(marker) + len(marker)
+            return int(prompt[start:].split(" words", 1)[0])
+
+        assert _extract_target_words(few_prompt) > _extract_target_words(many_prompt)
+
+    def test_backward_compatible_construction_still_works(self) -> None:
+        """The pre-existing explicit max_sections=N construction pattern
+        used throughout this file/production code keeps working unchanged."""
+        agent = ScriptAgent(llm_provider=RecordingVariedLLMProvider(), max_sections=5)
+        assert agent.max_sections == 5

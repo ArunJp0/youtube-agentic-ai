@@ -33,6 +33,7 @@ from src.services.provenance_store import ProvenanceManifestStore
 from src.services.publishing_record_store import PublishingRecordStore
 from src.services.script_context_reconstruction import original_base_name
 from src.services.upload_artifact_discovery import DiscoveredRunArtifacts
+from src.tools.ai_video_provider import MockAIVideoProvider
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.music_catalog_provider import MockMusicCatalogProvider, MusicCatalogProvider
@@ -2942,3 +2943,58 @@ class TestPublishingIntegration:
         assert len(client.inserted_videos) == 1
         winning_run_id = original_base_name(state.audio_mix_result.output_path)
         assert state.remediation_history[0].resulting_run_id == winning_run_id
+
+
+class TestAIVideoPipelineIntegration:
+    """Full-pipeline proof that ai_video_provider/stock_fallback_enabled
+    actually reach VisualMediaService through build_pipeline_graph/
+    run_pipeline, end to end - not just at the VisualMediaService unit
+    level. All mocked; no real PixVerse/Gemini/Pexels/network calls."""
+
+    @staticmethod
+    async def _run_with_ai_video(tmp_path, ai_video_provider, stock_fallback_enabled: bool):
+        return await run_pipeline(
+            "Why does ice float on water?",
+            MockSearchProvider(),
+            ResearchMockWithVariedSections(),
+            MockVoiceProvider(),
+            TEST_VOICE_NAME,
+            ThumbnailCapableMediaProvider(),
+            FakeVideoAssembler(),
+            MockVisualRelevanceEvaluator(default_score=0.9),
+            MockTranscriptionProvider(),
+            _music_catalog_provider(tmp_path),
+            str(tmp_path / "audio"),
+            str(tmp_path / "media"),
+            str(tmp_path / "video"),
+            str(tmp_path / "subtitles"),
+            str(tmp_path / "thumbnails"),
+            str(tmp_path / "metadata"),
+            str(tmp_path / "provenance"),
+            str(tmp_path / "compliance"),
+            2,
+            ai_video_provider=ai_video_provider,
+            stock_fallback_enabled=stock_fallback_enabled,
+        )
+
+    @pytest.mark.asyncio
+    async def test_ai_video_provider_reaches_visual_media_through_full_pipeline(self, tmp_path) -> None:
+        state = await self._run_with_ai_video(tmp_path, MockAIVideoProvider(), stock_fallback_enabled=False)
+
+        assert state.visual_result is not None
+        assets = [a for m in state.visual_result.sections for a in m.assets]
+        assert assets
+        assert all(a.relevance_tier == "ai_generated" for a in assets)
+
+    @pytest.mark.asyncio
+    async def test_default_pipeline_call_unaffected_by_ai_video_params_existing(self, tmp_path) -> None:
+        """No ai_video_provider passed at all (every existing production/
+        test call site) - behavior must be byte-for-byte the prior
+        stock-only path."""
+        state = await self._run_with_ai_video(tmp_path, ai_video_provider=None, stock_fallback_enabled=True)
+
+        assert state.visual_result is not None
+        assets = [a for m in state.visual_result.sections for a in m.assets]
+        assert assets
+        assert all(a.relevance_tier != "ai_generated" for a in assets)
+        assert all(a.provider == "mock" for a in assets)

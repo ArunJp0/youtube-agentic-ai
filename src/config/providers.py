@@ -12,6 +12,7 @@ from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.transcription_provider import MockTranscriptionProvider, TranscriptionProvider
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
 from src.tools.topic_source_provider import CompositeTopicSourceProvider, MockTopicSourceProvider, TopicSourceProvider
+from src.tools.ai_video_provider import AIVideoProvider, LocalAIVideoProvider, MockAIVideoProvider
 
 
 class ProviderConfigError(Exception):
@@ -253,3 +254,43 @@ def get_topic_planner_source(settings: Optional[Settings] = None) -> TopicSource
         return CompositeTopicSourceProvider([evergreen, news])
 
     raise ProviderConfigError(f"Unknown TOPIC_MODE: '{settings.topic_mode}'. Expected 'evergreen', 'trending', or 'mixed'.")
+
+
+def get_ai_video_provider(settings: Optional[Settings] = None) -> Optional[AIVideoProvider]:
+    """Build the configured AIVideoProvider, or ``None`` when AI video
+    generation is disabled (the safe default) - callers must treat
+    ``None`` as "use Pexels only", never construct a provider themselves.
+
+    "local" is a DEMO/TESTING adapter only (see LocalAIVideoProvider's own
+    docstring) - it serves pre-existing local clips, never generates
+    anything. A real paid provider (fal.ai/Kling, Seedance, Veo, PixVerse's
+    official API, etc.) is added by implementing AIVideoProvider and
+    extending this function's if/elif chain - never by changing
+    VisualContextPlanner/VisualMediaService, which only ever depend on the
+    AIVideoProvider interface.
+
+    Raises:
+        ProviderConfigError: If AI_VIDEO_ENABLED=true but AI_VIDEO_PROVIDER
+            is not a recognized value, or "local" is requested without
+            AI_VIDEO_LOCAL_CLIPS_DIR configured.
+    """
+    settings = settings or Settings()
+    if not settings.ai_video_enabled:
+        return None
+
+    provider_name = (settings.ai_video_provider or "mock").strip().lower()
+
+    if provider_name == "mock":
+        return MockAIVideoProvider()
+    if provider_name == "local":
+        if not settings.ai_video_local_clips_dir:
+            raise ProviderConfigError(
+                "AI_VIDEO_PROVIDER=local requires AI_VIDEO_LOCAL_CLIPS_DIR to be set "
+                "(a directory of manually-generated demo clips)"
+            )
+        return LocalAIVideoProvider(clips_dir=settings.ai_video_local_clips_dir)
+
+    raise ProviderConfigError(
+        f"Unknown AI_VIDEO_PROVIDER: '{settings.ai_video_provider}'. Expected 'mock' or 'local' "
+        "(a real paid provider is not implemented yet - see src.tools.ai_video_provider)."
+    )

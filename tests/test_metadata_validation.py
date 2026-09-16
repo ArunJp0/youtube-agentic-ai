@@ -6,9 +6,15 @@ import pytest
 
 from src.models.metadata import Chapter
 from src.services.metadata_validation import (
+    DESCRIPTION_HARD_MAX_WORDS,
+    DESCRIPTION_TARGET_MAX_WORDS,
+    DESCRIPTION_TARGET_MIN_WORDS,
     MAX_HASHTAGS,
     MAX_TAGS,
     MAX_TITLE_LENGTH,
+    TITLE_HARD_MAX_CHARS,
+    TITLE_TARGET_MAX_CHARS,
+    TITLE_TARGET_MIN_CHARS,
     ChapterValidationError,
     format_youtube_timestamp,
     normalize_description,
@@ -38,18 +44,90 @@ class TestNormalizeTitle:
         assert normalize_title(title) == title
 
     def test_over_length_title_truncated_cleanly(self) -> None:
-        long_title = "word " * 40  # far over MAX_TITLE_LENGTH
+        long_title = "word " * 40  # far over the house-style hard max
         result = normalize_title(long_title)
-        assert len(result) <= MAX_TITLE_LENGTH
+        assert len(result) <= TITLE_HARD_MAX_CHARS
         assert not result.endswith(" ")
         assert result == result.rstrip()
 
     def test_truncation_does_not_cut_mid_word(self) -> None:
         long_title = "Supercalifragilisticexpialidocious " * 5
         result = normalize_title(long_title)
-        assert len(result) <= MAX_TITLE_LENGTH
+        assert len(result) <= TITLE_HARD_MAX_CHARS
         # Every remaining "word" should be a full word from the source.
         assert all(word in long_title for word in result.split())
+
+
+class TestNormalizeTitleHouseStyle:
+    """New house-style constraints: target 45-60 chars, hard max 65 -
+    repaired by dropping a trailing subtitle before falling back to
+    word-boundary truncation, never a topic-specific hack."""
+
+    def test_title_at_or_under_hard_max_passes_through_unchanged(self) -> None:
+        title = "Why Does Ice Float Instead of Sink?"
+        assert len(title) <= TITLE_HARD_MAX_CHARS
+        assert normalize_title(title) == title
+
+    def test_title_in_preferred_target_range_unchanged(self) -> None:
+        # A realistic hook-style title landing inside the 45-60 char target.
+        title = "Why Does Ice Float on Water Instead of Sinking?"
+        assert TITLE_TARGET_MIN_CHARS <= len(title) <= TITLE_TARGET_MAX_CHARS
+        assert normalize_title(title) == title
+
+    def test_hard_max_is_always_enforced(self) -> None:
+        long_title = (
+            "Why Does Ice Float Instead of Sinking to the Bottom of the Ocean Floor Every Single Time It Forms"
+        )
+        result = normalize_title(long_title)
+        assert len(result) <= TITLE_HARD_MAX_CHARS
+
+    def test_over_length_title_repaired_by_dropping_colon_subtitle(self) -> None:
+        title = "Why Does Ice Float on Water: The Fascinating Science Explained in Full Detail"
+        assert len(title) > TITLE_HARD_MAX_CHARS
+        result = normalize_title(title)
+        assert result == "Why Does Ice Float on Water"
+        assert len(result) <= TITLE_HARD_MAX_CHARS
+
+    def test_over_length_title_repaired_by_dropping_em_dash_subtitle(self) -> None:
+        title = "Why Does Ice Float on Water — A Deep Dive Into the Real Science Behind It"
+        assert len(title) > TITLE_HARD_MAX_CHARS
+        result = normalize_title(title)
+        assert result == "Why Does Ice Float on Water"
+
+    def test_thin_subtitle_prefix_is_not_used_alone(self) -> None:
+        # The prefix before ':' ("Ice") is too thin (<3 words) to stand as
+        # a title on its own, so repair falls through to word-boundary
+        # truncation of the whole title instead of collapsing to "Ice".
+        title = "Ice: " + ("Really Amazing Frozen Water Facts Explained In Great Detail " * 2)
+        result = normalize_title(title)
+        assert len(result) <= TITLE_HARD_MAX_CHARS
+        assert result != "Ice"
+        assert result.startswith("Ice")
+
+    def test_repair_never_cuts_mid_word(self) -> None:
+        long_title = "Supercalifragilisticexpialidocious " * 5
+        result = normalize_title(long_title)
+        assert len(result) <= TITLE_HARD_MAX_CHARS
+        assert all(word in long_title for word in result.split())
+
+    def test_mid_word_hyphen_never_treated_as_subtitle_separator(self) -> None:
+        # If the mid-word hyphen in "e-commerce" were incorrectly matched
+        # as a subtitle separator, this would wrongly collapse to "The
+        # Complete Guide to e" - the regex requires whitespace around the
+        # separator precisely to prevent that.
+        title = "The Complete Guide to e-commerce Growth Strategies for Modern Businesses Everywhere"
+        assert len(title) > TITLE_HARD_MAX_CHARS
+        result = normalize_title(title)
+        assert result != "The Complete Guide to e"
+        assert "e-commerce" in result
+        assert len(result) <= TITLE_HARD_MAX_CHARS
+
+    def test_title_remains_meaningful_and_topic_related_after_repair(self) -> None:
+        title = "Why Do Volcanoes Erupt: A Complete Scientific Breakdown of Magma and Pressure"
+        result = normalize_title(title)
+        assert "Volcanoes" in result
+        assert "Erupt" in result
+        assert len(result) <= TITLE_HARD_MAX_CHARS
 
 
 class TestNormalizeDescription:
@@ -62,6 +140,63 @@ class TestNormalizeDescription:
     def test_within_limit_unchanged(self) -> None:
         text = "A perfectly normal description."
         assert normalize_description(text) == text
+
+
+class TestNormalizeDescriptionHouseStyle:
+    """New house-style constraints: target 60-90 words, hard max 110 -
+    repaired by dropping whole trailing sentences (paragraph-aware), never
+    a mid-sentence cut."""
+
+    def test_description_at_or_under_hard_max_unchanged(self) -> None:
+        text = "This is a normal, reasonably short video description. " * 3
+        text = text.strip()
+        assert len(text.split()) <= DESCRIPTION_HARD_MAX_WORDS
+        assert normalize_description(text) == text
+
+    def test_description_in_preferred_target_range_unchanged(self) -> None:
+        sentence = "This sentence has exactly eight words in it."
+        text = " ".join([sentence] * 9)  # 9 * 8 = 72 words, inside 60-90
+        assert DESCRIPTION_TARGET_MIN_WORDS <= len(text.split()) <= DESCRIPTION_TARGET_MAX_WORDS
+        assert normalize_description(text) == text
+
+    def test_hard_max_is_always_enforced(self) -> None:
+        sentence = "This sentence has exactly eight words in it."
+        text = " ".join([sentence] * 30)  # 240 words, far over the cap
+        result = normalize_description(text)
+        assert len(result.split()) <= DESCRIPTION_HARD_MAX_WORDS
+
+    def test_repair_keeps_only_whole_sentences_never_cuts_mid_sentence(self) -> None:
+        sentence = "This sentence has exactly eight words in it."
+        text = " ".join([sentence] * 30)
+        result = normalize_description(text)
+        assert result.endswith(".")
+        # 110 // 8 == 13 whole sentences fit (104 words); a 14th would be 112 > 110.
+        assert result == " ".join([sentence] * 13)
+        assert len(result.split()) == 104
+
+    def test_repair_preserves_paragraph_breaks(self) -> None:
+        sentence = "This sentence has exactly eight words in it."
+        paragraph_one = " ".join([sentence] * 10)  # 80 words
+        paragraph_two = " ".join([sentence] * 10)  # 80 words
+        text = f"{paragraph_one}\n\n{paragraph_two}"
+        result = normalize_description(text)
+        assert len(result.split()) <= DESCRIPTION_HARD_MAX_WORDS
+        assert "\n\n" in result
+
+    def test_single_oversized_sentence_falls_back_to_word_truncation(self) -> None:
+        huge_sentence = ("word " * 200).strip()  # one "sentence", no punctuation at all
+        result = normalize_description(huge_sentence)
+        assert len(result.split()) <= DESCRIPTION_HARD_MAX_WORDS
+
+    def test_does_not_reproduce_a_large_script_passage(self) -> None:
+        """A description built by naively concatenating many long narration
+        sentences must be safely cut down to size, never passed through as
+        a near-transcript."""
+        narration_sentences = [f"The narrator explains fact number {i} about the topic in detail." for i in range(20)]
+        long_description = " ".join(narration_sentences)
+        result = normalize_description(long_description)
+        assert len(result.split()) <= DESCRIPTION_HARD_MAX_WORDS
+        assert result != long_description
 
 
 class TestNormalizeTags:

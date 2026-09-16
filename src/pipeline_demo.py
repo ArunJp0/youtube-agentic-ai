@@ -21,6 +21,7 @@ from src.caption_demo import print_caption_result
 from src.compliance_demo import print_compliance_result
 from src.config.providers import (
     ProviderConfigError,
+    get_ai_video_provider,
     get_llm_provider,
     get_media_provider,
     get_search_provider,
@@ -37,6 +38,7 @@ from src.thumbnail_demo import print_thumbnail_result
 from src.visual_qc_demo import print_qc_result
 from src.services.caption_service import DEFAULT_SUBTITLE_OUTPUT_DIR
 from src.services.provenance_store import ProvenanceManifestStore, ProvenanceStoreError
+from src.services.script_duration import calculate_word_budget, resolve_target_duration_minutes
 from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.services.visual_media_service import DEFAULT_MEDIA_OUTPUT_DIR
 from src.services.voice_service import DEFAULT_OUTPUT_DIR
@@ -111,6 +113,10 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
     # counterpart in this demo either; only the automated test suite needs
     # a mock catalog, injected directly where it calls build_pipeline_graph.
     music_catalog_provider = LocalMusicCatalogProvider()
+    script_word_budget = calculate_word_budget(
+        resolve_target_duration_minutes(settings.script_duration_profile, settings.script_target_duration_minutes)
+    )
+    ai_video_provider = get_ai_video_provider(settings)
 
     print(f"Pipeline: {topic}")
     print(
@@ -119,6 +125,15 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         f"| Media: {settings.media_provider} | Visual QC: {visual_relevance_evaluator.name} "
         f"| Captions: {transcription_provider.name} | BGM: {music_catalog_provider.name} | Video: ffmpeg"
     )
+    print(
+        f"   Target duration: ~{script_word_budget.target_duration_minutes:.1f} min "
+        f"(profile: {settings.script_duration_profile}, ~{script_word_budget.target_section_count} sections requested)"
+    )
+    if ai_video_provider is not None:
+        print(
+            f"   AI video: {ai_video_provider.name} (max_retries={settings.ai_video_max_retries}, "
+            f"stock_fallback_enabled={settings.stock_fallback_enabled})"
+        )
     print("=" * 60)
 
     graph = build_pipeline_graph(
@@ -135,6 +150,10 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         DEFAULT_MEDIA_OUTPUT_DIR,
         DEFAULT_VIDEO_OUTPUT_DIR,
         DEFAULT_SUBTITLE_OUTPUT_DIR,
+        script_word_budget=script_word_budget,
+        ai_video_provider=ai_video_provider,
+        ai_video_max_retries=settings.ai_video_max_retries,
+        stock_fallback_enabled=settings.stock_fallback_enabled,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 

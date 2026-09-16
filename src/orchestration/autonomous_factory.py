@@ -13,6 +13,7 @@ from typing import List, Optional
 from src.agents.topic_planner_agent import TopicPlannerAgent
 from src.agents.topic_ranking_planner import TopicRankingPlanner
 from src.config.providers import (
+    get_ai_video_provider,
     get_llm_provider,
     get_media_provider,
     get_search_provider,
@@ -26,6 +27,7 @@ from src.models.youtube_upload import PublishingIntent, YOUTUBE_UPLOAD_SCOPES
 from src.orchestration.autonomous_run_controller import AutonomousRunController, PipelineRunner
 from src.services.autonomous_run_store import AutonomousRunStore, DEFAULT_AUTONOMOUS_RUN_DIR
 from src.services.run_lock import DEFAULT_LOCK_PATH, RunLock
+from src.services.script_duration import calculate_word_budget, resolve_target_duration_minutes
 from src.tools.ffmpeg_video_assembler import FFmpegVideoAssembler
 from src.tools.music_catalog_provider import LocalMusicCatalogProvider
 from src.tools.youtube_client import GoogleYouTubeClient, YouTubeClient
@@ -105,6 +107,10 @@ def build_pipeline_runner(settings: Settings) -> PipelineRunner:
     visual_relevance_evaluator = get_visual_relevance_evaluator(settings)
     transcription_provider = get_transcription_provider(settings)
     music_catalog_provider = LocalMusicCatalogProvider()
+    script_word_budget = calculate_word_budget(
+        resolve_target_duration_minutes(settings.script_duration_profile, settings.script_target_duration_minutes)
+    )
+    ai_video_provider = get_ai_video_provider(settings)
 
     async def _run(topic: str, publishing_intent: Optional[PublishingIntent]) -> PipelineState:
         youtube_client = _build_youtube_client(settings) if publishing_intent and publishing_intent.mode != "disabled" else None
@@ -121,6 +127,10 @@ def build_pipeline_runner(settings: Settings) -> PipelineRunner:
             music_catalog_provider,
             youtube_client=youtube_client,
             publishing_intent=publishing_intent,
+            script_word_budget=script_word_budget,
+            ai_video_provider=ai_video_provider,
+            ai_video_max_retries=settings.ai_video_max_retries,
+            stock_fallback_enabled=settings.stock_fallback_enabled,
         )
 
     return _run

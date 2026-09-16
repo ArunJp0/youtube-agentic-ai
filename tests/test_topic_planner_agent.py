@@ -904,3 +904,127 @@ class TestTrendingModeGeminiFailureFallback:
 
         assert len(llm.calls) == 1
         assert result.success is True
+
+
+class TestMixedModeSelection:
+    """Mixed mode must let a fresh/relevant current candidate win when it's
+    genuinely the best option, and must never ban evergreen candidates from
+    still winning when THEY are the best option - the exact behavior the
+    TOPIC_MODE=mixed configuration fix (see .env) is meant to unlock in
+    real autonomous execution, which previously never even considered a
+    trending source at all (TOPIC_MODE defaulted to "evergreen")."""
+
+    def test_strong_fresh_candidate_can_win_in_mixed_mode(self, tmp_path) -> None:
+        evergreen = _candidate("Why do cats purr?", popularity=0.5)
+        # Two independent outlets reporting the same fresh story - realistic
+        # cross-source corroboration (distinct_source_count=2 ->
+        # source_confidence=0.7), not an artificially single-sourced item,
+        # so freshness + corroboration together can genuinely outweigh an
+        # equally-judged evergreen candidate that carries no trend signal.
+        fresh_news_a = _news_candidate("Major AI Breakthrough Announced", hours_old=1, source_name="Source A")
+        fresh_news_b = _news_candidate("Major AI Breakthrough Announced Today", hours_old=1, source_name="Source B")
+        provider = CompositeTopicSourceProvider(
+            [
+                MockTopicSourceProvider(candidates=[evergreen], provider_name="evergreen"),
+                MockTopicSourceProvider(candidates=[fresh_news_a, fresh_news_b], provider_name="news"),
+            ]
+        )
+        # Equal semantic judgments for every surviving candidate - only the
+        # trend signals (freshness/source confidence) differ, so a win by
+        # the fresh story proves those signals carry real weight, not a
+        # fixed bias either way.
+        llm = RecordingLLMProvider(response=_valid_ranking_response([evergreen, fresh_news_a, fresh_news_b]))
+        agent = TopicPlannerAgent(
+            topic_source_provider=provider,
+            ranking_planner=TopicRankingPlanner(llm),
+            topic_plan_store=TopicPlanStore(str(tmp_path / "plans")),
+            provenance_output_dir=str(tmp_path / "provenance"),
+            mode="mixed",
+            freshness_hours=48,
+        )
+
+        result = asyncio.run(agent.plan_topic())
+
+        assert result.success is True
+        assert result.selected_topic == "Major AI Breakthrough Announced"
+
+    def test_evergreen_candidate_can_still_win_in_mixed_mode(self, tmp_path) -> None:
+        strong_evergreen = _candidate("Why do cats purr? A complete science explainer", popularity=0.9)
+        weak_news = _news_candidate("Minor Regional Update", hours_old=1)
+        provider = CompositeTopicSourceProvider(
+            [
+                MockTopicSourceProvider(candidates=[strong_evergreen], provider_name="evergreen"),
+                MockTopicSourceProvider(candidates=[weak_news], provider_name="news"),
+            ]
+        )
+        llm = RecordingLLMProvider(
+            response=json.dumps(
+                {
+                    "judgments": [
+                        {
+                            "normalized_title": strong_evergreen.normalized_title,
+                            "relevance_score": 0.95,
+                            "evergreen_score": 0.9,
+                            "suitability_score": 0.95,
+                            "rationale": "Excellent evergreen fit",
+                        },
+                        {
+                            "normalized_title": weak_news.normalized_title,
+                            "relevance_score": 0.3,
+                            "evergreen_score": 0.2,
+                            "suitability_score": 0.3,
+                            "rationale": "Weak/unsuitable fit",
+                        },
+                    ]
+                }
+            )
+        )
+        agent = TopicPlannerAgent(
+            topic_source_provider=provider,
+            ranking_planner=TopicRankingPlanner(llm),
+            topic_plan_store=TopicPlanStore(str(tmp_path / "plans")),
+            provenance_output_dir=str(tmp_path / "provenance"),
+            mode="mixed",
+            freshness_hours=48,
+        )
+
+        result = asyncio.run(agent.plan_topic())
+
+        # Mixed mode never bans evergreen - a genuinely stronger evergreen
+        # candidate still wins over a merely-fresh-but-weak trending one.
+        assert result.success is True
+        assert result.selected_topic == strong_evergreen.raw_title
+
+    def test_duplicate_prevention_intact_with_composite_mixed_source(self, tmp_path) -> None:
+        from src.services.provenance_store import ProvenanceManifestStore
+
+        unrelated_evergreen = _candidate("How do vaccines work?")
+        duplicate_news = _news_candidate("Why Do Cats Purr", hours_old=1)  # near-duplicate of prior history
+        unique_news = _news_candidate("New Exoplanet Discovered This Week", hours_old=1)
+        provider = CompositeTopicSourceProvider(
+            [
+                MockTopicSourceProvider(candidates=[unrelated_evergreen], provider_name="evergreen"),
+                MockTopicSourceProvider(candidates=[duplicate_news, unique_news], provider_name="news"),
+            ]
+        )
+        llm = RecordingLLMProvider(
+            response=_valid_ranking_response([unrelated_evergreen, duplicate_news, unique_news])
+        )
+        provenance_dir = tmp_path / "provenance"
+        ProvenanceManifestStore(str(provenance_dir)).write(
+            _manifest("run-1", "Why do cats purr?", "2026-01-01T00:00:00+00:00")
+        )
+        agent = TopicPlannerAgent(
+            topic_source_provider=provider,
+            ranking_planner=TopicRankingPlanner(llm),
+            topic_plan_store=TopicPlanStore(str(tmp_path / "plans")),
+            provenance_output_dir=str(provenance_dir),
+            mode="mixed",
+            freshness_hours=48,
+        )
+
+        result = asyncio.run(agent.plan_topic())
+
+        assert result.success is True
+        assert result.duplicate_count == 1
+        assert result.selected_topic != "Why Do Cats Purr"

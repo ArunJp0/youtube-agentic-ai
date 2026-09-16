@@ -53,6 +53,8 @@ from src.services.provenance_collection import persist_provenance_if_completed
 from src.services.provenance_store import DEFAULT_PROVENANCE_OUTPUT_DIR, ProvenanceManifestStore, ProvenanceStoreError
 from src.services.publishing_record_store import DEFAULT_PUBLISHING_RECORD_DIR, PublishingRecordStore
 from src.services.script_context_reconstruction import original_base_name
+from src.services.script_duration import WordBudget
+from src.tools.ai_video_provider import AIVideoProvider
 from src.services.upload_artifact_discovery import DiscoveredRunArtifacts
 from src.services.video_assembly_service import (
     DEFAULT_VIDEO_OUTPUT_DIR,
@@ -197,6 +199,10 @@ def build_pipeline_graph(
     youtube_client: Optional[YouTubeClient] = None,
     publishing_intent: Optional[PublishingIntent] = None,
     publishing_record_dir: str = DEFAULT_PUBLISHING_RECORD_DIR,
+    script_word_budget: Optional[WordBudget] = None,
+    ai_video_provider: Optional[AIVideoProvider] = None,
+    ai_video_max_retries: int = 2,
+    stock_fallback_enabled: bool = True,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
@@ -307,12 +313,29 @@ def build_pipeline_graph(
             must explicitly opt in to ``mode="private"``/``"scheduled"``.
         publishing_record_dir: Directory PublishingRecordStore persists
             idempotency records into (mirrors every other ``*_output_dir``)
+        script_word_budget: Optional centralized target-duration content
+            budget for the Script Agent (see
+            ``src.services.script_duration``) - defaults to the
+            "standard" (~5-8 minute) profile when omitted, never a second
+            hardcoded section count here
+        ai_video_provider: Optional AIVideoProvider (see
+            ``src.tools.ai_video_provider``) - when set, each visual slot
+            tries AI generation first, bounded by ``ai_video_max_retries``,
+            before falling back to ``media_provider`` (Pexels/mock)
+            exactly as before. ``None`` (default) preserves the exact
+            existing stock-only behavior unchanged.
+        ai_video_max_retries: Bounded additional AI generation attempts
+            per slot after the first.
+        stock_fallback_enabled: When AI generation is configured but
+            exhausts its retries, fall back to ``media_provider`` if True
+            (default); if False, that slot fails cleanly instead of
+            silently fetching stock footage.
 
     Returns:
         StateGraph ready to be ``.compile()``d
     """
     research_agent = ResearchAgent(search_provider=search_provider, llm_provider=llm_provider)
-    script_agent = ScriptAgent(llm_provider=llm_provider)
+    script_agent = ScriptAgent(llm_provider=llm_provider, word_budget=script_word_budget)
     voice_service = VoiceService(
         voice_provider=voice_provider, voice_name=voice_name, output_dir=voice_output_dir
     )
@@ -322,7 +345,12 @@ def build_pipeline_graph(
     # to the deterministic query-generation path on its own.
     visual_planner = VisualContextPlanner(llm_provider=llm_provider)
     visual_service = VisualMediaService(
-        media_provider=media_provider, visual_planner=visual_planner, output_dir=media_output_dir
+        media_provider=media_provider,
+        visual_planner=visual_planner,
+        output_dir=media_output_dir,
+        ai_video_provider=ai_video_provider,
+        ai_video_max_retries=ai_video_max_retries,
+        stock_fallback_enabled=stock_fallback_enabled,
     )
     # visual_media_service=visual_service lets Visual QC request bounded
     # replacements through VisualMediaService's own existing selection
@@ -1198,6 +1226,10 @@ async def run_pipeline(
     youtube_client: Optional[YouTubeClient] = None,
     publishing_intent: Optional[PublishingIntent] = None,
     publishing_record_dir: str = DEFAULT_PUBLISHING_RECORD_DIR,
+    script_word_budget: Optional[WordBudget] = None,
+    ai_video_provider: Optional[AIVideoProvider] = None,
+    ai_video_max_retries: int = 2,
+    stock_fallback_enabled: bool = True,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
@@ -1282,6 +1314,20 @@ async def run_pipeline(
             causes a YouTube API call even on a genuine Compliance PASS
         publishing_record_dir: Directory PublishingRecordStore persists
             idempotency records into
+        script_word_budget: Optional centralized target-duration content
+            budget for the Script Agent (see
+            ``src.services.script_duration``) - defaults to the
+            "standard" (~5-8 minute) profile when omitted
+        ai_video_provider: Optional AIVideoProvider - when set, each
+            visual slot tries AI generation first (bounded by
+            ``ai_video_max_retries``) before falling back to the
+            configured stock media provider unchanged. ``None`` (default)
+            preserves the exact existing stock-only behavior.
+        ai_video_max_retries: Bounded additional AI generation attempts
+            per slot after the first.
+        stock_fallback_enabled: Fall back to stock media when AI
+            generation exhausts its retries (default True); if False, the
+            slot fails cleanly instead of silently fetching stock footage.
 
     Returns:
         Final PipelineState (check ``.status``/``.error`` for outcome)
@@ -1308,6 +1354,10 @@ async def run_pipeline(
         youtube_client,
         publishing_intent,
         publishing_record_dir,
+        script_word_budget,
+        ai_video_provider,
+        ai_video_max_retries,
+        stock_fallback_enabled,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 

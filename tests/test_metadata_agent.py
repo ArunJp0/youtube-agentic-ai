@@ -12,6 +12,10 @@ from src.agents.metadata_agent import MetadataAgent, MetadataAgentError
 from src.llm.provider import LLMProvider
 from src.models.metadata import MetadataResult
 from src.models.script import ScriptResult, ScriptSection
+from src.services.metadata_validation import (
+    DESCRIPTION_HARD_MAX_WORDS,
+    TITLE_HARD_MAX_CHARS,
+)
 
 
 def _script(**overrides) -> ScriptResult:
@@ -172,6 +176,89 @@ class TestMetadataAgentDescriptionHandling:
         result = agent.generate_metadata("dreams", _script(), duration_seconds=120.0)
 
         assert result.success is False
+
+
+class TestMetadataAgentTitleDescriptionHouseStyle:
+    """Real end-to-end coverage (through generate_metadata, not just the
+    validation unit) of the new concise/curiosity-driven title and
+    description constraints - all via FakeLLMProvider, no real Gemini call."""
+
+    def test_prompt_communicates_title_and_description_targets(self, tmp_path) -> None:
+        llm = FakeLLMProvider(response=_valid_response())
+        agent = MetadataAgent(llm_provider=llm, output_dir=str(tmp_path))
+
+        agent.generate_metadata("dreams", _script(), duration_seconds=120.0)
+
+        prompt = llm.calls[0]
+        assert "curiosity" in prompt.lower() or "hook" in prompt.lower()
+        assert str(TITLE_HARD_MAX_CHARS) in prompt
+        assert str(DESCRIPTION_HARD_MAX_WORDS) in prompt
+        assert "never copied or closely paraphrased" in prompt.lower()
+
+    def test_overlong_llm_title_is_repaired_not_rejected(self, tmp_path) -> None:
+        long_title = "Why Do Humans Dream: A Complete and Exhaustive Scientific Deep Dive Into Sleep"
+        assert len(long_title) > TITLE_HARD_MAX_CHARS
+        llm = FakeLLMProvider(response=_valid_response(title=long_title))
+        agent = MetadataAgent(llm_provider=llm, output_dir=str(tmp_path))
+
+        result = agent.generate_metadata("dreams", _script(), duration_seconds=120.0)
+
+        assert result.success is True
+        assert len(result.title) <= TITLE_HARD_MAX_CHARS
+        # Repaired by dropping the subtitle, never rejected/blank/generic.
+        assert result.title == "Why Do Humans Dream"
+
+    def test_overlong_llm_description_is_repaired_not_rejected(self, tmp_path) -> None:
+        sentence = "The narrator explains one more detail about dreaming and sleep science."
+        long_description = " ".join([sentence] * 25)  # far over the 110-word hard cap
+        llm = FakeLLMProvider(response=_valid_response(description=long_description))
+        agent = MetadataAgent(llm_provider=llm, output_dir=str(tmp_path))
+
+        result = agent.generate_metadata("dreams", _script(), duration_seconds=120.0)
+
+        assert result.success is True
+        assert len(result.description.split()) <= DESCRIPTION_HARD_MAX_WORDS
+        assert result.description.endswith(".")
+        assert result.description != long_description
+
+    def test_title_within_house_style_range_passes_through_unchanged(self, tmp_path) -> None:
+        title = "Why Does Ice Float on Water Instead of Sinking?"
+        llm = FakeLLMProvider(response=_valid_response(title=title))
+        agent = MetadataAgent(llm_provider=llm, output_dir=str(tmp_path))
+
+        result = agent.generate_metadata("Why does ice float?", _script(), duration_seconds=120.0)
+
+        assert result.title == title
+
+    def test_description_does_not_reproduce_a_large_script_passage(self, tmp_path) -> None:
+        """Simulates an LLM that ignored the anti-copying instruction and
+        pasted large sections of narration verbatim - the deterministic
+        repair must still cut it down, never pass through as a transcript."""
+        script = _script()
+        copied_narration = " ".join(section.narration for section in script.sections * 10)  # well over 110 words
+        llm = FakeLLMProvider(response=_valid_response(description=copied_narration))
+        agent = MetadataAgent(llm_provider=llm, output_dir=str(tmp_path))
+
+        result = agent.generate_metadata(script.topic, script, duration_seconds=120.0)
+
+        assert result.success is True
+        assert len(result.description.split()) <= DESCRIPTION_HARD_MAX_WORDS
+        assert result.description != copied_narration
+
+    def test_tags_hashtags_chapters_contract_unaffected_by_title_description_changes(self, tmp_path) -> None:
+        """Regression guard: tags/hashtags/chapters behavior must remain
+        exactly as before this milestone's title/description-only change."""
+        llm = FakeLLMProvider(response=_valid_response(chapter_labels=["A", "B"]))
+        agent = MetadataAgent(llm_provider=llm, output_dir=str(tmp_path))
+        script = _script()
+
+        result = agent.generate_metadata(script.topic, script, duration_seconds=100.0)
+
+        assert result.tags == ["dreams", "sleep science", "REM sleep"]
+        assert result.hashtags == ["#dreams", "#sleep", "#science"]
+        assert result.chapters_available is True
+        assert len(result.chapters) == 2
+        assert result.chapters[0].timestamp_seconds == 0.0
 
 
 class TestMetadataAgentTagsHashtags:

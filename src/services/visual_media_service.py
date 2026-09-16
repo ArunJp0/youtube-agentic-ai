@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
@@ -25,9 +26,11 @@ from src.agents.visual_context_planner import VisualContextPlanner
 from src.models.media import MediaAsset, SectionMediaMapping, VisualResult
 from src.models.script import ScriptResult
 from src.models.visual_plan import SectionVisualPlan, VisualPlan
+from src.services.ai_video_visual_acquisition import acquire_visual_asset_with_ai_fallback, build_ai_video_request
 from src.services.query_generation import LAST_RESORT_QUERY, build_deterministic_visual_plan, ordered_unique
 from src.services.section_timing import calculate_section_durations
 from src.services.semantic_visual_filter import passes_avoid_filter, relevance_score
+from src.tools.ai_video_provider import AIVideoProvider
 from src.tools.media_provider import MediaCandidate, MediaProvider, MediaProviderError
 
 DEFAULT_MEDIA_OUTPUT_DIR = os.path.join("output", "media")
@@ -99,6 +102,9 @@ class VisualMediaService:
         output_dir: str = DEFAULT_MEDIA_OUTPUT_DIR,
         max_results_per_query: int = DEFAULT_MAX_RESULTS_PER_QUERY,
         prefer_video: bool = True,
+        ai_video_provider: Optional[AIVideoProvider] = None,
+        ai_video_max_retries: int = 2,
+        stock_fallback_enabled: bool = True,
     ) -> None:
         """Initialize the Visual Media Service.
 
@@ -114,12 +120,31 @@ class VisualMediaService:
             max_results_per_query: Candidates to request per query, giving
                 room to find a unique (non-duplicate) match
             prefer_video: Ask the provider for video clips before images
+            ai_video_provider: Optional AIVideoProvider (see
+                src.tools.ai_video_provider) - when set, each visual slot
+                tries AI generation FIRST (bounded by
+                ``ai_video_max_retries``), using the same per-section
+                VisualPlan (search queries/semantic summary/avoid concepts)
+                already used for stock search, before falling back to the
+                existing ``media_provider`` chain unchanged. ``None``
+                (default) preserves the exact prior stock-only behavior -
+                this parameter changes nothing unless explicitly supplied.
+            ai_video_max_retries: Bounded additional AI generation attempts
+                per slot after the first, before falling back/failing.
+            stock_fallback_enabled: When AI generation is configured but
+                exhausts its retries without success, fall back to
+                ``media_provider`` if True (default); if False, that slot
+                fails cleanly instead of silently fetching stock footage -
+                for a demo deliberately meant to show AI visuals only.
         """
         self.media_provider = media_provider
         self.visual_planner = visual_planner
         self.output_dir = output_dir
         self.max_results_per_query = max_results_per_query
         self.prefer_video = prefer_video
+        self.ai_video_provider = ai_video_provider
+        self.ai_video_max_retries = ai_video_max_retries
+        self.stock_fallback_enabled = stock_fallback_enabled
 
     async def generate_visuals(
         self,
@@ -186,8 +211,8 @@ class VisualMediaService:
             slot_assets: List[MediaAsset] = []
             slot_queries: List[str] = []
             for slot_index in range(slot_count):
-                asset, used_query = await self._acquire_slot_asset(
-                    section_plan, slot_index, index, downloaded_by_id, used_ids_in_order
+                asset, used_query = await self._acquire_visual_slot(
+                    section_plan, slot_index, index, duration, slot_count, downloaded_by_id, used_ids_in_order
                 )
                 slot_assets.append(asset)
                 slot_queries.append(used_query)
@@ -308,6 +333,93 @@ class VisualMediaService:
             used_ids_in_order,
             exclude_ids=exclude_ids,
         )
+
+    # ---- AI-generated-video integration seam ---------------------------------
+
+    async def _acquire_visual_slot(
+        self,
+        section_plan: SectionVisualPlan,
+        slot_index: int,
+        section_index: int,
+        section_duration_seconds: float,
+        slot_count: int,
+        downloaded_by_id: Dict[str, MediaAsset],
+        used_ids_in_order: List[str],
+    ) -> Tuple[MediaAsset, str]:
+        """Fill one visual slot, preferring AI-generated video when
+        ``ai_video_provider`` is configured, falling back to the existing
+        stock-media chain (``_acquire_slot_asset``, completely unchanged)
+        when it isn't, when AI generation exhausts its bounded retries, or
+        when a caller has disabled the fallback entirely.
+
+        This is the ONLY call site touched to add AI-video support -
+        ``_acquire_slot_asset``/the whole stock selection chain is reused
+        exactly as-is via a closure, never duplicated. When
+        ``ai_video_provider`` is ``None`` (the default), this method's
+        first branch makes it behave byte-for-byte identically to calling
+        ``_acquire_slot_asset`` directly - zero behavior change unless
+        explicitly opted in.
+        """
+
+        async def pexels_fallback() -> Tuple[MediaAsset, str]:
+            return await self._acquire_slot_asset(
+                section_plan, slot_index, section_index, downloaded_by_id, used_ids_in_order
+            )
+
+        if self.ai_video_provider is None:
+            return await pexels_fallback()
+
+        request = build_ai_video_request(
+            prompt=self._build_ai_video_prompt(section_plan, slot_index),
+            section_index=section_index,
+            slot_index=slot_index,
+            duration_seconds=max(section_duration_seconds / max(slot_count, 1), MIN_SLOT_SECONDS),
+            negative_prompt=", ".join(section_plan.avoid_concepts) or None,
+        )
+        asset, used_prompt = await acquire_visual_asset_with_ai_fallback(
+            request,
+            self.ai_video_provider,
+            pexels_fallback,
+            self.ai_video_max_retries,
+            self.stock_fallback_enabled,
+        )
+
+        if asset.success and asset.relevance_tier == "ai_generated" and asset.local_file_path:
+            # Land the AI clip inside this service's own managed output
+            # directory - exactly where every Pexels download already
+            # lands - rather than leaving it pointing outside the tree.
+            asset = asset.model_copy(
+                update={"local_file_path": self._materialize_ai_asset(asset, section_index, slot_index)}
+            )
+
+        return asset, used_prompt
+
+    @staticmethod
+    def _build_ai_video_prompt(section_plan: SectionVisualPlan, slot_index: int) -> str:
+        """Reuses the SAME per-section VisualPlan data already used for
+        stock search (search_queries/semantic_summary) - no new planning
+        logic, no second LLM call, and no provider-specific wording here;
+        VisualContextPlanner stays entirely unaware of AI video generation."""
+        queries = section_plan.search_queries
+        base = queries[slot_index % len(queries)] if queries else ""
+        summary = (section_plan.semantic_summary or "").strip()
+        if base and summary and summary.lower() not in base.lower():
+            return f"{base}. {summary}"
+        return base or summary or "A relevant cinematic establishing shot for this section"
+
+    def _materialize_ai_asset(self, asset: MediaAsset, section_index: int, slot_index: int) -> str:
+        source_path = asset.local_file_path
+        ext = os.path.splitext(source_path)[1] or ".mp4"
+        filename = f"ai-{section_index}-{slot_index}-{uuid.uuid4().hex[:8]}{ext}"
+        destination = os.path.join(self.output_dir, filename)
+        try:
+            shutil.copyfile(source_path, destination)
+        except OSError:
+            # Copy failed - keep the original path rather than losing an
+            # otherwise-successful asset; downstream stages can still read
+            # it directly from wherever the provider produced it.
+            return source_path
+        return destination
 
     async def _acquire_slot_asset(
         self,
