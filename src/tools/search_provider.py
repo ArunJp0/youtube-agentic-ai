@@ -67,19 +67,32 @@ class MockSearchProvider(SearchProvider):
             {
                 "title": "Photosynthesis: Process, Stages, & Types",
                 "url": "https://www.nature.com/articles/s41586-022-04589-9",
-                "snippet": "Photosynthesis converts light energy into chemical energy stored in glucose molecules.",
+                "snippet": (
+                    "Photosynthesis converts light energy into chemical energy stored in "
+                    "glucose molecules, using carbon dioxide and water absorbed by the "
+                    "plant's leaves and roots as the essential starting raw materials."
+                ),
             },
             {
                 "title": "The Process of Photosynthesis - Biology",
                 "url": "https://www.khanacademy.org/science/biology/photosynthesis-in-plants",
-                "snippet": "Light-dependent reactions capture energy, while Calvin cycle uses it to make sugar.",
+                "snippet": (
+                    "Light-dependent reactions capture energy in the thylakoid membrane, "
+                    "while the Calvin cycle uses that captured energy in the stroma to "
+                    "fix carbon and ultimately make sugar the plant can use or store."
+                ),
             },
         ],
         "what causes earthquakes": [
             {
                 "title": "Earthquake Causes - USGS",
                 "url": "https://www.usgs.gov/faqs/what-causes-earthquakes",
-                "snippet": "Most earthquakes result from tectonic plate movement and stress accumulation.",
+                "snippet": (
+                    "Most earthquakes result from tectonic plate movement and the "
+                    "gradual buildup of stress accumulation along a fault line, which "
+                    "is released suddenly as seismic waves once it exceeds the rock's "
+                    "frictional strength."
+                ),
             },
         ],
     }
@@ -99,22 +112,40 @@ class MockSearchProvider(SearchProvider):
                 results = self._MOCK_RESULTS[key][:num_results]
                 return [{"title": r["title"], "url": r["url"], "snippet": r["snippet"]} for r in results]
 
-        # Generic mock response for unknown queries
+        # Generic mock response for unknown queries. Each snippet is
+        # deliberately substantial and distinctly worded (not just a short
+        # templated phrase) so callers exercising pipeline/orchestration
+        # behavior (rather than research-content-quality itself, which has
+        # its own dedicated real-content fixtures/tests) don't incidentally
+        # trip ResearchAgent's real-world-calibrated minimum-substance gate
+        # - still obviously a mock, never real content.
         return [
             {
-                "title": f"Mock result 1 for '{query}'",
+                "title": f"Mock background report on {query}",
                 "url": "https://example.com/result1",
-                "snippet": f"Mock snippet for research on {query}",
+                "snippet": (
+                    f"Mock research snippet exploring {query} in some detail, covering its "
+                    "background, key mechanisms, and why it matters, with illustrative "
+                    "examples drawn from representative studies and expert commentary."
+                ),
             },
             {
-                "title": f"Mock result 2 for '{query}'",
+                "title": f"Mock practical implications for {query}",
                 "url": "https://example.com/result2",
-                "snippet": f"Additional information about {query}",
+                "snippet": (
+                    f"A second mock perspective on {query}, focusing on practical "
+                    "implications, common misconceptions, and how current understanding "
+                    "has evolved based on recent findings and ongoing expert discussion."
+                ),
             },
             {
-                "title": f"Mock result 3 for '{query}'",
+                "title": f"Mock open questions about {query}",
                 "url": "https://example.com/result3",
-                "snippet": f"Further details about {query}",
+                "snippet": (
+                    f"A third mock viewpoint on {query}, summarizing supporting evidence, "
+                    "notable examples, and open questions left for future investigation, "
+                    "plus broader context useful for understanding the bigger picture."
+                ),
             },
         ][:num_results]
 

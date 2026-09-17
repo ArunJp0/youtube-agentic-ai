@@ -76,10 +76,16 @@ class FakeReplacementProvider:
         self.calls: list[dict] = []
 
     async def acquire_replacement_asset(
-        self, section_plan, slot_index, section_index, downloaded_by_id, used_ids_in_order, exclude_ids
+        self, section_plan, slot_index, section_index, downloaded_by_id, used_ids_in_order, exclude_ids,
+        broaden_query=False,
     ):
         self.calls.append(
-            {"section_index": section_index, "slot_index": slot_index, "exclude_ids": set(exclude_ids)}
+            {
+                "section_index": section_index,
+                "slot_index": slot_index,
+                "exclude_ids": set(exclude_ids),
+                "broaden_query": broaden_query,
+            }
         )
         queue = self.replacements_by_slot.get((section_index, slot_index), [])
         if not queue:

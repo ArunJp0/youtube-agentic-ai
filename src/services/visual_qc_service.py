@@ -23,7 +23,11 @@ from src.models.visual_plan import SectionVisualPlan, VisualPlan
 from src.models.visual_qc import AssetQCResult, RawAssetVerdict, SectionQCResult, VisualQCResult
 from src.services.frame_sampling import calculate_sample_timestamps
 from src.services.repetition_check import detect_repetition_warnings
-from src.services.visual_media_service import RECENT_REUSE_LOOKBACK, VisualMediaService
+from src.services.visual_media_service import (
+    RECENT_REUSE_LOOKBACK,
+    VisualMediaService,
+    reconstruct_global_asset_state,
+)
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.visual_relevance_evaluator import (
     AssetFrames,
@@ -313,8 +317,19 @@ class VisualQCService:
             excluded.add(self._asset_key(current_asset))
             attempts += 1
             try:
+                # From the 2nd replacement attempt onward, deliberately
+                # broaden past the specific (possibly systematically
+                # unsuitable) query tier rather than just sampling another
+                # clip from the same one - see acquire_replacement_asset's
+                # docstring.
                 replacement_asset, _ = await self.visual_media_service.acquire_replacement_asset(
-                    section_plan, slot_index, mapping.section_index, downloaded_by_id, used_ids_in_order, excluded
+                    section_plan,
+                    slot_index,
+                    mapping.section_index,
+                    downloaded_by_id,
+                    used_ids_in_order,
+                    excluded,
+                    broaden_query=attempts > 1,
                 )
             except Exception:
                 break
@@ -442,17 +457,12 @@ class VisualQCService:
     def _reconstruct_global_state(visual_result: VisualResult) -> Tuple[Dict[str, MediaAsset], List[str]]:
         """Rebuild the global dedup state VisualMediaService would have had
         mid-generation, from an already-finished VisualResult - so a
-        QC-driven replacement still respects global duplicate prevention."""
-        downloaded_by_id: Dict[str, MediaAsset] = {}
-        used_ids_in_order: List[str] = []
-        for mapping in visual_result.sections:
-            for asset in mapping.assets:
-                if not asset.success:
-                    continue
-                key = VisualQCService._asset_key(asset)
-                downloaded_by_id.setdefault(key, asset)
-                used_ids_in_order.append(key)
-        return downloaded_by_id, used_ids_in_order
+        QC-driven replacement still respects global duplicate prevention.
+
+        Thin wrapper over the shared implementation in
+        visual_media_service.py (also used by VisualMediaService's own
+        remediation-scoped regeneration) - one implementation, not two."""
+        return reconstruct_global_asset_state(visual_result)
 
     @staticmethod
     def _section_plan_for(visual_plan: VisualPlan, section_index: int) -> Optional[SectionVisualPlan]:

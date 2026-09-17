@@ -1105,7 +1105,8 @@ class TestResearchHandoffProvenance:
         assert plan_result.selected_topic_source == "current_news"
 
         current_news_provider = _FixedSearchProvider(
-            "current_news", results=[_rich_result("https://news.example.com/ai-breakthrough")]
+            "current_news",
+            results=[_rich_result(plan_result.selected_topic, "https://news.example.com/ai-breakthrough")],
         )
         research_agent = ResearchAgent(
             search_provider=MockSearchProvider(),

@@ -193,9 +193,19 @@ class TestBuildPublishingIntent:
     not alter the existing safe-by-default publishing behavior."""
 
     def test_defaults_to_disabled(self) -> None:
-        settings = Settings()
-        intent = build_publishing_intent(settings)
-        assert intent.mode == "disabled"
+        import os
+
+        # Guard against a developer's/deployment's local .env overriding
+        # AUTONOMOUS_PUBLISHING_MODE (e.g. during a controlled real
+        # validation run) and masking this default-value assertion.
+        previous = os.environ.pop("AUTONOMOUS_PUBLISHING_MODE", None)
+        try:
+            settings = Settings()
+            intent = build_publishing_intent(settings)
+            assert intent.mode == "disabled"
+        finally:
+            if previous is not None:
+                os.environ["AUTONOMOUS_PUBLISHING_MODE"] = previous
 
     def test_private_mode_passes_through(self) -> None:
         settings = Settings(autonomous_publishing_mode="private")

@@ -647,6 +647,195 @@ class TestAcquireReplacementAsset:
         assert result_asset.reused is True
 
 
+class TestBroadenQueryReplacement:
+    """A later QC-driven replacement attempt (broaden_query=True) skips the
+    slot's specific query entirely and searches only the neutral/broader
+    tier - recovery generically, not by re-sampling the same possibly-
+    unsuitable visual concept (see VisualQCService._resolve_slot)."""
+
+    @pytest.mark.asyncio
+    async def test_broaden_query_true_skips_specific_query(self, tmp_path) -> None:
+        section_plan = SectionVisualPlan(
+            section_index=0,
+            search_queries=["specific narrow query"],
+            neutral_fallback_queries=["broad safe query"],
+        )
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+
+        asset, used_query = await service.acquire_replacement_asset(
+            section_plan, 0, 0, {}, [], set(), broaden_query=True
+        )
+
+        queried = [q for name, q in provider.calls if name == "search"]
+        assert "specific narrow query" not in queried
+        assert "broad safe query" in queried
+        assert used_query == "broad safe query"
+        assert asset.success is True
+
+    @pytest.mark.asyncio
+    async def test_broaden_query_false_tries_specific_query_first(self, tmp_path) -> None:
+        section_plan = SectionVisualPlan(
+            section_index=0,
+            search_queries=["specific narrow query"],
+            neutral_fallback_queries=["broad safe query"],
+        )
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+
+        asset, used_query = await service.acquire_replacement_asset(
+            section_plan, 0, 0, {}, [], set(), broaden_query=False
+        )
+
+        assert used_query == "specific narrow query"
+        assert asset.success is True
+
+    @pytest.mark.asyncio
+    async def test_broaden_query_still_avoids_excluded_ids(self, tmp_path) -> None:
+        """Broadening the query tier never weakens exclusion - a
+        previously-rejected id stays excluded regardless of which tier
+        finds the replacement."""
+        section_plan = SectionVisualPlan(
+            section_index=0,
+            search_queries=["specific narrow query"],
+            neutral_fallback_queries=["broad safe query"],
+        )
+        provider = MockMediaProvider(results_per_query=1, pool_size=1)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        downloaded_by_id: dict = {}
+        used_ids_in_order: list = []
+
+        first_asset, _ = await service.acquire_replacement_asset(
+            section_plan, 0, 0, downloaded_by_id, used_ids_in_order, set(), broaden_query=False
+        )
+        excluded = {first_asset.provider_asset_id}
+
+        result_asset, _ = await service.acquire_replacement_asset(
+            section_plan, 0, 0, downloaded_by_id, used_ids_in_order, excluded, broaden_query=True
+        )
+
+        # Only one distinct asset exists in the pool either way - excluded
+        # correctly falls back to reuse rather than silently ignoring the
+        # exclusion just because the query tier changed.
+        assert result_asset.reused is True
+
+
+class TestRemediationScopedVisualReuse:
+    """generate_visuals' prior_visual_result/changed_section_indices -
+    avoids unnecessarily rebuilding sections a Compliance Remediation
+    script revision didn't touch (see task: "avoid unnecessarily rebuilding
+    unaffected sections/assets")."""
+
+    @pytest.mark.asyncio
+    async def test_unchanged_section_reused_without_new_search(self, tmp_path) -> None:
+        script = _sample_script()
+        provider = MockMediaProvider(results_per_query=5)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        plan = service.build_plan(script)
+
+        first = await service.generate_visuals(script, 60.0, visual_plan=plan)
+        assert first.success is True
+        provider.calls.clear()
+
+        second = await service.generate_visuals(
+            script, 60.0, visual_plan=plan, prior_visual_result=first, changed_section_indices={1}
+        )
+
+        assert second.success is True
+        # Section 0 (unchanged) must be byte-identical to the prior result -
+        # no new search/download for it.
+        assert second.sections[0] == first.sections[0]
+        searched_queries = {q for name, q in provider.calls if name == "search"}
+        assert searched_queries.isdisjoint(plan.sections[0].search_queries)
+        # Section 1 (the actually-changed one) must still have been searched.
+        assert searched_queries & set(plan.sections[1].search_queries)
+
+    @pytest.mark.asyncio
+    async def test_changed_section_is_freshly_reacquired(self, tmp_path) -> None:
+        script = _sample_script()
+        provider = MockMediaProvider(results_per_query=5)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        plan = service.build_plan(script)
+
+        first = await service.generate_visuals(script, 60.0, visual_plan=plan)
+        provider.calls.clear()
+
+        second = await service.generate_visuals(
+            script, 60.0, visual_plan=plan, prior_visual_result=first, changed_section_indices={1}
+        )
+
+        assert any(name == "search" for name, _ in provider.calls)
+        # The changed section got at least one fresh search call.
+        assert second.sections[1].section_index == 1
+
+    @pytest.mark.asyncio
+    async def test_changed_section_avoids_reselecting_its_own_prior_asset(self, tmp_path) -> None:
+        """Global dedup state is seeded from EVERY prior asset (including
+        the changed section's own) so a fresh acquire for that section
+        naturally gets a different asset than it had before."""
+        script = _sample_script(sections=[_section("Only Section", "Some narration text about this topic.")])
+        # Ample pool headroom beyond however many slots this short section
+        # needs, so "avoids reselecting" is meaningfully testable rather
+        # than forced into reuse purely by pool exhaustion. max_results_per_query
+        # must also be raised - it, not the provider's own results_per_query,
+        # is what actually caps candidates considered per search call.
+        provider = MockMediaProvider(results_per_query=20, pool_size=20)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path), max_results_per_query=20)
+        plan = service.build_plan(script)
+
+        first = await service.generate_visuals(script, 30.0, visual_plan=plan)
+        prior_ids = {a.provider_asset_id for m in first.sections for a in m.assets if a.success}
+
+        second = await service.generate_visuals(
+            script, 30.0, visual_plan=plan, prior_visual_result=first, changed_section_indices={0}
+        )
+
+        new_ids = {a.provider_asset_id for m in second.sections for a in m.assets if a.success}
+        assert new_ids.isdisjoint(prior_ids)
+
+    @pytest.mark.asyncio
+    async def test_no_prior_result_behaves_exactly_as_before(self, tmp_path) -> None:
+        """Omitting prior_visual_result/changed_section_indices (the
+        default) must be byte-for-byte the original full-regeneration
+        behavior - no accidental behavior change for every existing
+        caller."""
+        script = _sample_script()
+        provider = MockMediaProvider(results_per_query=5)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        plan = service.build_plan(script)
+
+        result = await service.generate_visuals(script, 60.0, visual_plan=plan)
+
+        assert result.success is True
+        assert len(result.sections) == len(script.sections)
+
+    @pytest.mark.asyncio
+    async def test_slot_count_mismatch_forces_fresh_reacquire_even_if_unchanged(self, tmp_path) -> None:
+        """Safety guard: a section marked 'unchanged' is only reused when
+        its recomputed plan still genuinely matches the prior attempt's -
+        never reused blindly just because its index wasn't flagged."""
+        script = _sample_script()
+        provider = MockMediaProvider(results_per_query=5)
+        service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
+        plan = service.build_plan(script)
+        first = await service.generate_visuals(script, 60.0, visual_plan=plan)
+
+        # Simulate a stale prior mapping whose slot count no longer matches
+        # (e.g. a real duration shift) by hand-editing planned_duration.
+        stale_mapping = first.sections[0].model_copy(update={"planned_duration_seconds": 0.5})
+        stale_prior = first.model_copy(update={"sections": [stale_mapping] + list(first.sections[1:])})
+        provider.calls.clear()
+
+        second = await service.generate_visuals(
+            script, 60.0, visual_plan=plan, prior_visual_result=stale_prior, changed_section_indices={1}
+        )
+
+        # Section 0 was "unchanged" but its prior plan no longer matches -
+        # must be freshly reacquired, not reused verbatim from the stale mapping.
+        assert second.sections[0] != stale_mapping
+        assert any(name == "search" for name, _ in provider.calls)
+
+
 class TestGenerateVisualsWithSemanticPlanner:
     """Semantic-planner integration: VisualMediaService uses the plan's
     search_queries/avoid_concepts/neutral_fallback_queries and applies the

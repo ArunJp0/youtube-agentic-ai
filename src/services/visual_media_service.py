@@ -79,6 +79,28 @@ class VisualMediaServiceError(Exception):
     """
 
 
+def reconstruct_global_asset_state(visual_result: VisualResult) -> Tuple[Dict[str, MediaAsset], List[str]]:
+    """Rebuild the (downloaded_by_id, used_ids_in_order) global dedup state
+    VisualMediaService would have had mid-generation, from an already-
+    finished VisualResult.
+
+    Shared by VisualQCService's own QC-driven-replacement reconstruction
+    and VisualMediaService's own remediation-scoped regeneration (see
+    ``generate_visuals``'s ``prior_visual_result`` argument) - one
+    implementation, not two.
+    """
+    downloaded_by_id: Dict[str, MediaAsset] = {}
+    used_ids_in_order: List[str] = []
+    for mapping in visual_result.sections:
+        for asset in mapping.assets:
+            if not asset.success:
+                continue
+            key = VisualMediaService._asset_key(asset)
+            downloaded_by_id.setdefault(key, asset)
+            used_ids_in_order.append(key)
+    return downloaded_by_id, used_ids_in_order
+
+
 class VisualMediaService:
     """Deterministic service that prepares visual assets for a ScriptResult.
 
@@ -151,6 +173,8 @@ class VisualMediaService:
         script: ScriptResult,
         total_narration_duration_seconds: float,
         visual_plan: Optional[VisualPlan] = None,
+        prior_visual_result: Optional[VisualResult] = None,
+        changed_section_indices: Optional[Set[int]] = None,
     ) -> VisualResult:
         """Prepare duration-aware, context-planned visual assets for every
         section of a ScriptResult.
@@ -172,6 +196,20 @@ class VisualMediaService:
                 the same plan for another purpose (e.g. Visual QC) and must
                 avoid a second, redundant LLM planning call. If omitted,
                 one is built internally as before.
+            prior_visual_result: Optional already-QC-approved VisualResult
+                from an earlier attempt (e.g. before a bounded Compliance
+                Remediation script revision). When given together with
+                ``changed_section_indices``, a section NOT in that set whose
+                recomputed duration/slot count still matches the prior
+                attempt's is reused verbatim (no new Pexels search/download
+                at all) - only genuinely affected sections are re-acquired.
+                Global dedup state also seeds from every prior asset
+                (changed sections included), so freshly-reacquired sections
+                never reselect an asset they already had. ``None`` (default)
+                preserves the exact original full-regeneration behavior.
+            changed_section_indices: Section indices whose narration
+                actually changed - required (non-None) for any reuse to
+                happen; see ``prior_visual_result``.
 
         Returns:
             Structured VisualResult mapping each section to its ordered asset(s)
@@ -202,11 +240,32 @@ class VisualMediaService:
 
         downloaded_by_id: Dict[str, MediaAsset] = {}
         used_ids_in_order: List[str] = []
+        prior_mapping_by_index: Dict[int, SectionMediaMapping] = {}
+        if prior_visual_result is not None and changed_section_indices is not None:
+            downloaded_by_id, used_ids_in_order = reconstruct_global_asset_state(prior_visual_result)
+            prior_mapping_by_index = {m.section_index: m for m in prior_visual_result.sections}
+
         section_mappings: List[SectionMediaMapping] = []
 
         for index, (section, duration) in enumerate(zip(script.sections, section_durations)):
             section_plan = plan.sections[index]
             slot_count = self.calculate_slot_count(duration, total_narration_duration_seconds)
+
+            prior_mapping = prior_mapping_by_index.get(index)
+            if (
+                prior_mapping is not None
+                and index not in changed_section_indices
+                and len(prior_mapping.assets) == slot_count
+                and abs(prior_mapping.planned_duration_seconds - duration) < 0.5
+                and all(a.success for a in prior_mapping.assets)
+            ):
+                # Unaffected by this revision, and its plan is still valid
+                # (same slot count, same effective duration) - reuse the
+                # already-downloaded, already-QC-approved assets verbatim
+                # rather than re-searching/re-downloading Pexels for a
+                # section nothing actually changed about.
+                section_mappings.append(prior_mapping)
+                continue
 
             slot_assets: List[MediaAsset] = []
             slot_queries: List[str] = []
@@ -308,6 +367,7 @@ class VisualMediaService:
         downloaded_by_id: Dict[str, MediaAsset],
         used_ids_in_order: List[str],
         exclude_ids: Set[str],
+        broaden_query: bool = False,
     ) -> Tuple[MediaAsset, str]:
         """Public entry point for a QC-driven replacement: acquire a new
         asset for one already-filled slot using the exact same selection/
@@ -322,6 +382,17 @@ class VisualMediaService:
         should reconstruct these two from an existing VisualResult before
         the first call (see VisualQCService).
 
+        Args:
+            broaden_query: When True, skip this slot's specific query
+                entirely and search only the section's neutral/broader
+                fallback queries (see ``SectionVisualPlan.neutral_fallback_queries``)
+                and the shared last resort - for a later replacement
+                attempt, after a same-tier retry has already failed, on the
+                theory that the specific query's whole visual CONCEPT (not
+                just the one clip already rejected) may be what's
+                unsuitable for this section. False (default) tries the
+                specific query again first, exactly as before.
+
         Returns:
             (asset, query_used_to_find_it)
         """
@@ -332,6 +403,7 @@ class VisualMediaService:
             downloaded_by_id,
             used_ids_in_order,
             exclude_ids=exclude_ids,
+            broaden_query=broaden_query,
         )
 
     # ---- AI-generated-video integration seam ---------------------------------
@@ -429,6 +501,7 @@ class VisualMediaService:
         downloaded_by_id: Dict[str, MediaAsset],
         used_ids_in_order: List[str],
         exclude_ids: Optional[Set[str]] = None,
+        broaden_query: bool = False,
     ) -> Tuple[MediaAsset, str]:
         """Fill one visual slot from a section's visual plan.
 
@@ -441,7 +514,7 @@ class VisualMediaService:
         plan's avoid_concepts before it can be selected; only the one
         candidate actually chosen is downloaded.
 
-        Selection priority:
+        Selection priority (``broaden_query=False``, the default):
             1. A never-used, plan-approved candidate for this slot's
                specific query.
             2. A never-used, plan-approved candidate for a neutral/broader
@@ -452,6 +525,10 @@ class VisualMediaService:
             4. Any already-downloaded asset, even the most recent one
                (immediate repetition - absolute last resort).
 
+        With ``broaden_query=True``, step 1 (the specific query) is skipped
+        entirely - see ``acquire_replacement_asset``'s docstring for why a
+        later QC-driven replacement attempt deliberately escalates past it.
+
         Returns:
             (asset, query_used_to_find_it)
         """
@@ -459,6 +536,8 @@ class VisualMediaService:
         recent_ids = set(used_ids_in_order[-RECENT_REUSE_LOOKBACK:]) | exclude
         specific_queries = section_plan.search_queries
         primary = specific_queries[slot_index % len(specific_queries)] if specific_queries else None
+        if broaden_query:
+            primary = None
 
         chain_sources = ([primary] if primary else []) + list(section_plan.neutral_fallback_queries) + [
             LAST_RESORT_QUERY

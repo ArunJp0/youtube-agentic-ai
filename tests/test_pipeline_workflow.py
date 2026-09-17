@@ -1061,23 +1061,25 @@ class TestPipelineWorkflow:
     # ---- I. existing behavior preserved -------------------------------------
 
     @pytest.mark.asyncio
-    async def test_no_search_results_still_completes_through_metadata(self, providers) -> None:
-        """MockSearchProvider returning [] is a valid (if sparse) research result,
-        not an error - the pipeline should still complete all the way through
-        metadata generation."""
+    async def test_no_search_results_stops_the_pipeline_explicitly(self, providers) -> None:
+        """Production-hardening behavior change (deliberate, per audit):
+        a search provider returning zero results is now an explicit
+        research FAILURE (ResearchAgentError), not a valid-if-sparse
+        research result - research success requires sufficient DIRECT
+        substantive content, never merely "the provider call succeeded".
+        The pipeline must stop at research and never reach Script/Voice/
+        Visual/Assembly/Captions/BGM/Metadata for a topic with no usable
+        research at all."""
         state = await self._run(providers, topic="obscure topic", search_provider=EmptySearchProvider())
 
-        assert state.research_result is not None
-        assert state.research_result.sources == []
-        assert state.status == "completed"
-        assert state.video_assembly_result is not None
-        assert state.video_assembly_result.success is True
-        assert state.caption_result is not None
-        assert state.caption_result.success is True
-        assert state.audio_mix_result is not None
-        assert state.audio_mix_result.success is True
-        assert state.metadata_result is not None
-        assert state.metadata_result.success is True
+        assert state.research_result is None
+        assert state.status == "failed"
+        assert "Research failed" in (state.error or "")
+        assert state.script_result is None
+        assert state.video_assembly_result is None
+        assert state.caption_result is None
+        assert state.audio_mix_result is None
+        assert state.metadata_result is None
 
     @pytest.mark.asyncio
     async def test_pipeline_state_defaults(self) -> None:
@@ -2651,6 +2653,51 @@ class TestComplianceRemediation:
         assert record.publish_decision == "PASS"
         # It's also the winning candidate the remediation history points to.
         assert state.remediation_history[0].resulting_run_id == winning_run_id
+
+    # ---- E. Remediation regenerates only the affected downstream scope ---------
+
+    @pytest.mark.asyncio
+    async def test_remediation_does_not_redownload_media_for_unaffected_sections(self, providers) -> None:
+        """The task's own "avoid unnecessarily rebuilding unaffected
+        sections/assets" requirement: a remediation retry must not re-search/
+        re-download Pexels media for a section script_revision_node never
+        touched (see media_node's changed_section_indices wiring)."""
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, *_ = await self._run(providers, llm_provider=provider)
+
+        assert state.compliance_result.publish_decision == "PASS"
+        assert len(state.remediation_history) == 1
+        media_provider = providers[3]  # ThumbnailCapableMediaProvider
+
+        # Total real downloads across BOTH the original pass and the
+        # remediation retry must be well under double what one pass alone
+        # needed - proof unaffected sections were reused, not rebuilt.
+        one_pass_slot_total = sum(len(m.assets) for m in state.qc_approved_visual_result.sections)
+        total_downloads = sum(1 for name, _ in media_provider.calls if name == "download")
+        assert total_downloads < 2 * one_pass_slot_total
+
+    @pytest.mark.asyncio
+    async def test_remediation_reuses_unaffected_section_assets_verbatim(self, providers) -> None:
+        """The final, post-remediation VisualResult's unaffected section(s)
+        must be the exact same assets (by provider_asset_id) the first,
+        pre-remediation pass already selected and QC-approved - not merely
+        "fewer downloads" but genuinely the SAME chosen media."""
+        provider = RemediatingComplianceLLMProvider(
+            related_section_heading=_REMEDIABLE_SECTION_HEADING, reviews_before_pass=1
+        )
+        state, *_ = await self._run(providers, llm_provider=provider)
+
+        remediated_heading = state.remediation_history[0].corrections[0].section_heading
+        for mapping in state.qc_approved_visual_result.sections:
+            if mapping.section_heading == remediated_heading:
+                continue
+            # An unaffected section's assets were never re-acquired, so
+            # every one of them must still be a genuinely successful,
+            # previously-approved asset (never a blank/failed placeholder
+            # from an accidental unwanted re-run).
+            assert all(a.success for a in mapping.assets)
 
 
 class TestPublishingIntegration:

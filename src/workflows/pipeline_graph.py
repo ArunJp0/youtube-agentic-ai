@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 from langgraph.graph import END, StateGraph
 
@@ -492,8 +492,14 @@ def build_pipeline_graph(
             # QC can reuse the exact same plan later - one Gemini planning
             # call per run, never a second one for QC.
             plan = visual_service.build_plan(state.script_result)
+            changed_indices = _changed_section_indices(state)
+            prior_result = state.qc_approved_visual_result or state.visual_result
             result = await visual_service.generate_visuals(
-                state.script_result, narration_duration, visual_plan=plan
+                state.script_result,
+                narration_duration,
+                visual_plan=plan,
+                prior_visual_result=prior_result if changed_indices else None,
+                changed_section_indices=changed_indices or None,
             )
         except VisualMediaServiceError as e:
             return {
@@ -1079,6 +1085,18 @@ def build_pipeline_graph(
             "status": "published" if result.success else "publishing_failed",
             "error": result.error,
         }
+
+    def _changed_section_indices(state: PipelineState) -> Set[int]:
+        """Which script section indices the most recent Compliance
+        Remediation attempt actually revised - drives scoped Visual Media
+        reuse (see media_node's ``prior_visual_result``): a section NOT in
+        this set is safe to reuse from the prior attempt's already-QC-
+        approved assets rather than unnecessarily rebuilt. Empty on the
+        very first pass (nothing to reuse against yet) or when there is no
+        remediation history at all."""
+        if not state.remediation_history:
+            return set()
+        return {c.section_index for c in state.remediation_history[-1].corrections}
 
     def _remediation_eligibility(
         result: Optional[ComplianceResult], script_result: Optional[ScriptResult]

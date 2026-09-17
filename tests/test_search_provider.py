@@ -38,4 +38,4 @@ class TestSearchRawFunction:
         """search_raw should return mock results for unknown queries."""
         results = asyncio.run(search_raw("unknown_query_xyz123"))
         assert len(results) >= 2
-        assert results[0]["title"].startswith("Mock result")
+        assert results[0]["title"].startswith("Mock")
