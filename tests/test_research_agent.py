@@ -452,7 +452,12 @@ class TestThinWikipediaDoesNotKillValidCurrentNewsResearch:
         result = await agent.research(topic, topic_source="current_news")
 
         assert result.source_provider == "wikipedia"
-        assert current_news.calls == ["Developing story"]
+        # current_news's thin initial result triggers ResearchAgent's own
+        # bounded corroboration retry BEFORE falling through to Wikipedia -
+        # even for an already-short topic like this one, which now still
+        # gets one real retry attempt (widened result count) rather than
+        # being skipped outright (see DEFAULT_RETRY_RESULT_MULTIPLIER).
+        assert current_news.calls == ["Developing story", "Developing story"]
         assert wikipedia.calls == ["Developing story"]
 
 

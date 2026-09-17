@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Tuple
 
 from src.agents.topic_planner_agent import TopicPlannerAgent
 from src.models.autonomous import AutonomousRunRecord, TriggerSource
 from src.models.youtube_upload import PublishingIntent
+from src.orchestration.topic_continuity_orchestrator import TopicContinuityOrchestrator
 from src.services.autonomous_run_store import AutonomousRunStore
 from src.services.run_lock import RunLock, RunLockError
 from src.services.script_context_reconstruction import original_base_name
@@ -66,12 +67,19 @@ class AutonomousRunController:
         run_store: AutonomousRunStore,
         run_lock: RunLock,
         publishing_intent: Optional[PublishingIntent] = None,
+        topic_continuity: Optional[TopicContinuityOrchestrator] = None,
     ) -> None:
         self._topic_planner_agent = topic_planner_agent
         self._pipeline_runner = pipeline_runner
         self._run_store = run_store
         self._run_lock = run_lock
         self._publishing_intent = publishing_intent or PublishingIntent()
+        # Optional - when None (default), topic selection is EXACTLY the
+        # original single plan_topic() call below, unchanged. When
+        # provided, it replaces that single call with the bounded TIER 1 ->
+        # TIER 2 -> TIER 3 content-continuity search (see
+        # TopicContinuityOrchestrator) before the pipeline is ever invoked.
+        self._topic_continuity = topic_continuity
 
     async def run_once(
         self,
@@ -146,20 +154,33 @@ class AutonomousRunController:
         return record
 
     async def _execute(self, record: AutonomousRunRecord, dry_run: bool) -> AutonomousRunRecord:
-        try:
-            topic_result = await self._topic_planner_agent.plan_topic()
-        except Exception as e:
-            # STEP 8: Topic Planner failure -> record failure -> never
-            # start the expensive content pipeline.
-            return self._fail(record, e)
+        if self._topic_continuity is not None:
+            selected_topic, selected_topic_source = await self._select_topic_via_continuity(record)
+            if selected_topic is None:
+                # _select_topic_via_continuity already finished the record
+                # with the correct terminal status (topic_candidates_
+                # exhausted/infrastructure_unavailable) or re-raised as a
+                # normal failure.
+                return record
+        else:
+            # Exact original single-shot behavior, unchanged.
+            try:
+                topic_result = await self._topic_planner_agent.plan_topic()
+            except Exception as e:
+                # STEP 8: Topic Planner failure -> record failure -> never
+                # start the expensive content pipeline.
+                return self._fail(record, e)
 
-        record.topic_plan_status = topic_result.status
-        if not topic_result.success or not topic_result.selected_topic:
-            record.status = "no_topic"
-            record.error_message = topic_result.error
-            return self._finish(record)
+            record.topic_plan_status = topic_result.status
+            if not topic_result.success or not topic_result.selected_topic:
+                record.status = "no_topic"
+                record.error_message = topic_result.error
+                return self._finish(record)
 
-        record.selected_topic = topic_result.selected_topic
+            selected_topic = topic_result.selected_topic
+            selected_topic_source = topic_result.selected_topic_source
+
+        record.selected_topic = selected_topic
         record.status = "generating"
         self._run_store.write(record)
 
@@ -168,15 +189,44 @@ class AutonomousRunController:
             return self._finish(record)
 
         try:
-            pipeline_state = await self._pipeline_runner(
-                topic_result.selected_topic, topic_result.selected_topic_source, self._publishing_intent
-            )
+            pipeline_state = await self._pipeline_runner(selected_topic, selected_topic_source, self._publishing_intent)
         except Exception as e:
             # STEP 8: pipeline generation failure -> record FAILED -> never publish.
             return self._fail(record, e)
 
         self._apply_pipeline_outcome(record, pipeline_state)
         return self._finish(record)
+
+    async def _select_topic_via_continuity(
+        self, record: AutonomousRunRecord
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Runs the bounded TIER 1 -> TIER 2 -> TIER 3 content-continuity
+        search exactly once and applies its outcome to ``record``.
+
+        Returns ``(selected_topic, selected_topic_source)`` - the pipeline
+        is invoked exactly once, only when a topic was actually found;
+        ``(None, None)`` means ``record`` already reached a terminal state
+        (topic_candidates_exhausted/infrastructure_unavailable/failed) and
+        the caller must return it as-is without ever calling the pipeline.
+        """
+        try:
+            outcome = await self._topic_continuity.select_researchable_topic()
+        except Exception as e:
+            self._fail(record, e)
+            return None, None
+
+        record.topic_plan_status = outcome.topic_plan_status
+        if outcome.status == "selected":
+            record.topic_continuity_tier = outcome.tier
+            return outcome.topic, outcome.topic_source
+
+        # "topic_candidates_exhausted" or "infrastructure_unavailable" -
+        # both explicit, typed terminal states; topic insufficiency by
+        # itself must never look like an unexplained generic "failed".
+        record.status = outcome.status
+        record.error_message = outcome.error_message
+        self._finish(record)
+        return None, None
 
     def _apply_pipeline_outcome(self, record: AutonomousRunRecord, pipeline_state: PipelineState) -> None:
         record.pipeline_status = pipeline_state.status

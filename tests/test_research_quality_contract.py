@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import pytest
 
-from src.agents.research import ResearchAgent, ResearchAgentError
+from src.agents.research import DEFAULT_RETRY_RESULT_MULTIPLIER, ResearchAgent, ResearchAgentError
 from src.agents.script import ScriptAgent
 from src.llm.mock import MockLLMProvider
 from src.services.research_relevance import simplify_query
+from src.services.research_substance import assess_substance
+from src.tools.search_provider import SearchProvider
 from tests.test_research_agent import (
     _FixedSearchProvider,
     _PassthroughRelevanceFilter,
+    _duplicate_headline_result,
+    _on_topic_result,
     _rich_result,
     _thin_result,
 )
@@ -317,6 +321,206 @@ class TestRetryBehaviorEndToEnd:
         # Falls through to Wikipedia rather than crashing.
         assert result.source_provider == "wikipedia"
         assert len(provider.calls) == 2  # original + attempted retry
+
+
+# ---- B2. Evidence-widening audit: the retry must genuinely broaden evidence
+# acquisition, never lower what counts as acceptable evidence. Each test
+# below maps 1:1 to one of the required Part B regression scenarios. ----
+
+
+class TestEvidenceWideningRegressionSuite:
+    @pytest.mark.asyncio
+    async def test_relevant_title_only_headline_plus_substantive_corroboration_succeeds(self) -> None:
+        """A relevant but title-only first result must not sink the whole
+        topic - the bounded retry (now requesting MORE candidates than the
+        initial search, see DEFAULT_RETRY_RESULT_MULTIPLIER) must be able to
+        surface substantive corroborating coverage of the SAME event/topic
+        and succeed on the combined evidence."""
+        topic = "Regional transit authority approves new rail extension"
+
+        class _Provider(SearchProvider):
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, int]] = []
+
+            @property
+            def name(self) -> str:
+                return "current_news"
+
+            async def search(self, query: str, num_results: int = 5):
+                self.calls.append((query, num_results))
+                # Only the FIRST (small max_sources=1) request ever sees
+                # just the thin headline; a wider retry request surfaces
+                # the genuinely substantive corroborating article too.
+                candidates = [
+                    _duplicate_headline_result(topic, "https://outlet1.com/headline"),
+                    _on_topic_result(topic, "https://outlet2.com/corroborating-coverage"),
+                ]
+                return candidates[:num_results]
+
+        provider = _Provider()
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_thin_result(topic, "https://en.wikipedia.org/wiki/Thin")])
+        agent = ResearchAgent(
+            search_provider=wikipedia,
+            llm_provider=MockLLMProvider(),
+            current_news_search_provider=provider,
+            max_sources=1,
+        )
+
+        result = await agent.research(topic, topic_source="current_news")
+
+        assert result.source_provider == "current_news"
+        assert any("corroborating-coverage" in str(s) for s in result.sources)
+        # Proves the retry genuinely requested MORE than the initial
+        # max_sources=1 - the corroborating article was only reachable
+        # because of that widening.
+        assert len(provider.calls) == 2
+        assert provider.calls[0][1] == 1
+        assert provider.calls[1][1] > 1
+
+    @pytest.mark.asyncio
+    async def test_several_individually_thin_direct_results_combine_to_succeed(self) -> None:
+        """Several individually-thin DIRECT results about the SAME topic,
+        from DISTINCT (non-duplicate) stories, must combine - no single
+        source is required to individually clear the substance threshold
+        (see assess_substance's per-distinct-group summation, which this
+        proves end-to-end through ResearchAgent, not just at the unit
+        level)."""
+        topic = "Coastal city pilots new flood barrier technology"
+
+        def _distinct_thin(url: str, seed_word: str) -> dict:
+            # Each snippet is genuinely DISTINCT content (not a syndicated
+            # copy of another - a per-source SEED word repeated, with no
+            # shared scaffold phrase between titles, mirroring
+            # _rich_result's own url-derived-title pattern, so near-
+            # duplicate title/content matching never collapses these), but
+            # individually well below the 40-word minimum (15 words each).
+            return {
+                "title": seed_word.title(),
+                "url": url,
+                "snippet": f"{topic}. " + " ".join([seed_word] * 15),
+                "source_name": "Example News",
+            }
+
+        results = [
+            _distinct_thin("https://outlet1.com/a", "engineering"),
+            _distinct_thin("https://outlet2.com/b", "funding"),
+            _distinct_thin("https://outlet3.com/c", "timeline"),
+        ]
+        # Sanity check the fixture actually models "individually thin,
+        # collectively sufficient" before asserting on ResearchAgent.
+        assessment = assess_substance(results, min_words=40)
+        assert assessment.sufficient
+        assert not any(assess_substance([r], min_words=40).sufficient for r in results)
+
+        provider = _FixedSearchProvider("wikipedia", results=results)
+        agent = ResearchAgent(search_provider=provider, llm_provider=MockLLMProvider(), max_sources=5)
+
+        result = await agent.research(topic)
+
+        assert result.source_provider == "wikipedia"
+        assert len(result.sources) == 3
+
+    @pytest.mark.asyncio
+    async def test_title_only_with_no_corroborating_evidence_fails_safely(self) -> None:
+        """When the retry finds nothing beyond more title-only/duplicate
+        copies, the topic must still fail explicitly - the retry's purpose
+        is to obtain substantive evidence, never to lower the evidence
+        standard, and a thin headline is never itself accepted as
+        sufficient just because a retry was attempted."""
+        topic = "Poll shows rising trust in global institutions, less comfort with US as global leader"
+
+        class _Provider(SearchProvider):
+            @property
+            def name(self) -> str:
+                return "current_news"
+
+            async def search(self, query: str, num_results: int = 5):
+                return [
+                    _duplicate_headline_result(topic, "https://outlet1.com/a"),
+                    _duplicate_headline_result(topic, "https://outlet2.com/b"),
+                ]
+
+        wikipedia = _FixedSearchProvider("wikipedia", results=[_thin_result(topic, "https://en.wikipedia.org/wiki/Thin")])
+        agent = ResearchAgent(
+            search_provider=wikipedia, llm_provider=MockLLMProvider(), current_news_search_provider=_Provider()
+        )
+
+        with pytest.raises(ResearchAgentError, match="Insufficient DIRECT research material"):
+            await agent.research(topic, topic_source="current_news")
+
+    @pytest.mark.asyncio
+    async def test_verbose_unrelated_result_is_rejected_regardless_of_widened_retry(self) -> None:
+        """A long, well-written, but genuinely unrelated result is still
+        rejected even though the retry now requests more candidates -
+        widening evidence ACQUISITION never widens what counts as
+        acceptable evidence."""
+        llm = _ScriptedClassificationLLMProvider(_classification_response("unrelated"))
+        provider = _FixedSearchProvider(
+            "wikipedia",
+            results=[
+                {
+                    "title": "New engineering method improves bridge material durability roundup",
+                    "url": "https://example.com/unrelated-verbose",
+                    "snippet": "Verbose but unrelated content. " + " ".join(["filler"] * 80),
+                }
+            ],
+        )
+        agent = ResearchAgent(search_provider=provider, llm_provider=llm)
+
+        with pytest.raises(ResearchAgentError, match="Insufficient DIRECT research material"):
+            await agent.research(TOPIC)
+
+    @pytest.mark.asyncio
+    async def test_supporting_material_cannot_satisfy_direct_sufficiency_even_after_widened_retry(self) -> None:
+        """Only SUPPORTING material is ever found, even after the widened
+        retry - SUPPORTING material must never substitute for insufficient
+        DIRECT evidence, no matter how much of it accumulates."""
+        llm = _ScriptedClassificationLLMProvider(_classification_response("supporting", "supporting"))
+        provider = _FixedSearchProvider(
+            "wikipedia",
+            results=[
+                _supporting_result("https://example.com/supporting-1"),
+                _supporting_result("https://example.com/supporting-2"),
+            ],
+        )
+        agent = ResearchAgent(search_provider=provider, llm_provider=llm, max_sources=5)
+
+        with pytest.raises(ResearchAgentError, match="Insufficient DIRECT research material"):
+            await agent.research(TOPIC)
+
+    @pytest.mark.asyncio
+    async def test_unrelated_content_never_enters_synthesis_regardless_of_length(self) -> None:
+        """An unrelated result long enough to clear the word threshold on
+        its own must still never enter combined_context/ResearchResult -
+        exceeding DEFAULT_MIN_CONTEXT_WORDS is never sufficient by itself;
+        topical relevance is a separate, non-negotiable gate."""
+        llm = _ScriptedClassificationLLMProvider(_classification_response("direct", "unrelated"))
+        provider = _FixedSearchProvider(
+            "wikipedia",
+            results=[
+                _direct_result("https://example.com/direct"),
+                {
+                    "title": "Completely unrelated but very long article",
+                    "url": "https://example.com/long-unrelated",
+                    "snippet": "Totally unrelated content. " + " ".join(["padding"] * 200),
+                },
+            ],
+        )
+        agent = ResearchAgent(search_provider=provider, llm_provider=llm)
+
+        result = await agent.research(TOPIC)
+
+        assert "https://example.com/long-unrelated" not in {str(s) for s in result.sources}
+        assert "https://example.com/long-unrelated" not in result.summary
+        assert not any("padding" in fact.claim for fact in result.facts)
+
+    def test_retry_requests_more_candidates_than_the_initial_search(self) -> None:
+        """Direct unit proof of the widening itself - retry_max_sources
+        must exceed max_sources by the configured multiplier, never equal
+        to or less than it (a no-op widening would defeat the purpose)."""
+        agent = ResearchAgent(search_provider=_FixedSearchProvider("wikipedia"), llm_provider=MockLLMProvider(), max_sources=2)
+        assert agent.retry_max_sources > agent.max_sources
+        assert agent.retry_max_sources == agent.max_sources * DEFAULT_RETRY_RESULT_MULTIPLIER
 
 
 # ---- C. Wikipedia/fallback quality contract (the core gap this audit found) ----

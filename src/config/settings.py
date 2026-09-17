@@ -216,3 +216,33 @@ class Settings:
     autonomous_lock_timeout: int = field(
         default_factory=lambda: int(os.environ.get("AUTONOMOUS_LOCK_TIMEOUT", "10800"))
     )
+
+    # Multi-tier content-continuity strategy (see
+    # src.orchestration.topic_continuity_orchestrator) - bounded fallback
+    # so exhausting a few ranked current-news candidates is never, by
+    # itself, treated as a normal end-of-run condition. Disabled by
+    # default - AutonomousRunController's original single plan_topic()
+    # call is completely unaffected unless explicitly opted in.
+    topic_continuity_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TOPIC_CONTINUITY_ENABLED", "false").strip().lower() == "true"
+    )
+    # TIER 1: bounded number of ranked primary candidates tried before
+    # falling through to TIER 2.
+    topic_continuity_max_primary_candidates: int = field(
+        default_factory=lambda: int(os.environ.get("TOPIC_CONTINUITY_MAX_PRIMARY_CANDIDATES", "5"))
+    )
+    # TIER 2: bounded number of a dedicated evergreen-only Topic Planner's
+    # own ranked candidates tried before falling through to TIER 3.
+    topic_continuity_max_evergreen_candidates: int = field(
+        default_factory=lambda: int(os.environ.get("TOPIC_CONTINUITY_MAX_EVERGREEN_CANDIDATES", "5"))
+    )
+    # TIER 3: bounded number of persistent reserve entries tried before the
+    # run is genuinely exhausted.
+    topic_continuity_max_reserve_attempts: int = field(
+        default_factory=lambda: int(os.environ.get("TOPIC_CONTINUITY_MAX_RESERVE_ATTEMPTS", "5"))
+    )
+    # Bounded number of TIER 2's own remaining candidates opportunistically
+    # qualified purely to seed the TIER 3 reserve for a future run.
+    topic_continuity_reserve_seed_attempts: int = field(
+        default_factory=lambda: int(os.environ.get("TOPIC_CONTINUITY_RESERVE_SEED_ATTEMPTS", "2"))
+    )

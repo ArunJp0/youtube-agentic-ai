@@ -545,6 +545,147 @@ def test_autonomous_run_store_raises_on_corrupt_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Content-continuity integration (TopicContinuityOrchestrator wiring) -
+# requirements 9/10 from the multi-tier content-continuity milestone; TIER
+# 1/2/3 selection logic itself is covered by
+# tests/test_topic_continuity_orchestrator.py - this section only covers how
+# AutonomousRunController consumes a continuity outcome.
+# ---------------------------------------------------------------------------
+
+
+class StubContinuityOrchestrator:
+    """Replaces TopicContinuityOrchestrator entirely - returns a pre-built,
+    caller-scripted ContinuityOutcome without touching any real Topic
+    Planner/Research machinery."""
+
+    def __init__(self, outcome) -> None:
+        self.outcome = outcome
+        self.calls = 0
+
+    async def select_researchable_topic(self):
+        self.calls += 1
+        return self.outcome
+
+
+def make_continuity_outcome(
+    status: str = "selected",
+    topic: Optional[str] = "Fallback Topic",
+    topic_source: Optional[str] = "youtube",
+    tier: Optional[str] = "evergreen",
+    error_message: Optional[str] = None,
+):
+    from src.orchestration.topic_continuity_orchestrator import ContinuityOutcome
+
+    return ContinuityOutcome(
+        status=status,
+        topic=topic if status == "selected" else None,
+        topic_source=topic_source if status == "selected" else None,
+        tier=tier if status == "selected" else None,
+        topic_plan_status="selected" if status == "selected" else "no_candidates",
+        error_message=error_message,
+    )
+
+
+def build_controller_with_continuity(topic_continuity, pipeline_runner, tmp_path) -> AutonomousRunController:
+    run_store = AutonomousRunStore(str(tmp_path / "runs"))
+    run_lock = RunLock(str(tmp_path / "run.lock"), timeout_seconds=10800)
+    return AutonomousRunController(
+        topic_planner_agent=StubTopicPlannerAgent(result=make_topic_result()),  # never used when continuity is set
+        pipeline_runner=pipeline_runner,
+        run_store=run_store,
+        run_lock=run_lock,
+        topic_continuity=topic_continuity,
+    )
+
+
+async def test_successful_fallback_topic_continues_pipeline_exactly_once(tmp_path):
+    """Requirement 9: a topic found via TIER 2/TIER 3 fallback must still
+    reach the SAME downstream content pipeline, invoked exactly once."""
+    outcome = make_continuity_outcome(status="selected", topic="Evergreen Winner", tier="evergreen")
+    continuity = StubContinuityOrchestrator(outcome)
+    pipeline = StubPipelineRunner(state=make_completed_state(topic="Evergreen Winner"))
+    controller = build_controller_with_continuity(continuity, pipeline, tmp_path)
+
+    record = await controller.run_once("manual")
+
+    assert continuity.calls == 1
+    assert len(pipeline.calls) == 1
+    assert pipeline.calls[0] == ("Evergreen Winner", "youtube", controller._publishing_intent)
+    assert record.selected_topic == "Evergreen Winner"
+    assert record.topic_continuity_tier == "evergreen"
+    assert record.status == "publishing_disabled"
+
+
+async def test_topic_candidates_exhausted_is_a_safe_terminal_state_without_pipeline_call(tmp_path):
+    """Requirement 8 (controller-level): the explicit exhausted status
+    never invokes the expensive content pipeline."""
+    outcome = make_continuity_outcome(status="topic_candidates_exhausted", error_message="all tiers exhausted")
+    continuity = StubContinuityOrchestrator(outcome)
+    pipeline = StubPipelineRunner(state=make_completed_state())
+    controller = build_controller_with_continuity(continuity, pipeline, tmp_path)
+
+    record = await controller.run_once("manual")
+
+    assert pipeline.calls == []
+    assert record.status == "topic_candidates_exhausted"
+    assert record.error_message == "all tiers exhausted"
+    assert record.selected_topic is None
+
+
+async def test_infrastructure_unavailable_is_a_safe_terminal_state_without_pipeline_call(tmp_path):
+    """Requirement 7 (controller-level): an infrastructure-shaped failure
+    is represented distinctly from topic_candidates_exhausted, and never
+    invokes the pipeline either."""
+    outcome = make_continuity_outcome(status="infrastructure_unavailable", error_message="Gemini outage")
+    continuity = StubContinuityOrchestrator(outcome)
+    pipeline = StubPipelineRunner(state=make_completed_state())
+    controller = build_controller_with_continuity(continuity, pipeline, tmp_path)
+
+    record = await controller.run_once("manual")
+
+    assert pipeline.calls == []
+    assert record.status == "infrastructure_unavailable"
+    assert record.error_message == "Gemini outage"
+
+
+async def test_continuity_disabled_by_default_preserves_original_single_shot_behavior(tmp_path):
+    """When topic_continuity is not configured (the default), behavior is
+    byte-for-byte the original single plan_topic() call - continuity is
+    fully opt-in."""
+    planner = StubTopicPlannerAgent(result=make_topic_result("Original Behavior Topic"))
+    pipeline = StubPipelineRunner(state=make_completed_state(topic="Original Behavior Topic"))
+    controller = build_controller(planner, pipeline, tmp_path)
+
+    record = await controller.run_once("manual")
+
+    assert planner.calls == 1
+    assert record.selected_topic == "Original Behavior Topic"
+    assert record.topic_continuity_tier is None
+
+
+async def test_publishing_idempotency_preserved_with_continuity_enabled(tmp_path):
+    """Requirement 10: the existing scheduled-occurrence idempotency
+    guarantee (never re-run/re-publish the same scheduled occurrence) is
+    unaffected by content-continuity being enabled - the continuity search
+    and the pipeline are each invoked exactly once for a given occurrence,
+    even if the exact same occurrence is retried/replayed."""
+    outcome = make_continuity_outcome(status="selected", topic="Idempotent Fallback Topic", tier="primary")
+    continuity = StubContinuityOrchestrator(outcome)
+    pipeline = StubPipelineRunner(state=make_published_state(topic="Idempotent Fallback Topic", video_id="vid-idem"))
+    controller = build_controller_with_continuity(continuity, pipeline, tmp_path)
+    controller._publishing_intent = PublishingIntent(mode="private")
+
+    scheduled_time = "2026-02-01T00:00:00+00:00"
+    first = await controller.run_once("scheduled", scheduled_time=scheduled_time)
+    second = await controller.run_once("scheduled", scheduled_time=scheduled_time)
+
+    assert first.status == "published_private"
+    assert second.run_id == first.run_id
+    assert continuity.calls == 1  # not re-invoked for the already-completed occurrence
+    assert len(pipeline.calls) == 1  # never re-published
+
+
 async def test_existing_topic_planner_and_pipeline_signatures_unchanged():
     """Guards against an accidental signature change to the exact seams
     AutonomousRunController depends on."""

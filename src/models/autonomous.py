@@ -31,6 +31,15 @@ AutonomousRunStatus = Literal[
     "completed",
     "skipped_locked",
     "planned_only",
+    # Added for the multi-tier content-continuity strategy (see
+    # src.orchestration.topic_continuity_orchestrator) - "topic_candidates_
+    # exhausted" is reached ONLY when every configured tier (primary
+    # candidates, evergreen fallback, qualified reserve) is genuinely
+    # exhausted; "infrastructure_unavailable" is reached when a systemic
+    # Gemini/search/network/auth/provider failure stopped the search
+    # early, distinct from genuine topic/content insufficiency.
+    "topic_candidates_exhausted",
+    "infrastructure_unavailable",
 ]
 
 TriggerSource = Literal["scheduled", "manual", "dry_run"]
@@ -61,6 +70,11 @@ class AutonomousRunRecord(BaseModel):
     # Topic Planner reference - never a duplicate of the full TopicSelectionResult.
     topic_plan_status: Optional[str] = Field(default=None, description="The underlying TopicSelectionResult.status")
     selected_topic: Optional[str] = Field(default=None)
+    topic_continuity_tier: Optional[str] = Field(
+        default=None,
+        description="Which content-continuity tier the selected topic came from ('primary'/'evergreen'/"
+        "'reserve'), when TopicContinuityOrchestrator was used - None when continuity wasn't configured or no topic was found",
+    )
 
     # Content pipeline reference.
     pipeline_run_id: Optional[str] = Field(default=None, description="The content run's own run_id, e.g. from provenance")

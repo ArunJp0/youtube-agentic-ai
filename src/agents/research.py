@@ -23,6 +23,17 @@ from src.llm.provider import LLMProvider
 # research()'s explicit-failure branch).
 DEFAULT_MIN_CONTEXT_WORDS = 40
 
+# Bounded widening for the ONE existing corroboration retry (never a second
+# retry tier, never a threshold change) - the retry requests MORE candidates
+# than the initial search so a genuinely relevant but thin first result
+# (e.g. a single title-only RSS headline) has a real chance of surfacing
+# substantive corroborating coverage of the same event/topic. Purely a
+# search-breadth increase: every retrieved result - initial or retry -
+# still goes through the identical DIRECT/SUPPORTING/UNRELATED contract and
+# the identical DEFAULT_MIN_CONTEXT_WORDS substance gate; nothing about what
+# counts as acceptable evidence changes.
+DEFAULT_RETRY_RESULT_MULTIPLIER = 3
+
 # Shared instruction fragment for every synthesis prompt (summary/key
 # points/facts) - reused rather than duplicated, so "how supporting
 # material must be weighted" is defined in exactly one place. Only takes
@@ -47,6 +58,25 @@ def _has_sufficient_substance(results: List[Dict[str, Any]], min_words: int) -> 
 class ResearchAgentError(Exception):
     """Custom exception for Research Agent errors."""
     pass
+
+
+class ResearchInfrastructureError(ResearchAgentError):
+    """Raised instead of the plain ``ResearchAgentError`` when a research
+    failure is infrastructure-shaped (every configured search provider
+    raised outright, or the LLM synthesis step itself failed) rather than
+    genuine content insufficiency (a provider responded but the topic
+    simply didn't have enough DIRECT material).
+
+    Still an ``is-a ResearchAgentError`` - every existing ``except
+    ResearchAgentError`` call site (e.g. research_node) keeps catching this
+    identically, with zero behavior change. The distinction exists purely
+    for callers like the multi-tier topic-continuity orchestrator that must
+    NOT treat a systemic Gemini/network/auth/provider outage as "this one
+    topic has no research" and burn through unrelated topic candidates for
+    a problem that would affect any of them equally - a caller catching
+    this specifically should apply its own existing bounded infrastructure
+    retry/backoff policy instead of trying another topic.
+    """
 
 
 @dataclass
@@ -107,6 +137,7 @@ class ResearchAgent:
         current_news_search_provider: Optional[SearchProvider] = None,
         min_context_words: int = DEFAULT_MIN_CONTEXT_WORDS,
         relevance_filter: Optional[ResearchRelevanceFilter] = None,
+        retry_result_multiplier: int = DEFAULT_RETRY_RESULT_MULTIPLIER,
     ) -> None:
         """Initialize the Research Agent.
 
@@ -136,6 +167,11 @@ class ResearchAgent:
                 Wikipedia alike; no provider is exempt. Defaults to a
                 filter built from the same ``llm_provider`` above (no
                 second LLM dependency to wire through callers).
+            retry_result_multiplier: How many more candidates than
+                ``max_sources`` the ONE bounded corroboration retry (see
+                ``_search_and_validate``) requests from the same provider -
+                a search-breadth widening only, never an acceptance-
+                criteria change (see ``DEFAULT_RETRY_RESULT_MULTIPLIER``).
         """
         self.search_provider = search_provider
         self.llm_provider = llm_provider
@@ -144,6 +180,8 @@ class ResearchAgent:
         self.current_news_search_provider = current_news_search_provider
         self.min_context_words = min_context_words
         self.relevance_filter = relevance_filter or ResearchRelevanceFilter(llm_provider)
+        self.retry_result_multiplier = retry_result_multiplier
+        self.retry_max_sources = max(max_sources, max_sources * retry_result_multiplier)
 
     async def research(self, topic: str, topic_source: Optional[str] = None) -> ResearchResult:
         """Execute full research workflow for a topic.
@@ -189,6 +227,7 @@ class ResearchAgent:
         used_provider_label: Optional[str] = None
         providers_tried: List[str] = []
         last_error: Optional[str] = None
+        providers_raised_count = 0
 
         for provider in providers:
             label = getattr(provider, "name", type(provider).__name__)
@@ -197,9 +236,11 @@ class ResearchAgent:
                 outcome = await self._search_and_validate(provider, topic)
             except asyncio.TimeoutError:
                 last_error = f"{label} search timed out after {self.timeout_seconds}s"
+                providers_raised_count += 1
                 continue
             except Exception as e:
                 last_error = f"{label} search failed: {e}"
+                providers_raised_count += 1
                 continue
 
             if not accepted_direct and not accepted_supporting and outcome.accepted:
@@ -233,7 +274,7 @@ class ResearchAgent:
             assessment = assess_substance(accepted_direct, self.min_context_words)
             tried = ", ".join(providers_tried) or "none"
             error_detail = f" Last error: {last_error}." if last_error else ""
-            raise ResearchAgentError(
+            message = (
                 f"Insufficient DIRECT research material for '{topic}' after trying {tried} "
                 f"({assessment.distinct_word_count} distinct DIRECT context words across "
                 f"{assessment.distinct_source_count} distinct DIRECT source(s) - "
@@ -242,6 +283,15 @@ class ResearchAgent:
                 f"available but supporting material alone can never satisfy sufficiency - below the "
                 f"{self.min_context_words}-word minimum).{error_detail}"
             )
+            if providers and providers_raised_count == len(providers):
+                # EVERY configured provider raised outright (timeout/
+                # exception) - none of them ever got a chance to return
+                # real content for us to evaluate. The same outage would
+                # affect any other topic equally, so this is an
+                # infrastructure-shaped failure, not genuine content
+                # insufficiency (see ResearchInfrastructureError).
+                raise ResearchInfrastructureError(message)
+            raise ResearchAgentError(message)
 
         # Step 2: Extract sources/snippets from the FINAL accepted set
         # ONLY (DIRECT + SUPPORTING) - never from rejected/raw/retry
@@ -282,7 +332,13 @@ class ResearchAgent:
             facts = await self._extract_facts(topic, combined_context)
             research_notes = await self._generate_notes(topic, combined_context)
         except Exception as e:
-            raise ResearchAgentError(f"LLM processing failed: {e}")
+            # Gemini's own provider already exhausts its documented
+            # retry/backoff + fallback-model policy before an exception
+            # ever reaches here - this is a genuine infrastructure-level
+            # LLM failure (never fixable by trying a different topic; the
+            # same outage would break synthesis for any topic equally),
+            # not content insufficiency (see ResearchInfrastructureError).
+            raise ResearchInfrastructureError(f"LLM processing failed: {e}")
 
         # A "key point" that is actually the LLM declining to answer (e.g.
         # "the source material only contains a headline...") is never a
@@ -328,13 +384,24 @@ class ResearchAgent:
 
           1. classify + validate (relevance/DIRECT-SUPPORTING/near-
              duplicate collapse - see _classify_and_dedupe),
-          2. if the DIRECT content alone still isn't substantive enough,
-             one bounded retry against a generically simplified query is
-             attempted, its results are classified/validated too, and
-             merged in (deduplicated by URL AND by content),
+          2. if the DIRECT content alone still isn't substantive enough
+             (e.g. a single title-only headline), ONE bounded corroboration
+             retry is attempted - against a generically simplified query
+             when the topic is long enough to simplify, or the topic itself
+             otherwise (a short/already-terse topic must still get a real
+             retry chance, not be skipped entirely) - requesting MORE
+             candidates than the initial search (see
+             ``retry_max_sources``/``DEFAULT_RETRY_RESULT_MULTIPLIER``) so
+             a genuinely thin first result has a real chance at finding
+             substantive corroborating coverage of the same event/topic.
+             Its results are classified/validated too (identical contract,
+             never a lowered bar), and merged in (deduplicated by URL AND
+             by content),
           3. still-insufficient DIRECT substance is returned as-is (the
              caller falls through to the next provider, or ultimately
-             raises ResearchAgentError - it is never treated as success).
+             raises ResearchAgentError - it is never treated as success;
+             a thin headline is never itself accepted as sufficient
+             evidence just because a retry was attempted).
         """
         results = await asyncio.wait_for(
             provider.search(topic, self.max_sources), timeout=self.timeout_seconds
@@ -344,15 +411,18 @@ class ResearchAgent:
             return outcome
 
         simplified_query = simplify_query(topic)
-        if not simplified_query or simplified_query.strip().lower() == topic.strip().lower():
-            return outcome
+        retry_query = (
+            simplified_query
+            if simplified_query and simplified_query.strip().lower() != topic.strip().lower()
+            else topic
+        )
 
         try:
             retry_results = await asyncio.wait_for(
-                provider.search(simplified_query, self.max_sources), timeout=self.timeout_seconds
+                provider.search(retry_query, self.retry_max_sources), timeout=self.timeout_seconds
             )
         except Exception:
-            # The bounded simplified-query retry itself failed (timeout/
+            # The bounded corroboration retry itself failed (timeout/
             # provider error) - keep whatever the first attempt already
             # produced rather than discarding it.
             return outcome
