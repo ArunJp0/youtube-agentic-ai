@@ -370,11 +370,22 @@ class VisualMediaService:
         broaden_query: bool = False,
     ) -> Tuple[MediaAsset, str]:
         """Public entry point for a QC-driven replacement: acquire a new
-        asset for one already-filled slot using the exact same selection/
-        reuse-fallback rules as normal slot filling (see
-        ``_acquire_slot_asset``), but additionally never select or reuse
-        any id in ``exclude_ids`` (e.g. an asset Visual QC has already
-        rejected for this slot).
+        asset for one already-filled slot using the exact same search-and-
+        select rules as normal slot filling (see ``_acquire_slot_asset``),
+        but additionally never select or reuse any id in ``exclude_ids``
+        (e.g. an asset Visual QC has already rejected for this slot).
+
+        Unlike normal initial slot filling, a QC-driven replacement never
+        falls back to reusing an arbitrary already-downloaded asset from
+        elsewhere in the video (``allow_reuse_fallback=False``): reusing a
+        clip selected for a DIFFERENT slot/section is not a genuine
+        semantic replacement for a rejected one - it is very likely to be
+        evaluated as unsuitable again, silently burning a bounded
+        replacement attempt for no real chance of success. A replacement
+        attempt therefore either finds a genuinely new, plan-approved
+        candidate or reports failure (``asset.success is False``) cleanly,
+        letting the caller (VisualQCService) decide to drop the slot and
+        recompute section coverage instead.
 
         Mutates ``downloaded_by_id``/``used_ids_in_order`` in place, the
         same way the normal generation loop does, so global duplicate
@@ -404,6 +415,7 @@ class VisualMediaService:
             used_ids_in_order,
             exclude_ids=exclude_ids,
             broaden_query=broaden_query,
+            allow_reuse_fallback=False,
         )
 
     # ---- AI-generated-video integration seam ---------------------------------
@@ -502,6 +514,7 @@ class VisualMediaService:
         used_ids_in_order: List[str],
         exclude_ids: Optional[Set[str]] = None,
         broaden_query: bool = False,
+        allow_reuse_fallback: bool = True,
     ) -> Tuple[MediaAsset, str]:
         """Fill one visual slot from a section's visual plan.
 
@@ -519,15 +532,25 @@ class VisualMediaService:
                specific query.
             2. A never-used, plan-approved candidate for a neutral/broader
                query.
-            3. An already-downloaded asset not used in the last
-               RECENT_REUSE_LOOKBACK slots (no re-download - reuses the
-               existing local file).
-            4. Any already-downloaded asset, even the most recent one
-               (immediate repetition - absolute last resort).
+            3. (``allow_reuse_fallback=True`` only) An already-downloaded
+               asset not used in the last RECENT_REUSE_LOOKBACK slots (no
+               re-download - reuses the existing local file).
+            4. (``allow_reuse_fallback=True`` only) Any already-downloaded
+               asset not in ``exclude_ids``, even one used recently
+               (immediate repetition - absolute last resort). An asset in
+               ``exclude_ids`` is never returned here, regardless.
 
         With ``broaden_query=True``, step 1 (the specific query) is skipped
         entirely - see ``acquire_replacement_asset``'s docstring for why a
         later QC-driven replacement attempt deliberately escalates past it.
+
+        With ``allow_reuse_fallback=False`` (used by
+        ``acquire_replacement_asset`` - a QC-driven replacement should
+        never "succeed" by silently reusing an unrelated already-downloaded
+        clip, which stands a real chance of being judged unsuitable again),
+        steps 3-4 are skipped entirely: the call reports failure
+        (``asset.success is False``) instead if no genuinely new,
+        plan-approved candidate is found anywhere in the query chain.
 
         Returns:
             (asset, query_used_to_find_it)
@@ -582,24 +605,29 @@ class VisualMediaService:
                 )
 
         # No never-used, plan-approved candidate found anywhere in the
-        # chain - fall back to reusing an already-downloaded asset rather
-        # than failing the slot.
+        # chain. For NORMAL initial slot filling (allow_reuse_fallback=
+        # True), fall back to reusing an already-downloaded asset rather
+        # than failing the slot. For a QC-driven replacement
+        # (allow_reuse_fallback=False), reusing an unrelated clip is not a
+        # genuine replacement - report failure instead (see this method's
+        # own docstring) so the caller can drop the slot and recompute
+        # section coverage rather than silently keeping a doomed retry.
         fallback_query = query_chain[-1] if query_chain else ""
 
-        for asset_id, asset in downloaded_by_id.items():
-            if asset_id not in recent_ids:
-                return self._reuse_asset(asset, fallback_query, section_index), fallback_query
+        if allow_reuse_fallback:
+            for asset_id, asset in downloaded_by_id.items():
+                if asset_id not in recent_ids:
+                    return self._reuse_asset(asset, fallback_query, section_index), fallback_query
 
-        # Still nothing recent-and-not-excluded: prefer anything not
-        # explicitly excluded (e.g. a QC-rejected id) over an excluded one,
-        # even if it was used recently.
-        for asset_id, asset in downloaded_by_id.items():
-            if asset_id not in exclude:
-                return self._reuse_asset(asset, fallback_query, section_index), fallback_query
-
-        if downloaded_by_id:
-            any_asset = next(iter(downloaded_by_id.values()))
-            return self._reuse_asset(any_asset, fallback_query, section_index), fallback_query
+            # Still nothing recent-and-not-excluded: prefer anything not
+            # explicitly excluded (e.g. a QC-rejected id) over an excluded
+            # one, even if it was used recently - but NEVER an explicitly
+            # excluded id, even as an absolute last resort (an excluded id
+            # is specifically an asset the caller has already ruled out,
+            # e.g. one Visual QC just rejected).
+            for asset_id, asset in downloaded_by_id.items():
+                if asset_id not in exclude:
+                    return self._reuse_asset(asset, fallback_query, section_index), fallback_query
 
         if not searched_any:
             last_error = last_error or "No search queries available"

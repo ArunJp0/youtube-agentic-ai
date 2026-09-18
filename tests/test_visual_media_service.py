@@ -621,7 +621,14 @@ class TestAcquireReplacementAsset:
         assert downloaded_by_id[asset.provider_asset_id].provider_asset_id == asset.provider_asset_id
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_excluded_reuse_only_when_nothing_else_available(self, tmp_path) -> None:
+    async def test_reports_failure_rather_than_reusing_an_excluded_asset(self, tmp_path) -> None:
+        """A QC-driven replacement never falls back to reuse at all (see
+        acquire_replacement_asset's docstring) - when the only candidate
+        that exists is the one just excluded (e.g. an asset Visual QC just
+        rejected), the call must report failure so VisualQCService can
+        drop the slot and recompute section coverage, never silently hand
+        back the excluded/rejected asset as if it were a genuine
+        replacement."""
         section = _section(
             "How Electric Motors Work",
             "Electric vehicles use battery packs and electric motors to generate torque today.",
@@ -638,13 +645,13 @@ class TestAcquireReplacementAsset:
             section_plan, 0, 0, downloaded_by_id, used_ids_in_order, set()
         )
         # Only one distinct asset ever exists (pool_size=1) - excluding it
-        # leaves nothing else, so it must still be returned as a last resort.
+        # leaves nothing else, so the call must fail cleanly rather than
+        # reuse the excluded asset.
         result_asset, _ = await service.acquire_replacement_asset(
             section_plan, 0, 0, downloaded_by_id, used_ids_in_order, {first_asset.provider_asset_id}
         )
 
-        assert result_asset.provider_asset_id == first_asset.provider_asset_id
-        assert result_asset.reused is True
+        assert result_asset.success is False
 
 
 class TestBroadenQueryReplacement:
@@ -694,7 +701,8 @@ class TestBroadenQueryReplacement:
     async def test_broaden_query_still_avoids_excluded_ids(self, tmp_path) -> None:
         """Broadening the query tier never weakens exclusion - a
         previously-rejected id stays excluded regardless of which tier
-        finds the replacement."""
+        finds the replacement, and a QC-driven replacement reports failure
+        rather than falling back to reusing it."""
         section_plan = SectionVisualPlan(
             section_index=0,
             search_queries=["specific narrow query"],
@@ -715,9 +723,9 @@ class TestBroadenQueryReplacement:
         )
 
         # Only one distinct asset exists in the pool either way - excluded
-        # correctly falls back to reuse rather than silently ignoring the
+        # correctly reports failure rather than silently ignoring the
         # exclusion just because the query tier changed.
-        assert result_asset.reused is True
+        assert result_asset.success is False
 
 
 class TestRemediationScopedVisualReuse:

@@ -17,8 +17,13 @@ from src.services.thumbnail_validation import ThumbnailValidationError, validate
 
 # The only visual providers this architecture currently knows how to reason
 # about the licensing of - anything else is unidentifiable provenance, not
-# assumed safe.
-KNOWN_VISUAL_PROVIDERS = {"pexels", "mock"}
+# assumed safe. "neutral_fallback" (see src.tools.neutral_visual_generator)
+# is a locally, procedurally generated background/title-card clip with no
+# external content at all - it carries no licensing/attribution concern by
+# construction, so recognizing it here is an accurate provenance judgment,
+# not a weakened one (contrast with "pexels" below, which still requires a
+# real source_url even though the provider itself is known).
+KNOWN_VISUAL_PROVIDERS = {"pexels", "mock", "neutral_fallback"}
 
 
 def check_final_video(video_path: Optional[str]) -> ProvenanceCheckResult:

@@ -43,6 +43,7 @@ from src.services.video_assembly_service import DEFAULT_VIDEO_OUTPUT_DIR
 from src.services.visual_media_service import DEFAULT_MEDIA_OUTPUT_DIR
 from src.services.voice_service import DEFAULT_OUTPUT_DIR
 from src.tools.ffmpeg_video_assembler import FFmpegVideoAssembler, VideoAssemblerError
+from src.tools.neutral_visual_generator import FFmpegNeutralVisualGenerator
 from src.tools.music_catalog_provider import LocalMusicCatalogProvider
 from src.workflows.pipeline_graph import PipelineState, build_pipeline_graph
 
@@ -99,6 +100,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         Final PipelineState (see PipelineState.status/.error for outcome)
     """
     assembler = FFmpegVideoAssembler()
+    neutral_visual_generator = FFmpegNeutralVisualGenerator()
 
     settings = Settings()
     llm_provider = get_llm_provider(settings)
@@ -154,6 +156,7 @@ async def run_pipeline_demo(topic: str) -> PipelineState:
         ai_video_provider=ai_video_provider,
         ai_video_max_retries=settings.ai_video_max_retries,
         stock_fallback_enabled=settings.stock_fallback_enabled,
+        neutral_visual_generator=neutral_visual_generator,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 

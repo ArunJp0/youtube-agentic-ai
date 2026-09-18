@@ -37,6 +37,7 @@ from src.tools.ai_video_provider import MockAIVideoProvider
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
 from src.tools.media_provider import MediaProvider, MockMediaProvider
 from src.tools.music_catalog_provider import MockMusicCatalogProvider, MusicCatalogProvider
+from src.tools.neutral_visual_generator import NeutralVisualGenerator
 from src.tools.search_provider import MockSearchProvider, SearchProvider
 from src.tools.transcription_provider import MockTranscriptionProvider, TranscriptionProviderError
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator, VisualRelevanceEvaluator
@@ -587,6 +588,39 @@ class FirstAttemptWeakEvaluator(VisualRelevanceEvaluator):
         return [RawAssetVerdict(asset_id=a.asset_id, relevance_score=score, reason=reason) for a in context.assets]
 
 
+class AlwaysMisleadingFirstSectionEvaluator(VisualRelevanceEvaluator):
+    """Test double: section 0's asset is always misleading (including any
+    replacement re-check); every other section is always highly relevant.
+    Lets pipeline tests deterministically exercise "one section needed
+    drop+neutral-fallback recovery, but the pipeline still completed"."""
+
+    @property
+    def name(self) -> str:
+        return "always-misleading-first-section"
+
+    async def evaluate_section(self, context):
+        if context.section_index == 0:
+            return [
+                RawAssetVerdict(asset_id=a.asset_id, relevance_score=0.9, misleading_or_conflicting=True, reason="always misleading")
+                for a in context.assets
+            ]
+        return [RawAssetVerdict(asset_id=a.asset_id, relevance_score=0.9, reason="fine") for a in context.assets]
+
+
+class FakeNeutralVisualGenerator(NeutralVisualGenerator):
+    """Writes a tiny placeholder file instead of running real FFmpeg -
+    lets pipeline tests exercise Visual QC's drop+neutral-fallback
+    recovery path without any real video-generation dependency."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def generate(self, output_path, duration_seconds, width, height, fps, label=None) -> None:
+        self.calls.append({"output_path": output_path, "label": label})
+        with open(output_path, "wb") as f:
+            f.write(b"NEUTRAL")
+
+
 def _music_catalog_provider(tmp_path, track_id: str = "calm-test-track", write_file: bool = True) -> MockMusicCatalogProvider:
     """One approved, instrumental, neutral-tagged test track - passes the
     deterministic fallback MusicPlan's avoid_styles filter by construction
@@ -687,6 +721,7 @@ class TestPipelineWorkflow:
             overrides.get("provenance_output_dir", provenance_dir),
             overrides.get("compliance_output_dir", compliance_dir),
             overrides.get("max_remediation_attempts", 2),
+            neutral_visual_generator=overrides.get("neutral_visual_generator"),
         )
 
     @pytest.mark.asyncio
@@ -846,6 +881,35 @@ class TestPipelineWorkflow:
         assembled_paths = {c["input_path"] for c in assembler.build_calls}
         assert assembled_paths.isdisjoint(original_paths)
 
+    @pytest.mark.asyncio
+    async def test_qc_drop_and_neutral_fallback_recovery_still_reaches_completion(self, providers) -> None:
+        """12/14. A section whose only asset is misleading with no
+        successful replacement is dropped and recovered with a locally-
+        generated neutral fallback visual - Video Assembly (and every
+        stage after it, including Compliance) must still be reached
+        normally; existing compliance/publishing gates are unaffected by
+        this recovery path."""
+        neutral_generator = FakeNeutralVisualGenerator()
+        state = await self._run(
+            providers,
+            visual_relevance_evaluator=AlwaysMisleadingFirstSectionEvaluator(),
+            neutral_visual_generator=neutral_generator,
+        )
+
+        assert len(neutral_generator.calls) == 1
+        assert state.visual_qc_result.disposition == "recovered"
+        assert state.visual_qc_result.neutral_fallback_count == 1
+        assert state.visual_qc_result.critical_section_indices == []
+        # Downstream stages all ran normally - a single recovered section
+        # never blocks the rest of the pipeline.
+        assert state.video_assembly_result is not None
+        assert state.video_assembly_result.success is True
+        assert state.caption_result is not None
+        assert state.audio_mix_result is not None
+        assert state.compliance_result is not None
+        assert state.compliance_result.success is True
+        assert state.status == "completed"
+
     # ---- E. Visual QC not called on earlier-stage failure ------------------
 
     @pytest.mark.asyncio
@@ -956,17 +1020,26 @@ class TestPipelineWorkflow:
 
     @pytest.mark.asyncio
     async def test_video_assembly_not_called_after_hard_qc_failure(self, providers) -> None:
-        """An asset still flagged misleading after bounded replacement is
-        exhausted must stop the pipeline before Video Assembly - never
-        reaching the final video (or captions, or BGM)."""
+        """EVERY asset in EVERY section still flagged misleading after
+        bounded replacement AND drop is a genuinely CRITICAL, unrepresentable
+        video (no neutral_visual_generator is configured for this test, so
+        there is no recovery strategy left) - this must stop the pipeline
+        before Video Assembly - never reaching the final video (or
+        captions, or BGM). A single misleading asset alone would NOT do
+        this (see TestVisualQCRecoveryIntegration below) - only a section
+        with zero safe usable coverage does."""
         _, _, _, _, assembler, _, transcription_provider, _, _, _, _, _ = providers
         state = await self._run(providers, visual_relevance_evaluator=AlwaysMisleadingEvaluator())
 
         assert state.status == "failed"
-        assert "rejected" in state.error.lower()
+        assert "no safe usable visual coverage" in state.error.lower()
+        assert state.visual_qc_result.disposition == "critical"
         assert state.video_assembly_result is None
         assert state.caption_result is None
         assert state.audio_mix_result is None
+        # 13. A genuinely CRITICAL QC failure must still prevent every
+        # downstream gate, including Compliance and Publishing.
+        assert state.compliance_result is None
         assert state.metadata_result is None
         assert assembler.build_calls == []
         assert assembler.assemble_calls == []

@@ -34,6 +34,7 @@ from src.services.run_lock import DEFAULT_LOCK_PATH, RunLock
 from src.services.script_duration import calculate_word_budget, resolve_target_duration_minutes
 from src.services.topic_reserve_store import QualifiedTopicReserveStore
 from src.tools.ffmpeg_video_assembler import FFmpegVideoAssembler
+from src.tools.neutral_visual_generator import FFmpegNeutralVisualGenerator
 from src.tools.music_catalog_provider import LocalMusicCatalogProvider
 from src.tools.youtube_client import GoogleYouTubeClient, YouTubeClient
 from src.workflows.pipeline_graph import PipelineState, run_pipeline
@@ -160,6 +161,12 @@ def build_pipeline_runner(settings: Settings) -> PipelineRunner:
     at all.
     """
     assembler = FFmpegVideoAssembler()
+    # Reuses the same real ffmpeg binary the assembler above already
+    # requires - a locally-generated neutral background clip, never an
+    # external service, used only as Visual QC's absolute last-resort
+    # recovery when a section would otherwise have zero safe usable
+    # visual coverage (see src.tools.neutral_visual_generator).
+    neutral_visual_generator = FFmpegNeutralVisualGenerator()
     search_provider = get_search_provider(settings)
     llm_provider = get_llm_provider(settings)
     voice_provider = get_voice_provider(settings)
@@ -196,6 +203,7 @@ def build_pipeline_runner(settings: Settings) -> PipelineRunner:
             stock_fallback_enabled=settings.stock_fallback_enabled,
             topic_source=topic_source,
             current_news_search_provider=current_news_search_provider,
+            neutral_visual_generator=neutral_visual_generator,
         )
 
     return _run

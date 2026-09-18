@@ -71,6 +71,7 @@ from src.services.voice_service import DEFAULT_OUTPUT_DIR, VoiceService, VoiceSe
 from src.tools.ffmpeg_video_assembler import VideoAssembler
 from src.tools.media_provider import MediaProvider
 from src.tools.music_catalog_provider import MusicCatalogProvider
+from src.tools.neutral_visual_generator import NeutralVisualGenerator
 from src.tools.search_provider import SearchProvider
 from src.tools.transcription_provider import TranscriptionProvider
 from src.tools.visual_relevance_evaluator import VisualRelevanceEvaluator
@@ -206,6 +207,7 @@ def build_pipeline_graph(
     stock_fallback_enabled: bool = True,
     topic_source: Optional[str] = None,
     current_news_search_provider: Optional[SearchProvider] = None,
+    neutral_visual_generator: Optional[NeutralVisualGenerator] = None,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
@@ -347,6 +349,14 @@ def build_pipeline_graph(
             event it cannot reasonably contain yet. ``None`` (default)
             means current-news topics fall back to the same single
             ``search_provider`` as before.
+        neutral_visual_generator: Optional NeutralVisualGenerator (see
+            ``src.tools.neutral_visual_generator``) Visual QC uses as its
+            absolute last-resort recovery strategy when a section would
+            otherwise end up with zero safe usable visual coverage after
+            every replace/drop attempt - a locally-generated neutral
+            background clip, never an external service or claim-specific
+            stock footage. ``None`` (default) means such a section is
+            reported CRITICAL instead of being recovered.
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -378,7 +388,10 @@ def build_pipeline_graph(
     # logic (see visual_qc_node) - VisualQCService never re-implements
     # candidate search itself.
     visual_qc_service = VisualQCService(
-        evaluator=visual_relevance_evaluator, assembler=assembler, visual_media_service=visual_service
+        evaluator=visual_relevance_evaluator,
+        assembler=assembler,
+        visual_media_service=visual_service,
+        neutral_visual_generator=neutral_visual_generator,
     )
     video_service = VideoAssemblyService(assembler=assembler, output_dir=video_output_dir)
     # Shares the same VideoAssembler as Visual QC/Video Assembly (subtitle
@@ -565,19 +578,25 @@ def build_pipeline_graph(
                 "error": f"Visual QC failed: {qc_result.error}",
             }
 
-        if qc_result.rejected_count > 0:
-            # At least one asset is still flagged misleading/conflicting
-            # after bounded replacement was exhausted - required media
-            # could not be safely approved or replaced. Stop before Video
-            # Assembly rather than risk a misleading clip reaching the
-            # final video; earlier-stage results are preserved below.
+        if qc_result.disposition == "critical":
+            # At least one SECTION has zero safe usable visual coverage
+            # even after bounded replacement, dropping the unresolved
+            # asset, and attempting a neutral fallback visual - genuinely
+            # impossible to represent that section safely. This is
+            # deliberately NOT triggered by an individual replaceable
+            # asset alone (see VisualQCService/src.models.visual_qc's
+            # PASS/REPLACEABLE/CRITICAL policy) - a single bad stock clip
+            # is recovered (replaced, dropped, or neutral-fallback-covered)
+            # without ever reaching here. Stop before Video Assembly rather
+            # than risk an unrepresentable/misleading video; earlier-stage
+            # results are preserved below.
             return {
                 "visual_qc_result": qc_result,
                 "qc_approved_visual_result": qc_visual_result,
                 "status": "failed",
                 "error": (
-                    f"Visual QC rejected {qc_result.rejected_count} asset(s) as misleading "
-                    "with no safe replacement available"
+                    f"Visual QC found section(s) {qc_result.critical_section_indices} with no safe usable "
+                    "visual coverage after replacement, drop, and neutral-fallback recovery were all exhausted"
                 ),
             }
 
@@ -1271,6 +1290,7 @@ async def run_pipeline(
     stock_fallback_enabled: bool = True,
     topic_source: Optional[str] = None,
     current_news_search_provider: Optional[SearchProvider] = None,
+    neutral_visual_generator: Optional[NeutralVisualGenerator] = None,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
@@ -1407,6 +1427,7 @@ async def run_pipeline(
         stock_fallback_enabled,
         topic_source,
         current_news_search_provider,
+        neutral_visual_generator,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 

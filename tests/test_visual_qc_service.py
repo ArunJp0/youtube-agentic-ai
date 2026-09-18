@@ -19,6 +19,7 @@ from src.services.visual_qc_service import (
     VisualQCServiceError,
 )
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
+from src.tools.neutral_visual_generator import NeutralVisualGenerator, NeutralVisualGeneratorError
 from src.tools.visual_relevance_evaluator import MockVisualRelevanceEvaluator
 
 
@@ -542,6 +543,385 @@ class TestRepetitionWarnings:
         qc_result, _ = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
 
         assert qc_result.repetition_warnings == []
+
+
+# ---------------------------------------------------------------------------
+# PASS / REPLACEABLE / CRITICAL recovery policy (production-robustness
+# milestone): an individual weak/misleading asset is never, by itself, a
+# whole-video failure - see src.models.visual_qc's module docstring.
+# ---------------------------------------------------------------------------
+
+
+class FakeNeutralVisualGenerator(NeutralVisualGenerator):
+    """Records every generate() call and writes a tiny placeholder file
+    instead of running real FFmpeg; can be configured to fail."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[dict] = []
+
+    def generate(self, output_path, duration_seconds, width, height, fps, label=None) -> None:
+        self.calls.append(
+            {"output_path": output_path, "duration_seconds": duration_seconds, "width": width, "height": height,
+             "fps": fps, "label": label}
+        )
+        if self.fail:
+            raise NeutralVisualGeneratorError("simulated generation failure")
+        with open(output_path, "wb") as f:
+            f.write(b"NEUTRAL")
+
+
+class TestReplaceableAssetRecovery:
+    @pytest.mark.asyncio
+    async def test_rejected_asset_first_replacement_succeeds(self, tmp_path) -> None:
+        """1. A rejected asset's FIRST replacement attempt succeeding
+        resolves the slot immediately - no drop, no further attempts."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        original = _asset(tmp_path, "bad0", 0)
+        replacement = _asset(tmp_path, "good0", 0)
+        visual_result = _visual_result([_mapping(0, [original])])
+        evaluator = MockVisualRelevanceEvaluator(
+            verdicts_by_asset_id={
+                "bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1),
+                "good0": RawAssetVerdict(asset_id="good0", relevance_score=0.95),
+            }
+        )
+        replacement_provider = FakeReplacementProvider({(0, 0): [replacement]})
+        service = VisualQCService(evaluator=evaluator, assembler=FakeAssembler(), visual_media_service=replacement_provider)
+
+        qc_result, updated = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        result = qc_result.sections[0].assets[0]
+        assert result.asset_id == "good0"
+        assert result.disposition == "pass"
+        assert result.dropped is False
+        assert qc_result.sections[0].disposition == "pass"
+        assert qc_result.disposition == "pass"
+        assert updated.sections[0].assets[0].success is True
+
+    @pytest.mark.asyncio
+    async def test_rejected_asset_later_bounded_replacement_succeeds(self, tmp_path) -> None:
+        """2. The FIRST replacement is also bad, but the SECOND (still
+        within the bound) succeeds - resolved, not dropped."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        original = _asset(tmp_path, "bad0", 0)
+        first_retry = _asset(tmp_path, "bad1", 0)
+        second_retry = _asset(tmp_path, "good0", 0)
+        visual_result = _visual_result([_mapping(0, [original])])
+        evaluator = MockVisualRelevanceEvaluator(
+            verdicts_by_asset_id={
+                "bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1),
+                "bad1": RawAssetVerdict(asset_id="bad1", relevance_score=0.1),
+                "good0": RawAssetVerdict(asset_id="good0", relevance_score=0.95),
+            }
+        )
+        replacement_provider = FakeReplacementProvider({(0, 0): [first_retry, second_retry]})
+        service = VisualQCService(
+            evaluator=evaluator, assembler=FakeAssembler(), visual_media_service=replacement_provider,
+            max_replacement_attempts=2,
+        )
+
+        qc_result, updated = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        result = qc_result.sections[0].assets[0]
+        assert result.asset_id == "good0"
+        assert result.replacement_attempts == 2
+        assert result.dropped is False
+        assert qc_result.sections[0].disposition == "pass"
+
+    @pytest.mark.asyncio
+    async def test_exhausted_replacement_drops_asset_with_sufficient_section_coverage(self, tmp_path) -> None:
+        """3. Every replacement attempt still fails -> the asset is
+        DROPPED (never kept as a known-bad clip) - but this section has
+        TWO other good assets, so coverage remains sufficient and the
+        pipeline is never blocked; no neutral fallback is even needed."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        bad = _asset(tmp_path, "bad0", 0)
+        good1 = _asset(tmp_path, "good1", 0)
+        good2 = _asset(tmp_path, "good2", 0)
+        replacements = [_asset(tmp_path, f"stillbad{i}", 0) for i in range(1, 3)]
+        visual_result = _visual_result([_mapping(0, [bad, good1, good2])])
+        verdicts = {
+            "bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1),
+            "stillbad1": RawAssetVerdict(asset_id="stillbad1", relevance_score=0.1),
+            "stillbad2": RawAssetVerdict(asset_id="stillbad2", relevance_score=0.1),
+            "good1": RawAssetVerdict(asset_id="good1", relevance_score=0.9),
+            "good2": RawAssetVerdict(asset_id="good2", relevance_score=0.9),
+        }
+        evaluator = MockVisualRelevanceEvaluator(verdicts_by_asset_id=verdicts)
+        replacement_provider = FakeReplacementProvider({(0, 0): replacements})
+        service = VisualQCService(
+            evaluator=evaluator, assembler=FakeAssembler(), visual_media_service=replacement_provider,
+            max_replacement_attempts=2,
+        )
+
+        qc_result, updated = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        dropped_result = qc_result.sections[0].assets[0]
+        assert dropped_result.dropped is True
+        assert dropped_result.approved is False
+        assert updated.sections[0].assets[0].success is False  # dropped from the final video
+        assert updated.sections[0].assets[1].success is True  # good1 untouched
+        assert updated.sections[0].assets[2].success is True  # good2 untouched
+        assert qc_result.sections[0].usable_asset_count == 2
+        assert qc_result.sections[0].neutral_fallback_used is False
+        assert qc_result.sections[0].disposition == "recovered"
+        assert qc_result.disposition == "recovered"
+        assert qc_result.dropped_count == 1
+
+    @pytest.mark.asyncio
+    async def test_exhausted_replacement_insufficient_coverage_uses_neutral_fallback(self, tmp_path) -> None:
+        """4. A single-asset section's only asset is dropped -> zero
+        coverage remains -> a locally-generated neutral fallback visual
+        recovers it instead of a whole-pipeline failure."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        bad = _asset(tmp_path, "bad0", 0)
+        visual_result = _visual_result([_mapping(0, [bad])])
+        evaluator = MockVisualRelevanceEvaluator(
+            verdicts_by_asset_id={"bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1)}
+        )
+        neutral_generator = FakeNeutralVisualGenerator()
+        service = VisualQCService(
+            evaluator=evaluator, assembler=FakeAssembler(), visual_media_service=None,
+            neutral_visual_generator=neutral_generator, neutral_fallback_output_dir=str(tmp_path / "fallback"),
+        )
+
+        qc_result, updated = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        assert len(neutral_generator.calls) == 1
+        assert neutral_generator.calls[0]["label"] == "Heading"  # SectionMediaMapping.section_heading
+        section_result = qc_result.sections[0]
+        assert section_result.neutral_fallback_used is True
+        assert section_result.usable_asset_count == 1
+        assert section_result.disposition == "recovered"
+        assert qc_result.disposition == "recovered"
+        assert qc_result.neutral_fallback_count == 1
+        final_asset = updated.sections[0].assets[0]
+        assert final_asset.success is True
+        assert final_asset.relevance_tier == "neutral_fallback"
+        assert final_asset.provider == "neutral_fallback"
+
+    @pytest.mark.asyncio
+    async def test_rejected_ids_never_reused_as_replacement(self, tmp_path) -> None:
+        """5. A QC-driven replacement must never return an id already
+        excluded (e.g. one Visual QC already rejected for this slot),
+        even as an absolute last resort when nothing new is found."""
+        from src.services.visual_media_service import VisualMediaService
+        from src.tools.media_provider import MediaProvider
+
+        class _EmptyMediaProvider(MediaProvider):
+            @property
+            def name(self) -> str:
+                return "mock"
+
+            async def search(self, query, prefer_video=True, max_results=5):
+                return []  # Pexels finds nothing new for any query tier
+
+            async def download(self, candidate, output_path) -> None:
+                raise NotImplementedError("not exercised - search never returns a candidate")
+
+        rejected_asset = _asset(tmp_path, "rejected0", 0)
+        downloaded_by_id = {"rejected0": rejected_asset}
+        used_ids_in_order = ["rejected0"]
+        service = VisualMediaService(media_provider=_EmptyMediaProvider())
+
+        replacement, _ = await service.acquire_replacement_asset(
+            _section_plan(0), 0, 0, downloaded_by_id, used_ids_in_order, exclude_ids={"rejected0"},
+        )
+
+        # No genuinely new candidate exists anywhere, and reuse-fallback is
+        # disabled for QC-driven replacement - must fail cleanly, never
+        # silently hand back the excluded id.
+        assert replacement.success is False
+
+    @pytest.mark.asyncio
+    async def test_multiple_rejected_assets_recover_independently(self, tmp_path) -> None:
+        """6. Two different rejected slots in the same section each get
+        their own independent bounded replacement search and resolution -
+        one succeeds via replacement, the other is dropped, and the
+        section still ends up safely covered by the surviving assets."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        bad_a = _asset(tmp_path, "bad-a", 0)
+        bad_b = _asset(tmp_path, "bad-b", 0)
+        good_c = _asset(tmp_path, "good-c", 0)
+        replacement_for_a = _asset(tmp_path, "good-a", 0)
+        replacements_for_b = [_asset(tmp_path, f"stillbad-b{i}", 0) for i in range(1, 3)]
+        visual_result = _visual_result([_mapping(0, [bad_a, bad_b, good_c])])
+        verdicts = {
+            "bad-a": RawAssetVerdict(asset_id="bad-a", relevance_score=0.1),
+            "good-a": RawAssetVerdict(asset_id="good-a", relevance_score=0.9),
+            "bad-b": RawAssetVerdict(asset_id="bad-b", relevance_score=0.1),
+            "stillbad-b1": RawAssetVerdict(asset_id="stillbad-b1", relevance_score=0.1),
+            "stillbad-b2": RawAssetVerdict(asset_id="stillbad-b2", relevance_score=0.1),
+            "good-c": RawAssetVerdict(asset_id="good-c", relevance_score=0.9),
+        }
+        evaluator = MockVisualRelevanceEvaluator(verdicts_by_asset_id=verdicts)
+        replacement_provider = FakeReplacementProvider(
+            {(0, 0): [replacement_for_a], (0, 1): replacements_for_b}
+        )
+        service = VisualQCService(
+            evaluator=evaluator, assembler=FakeAssembler(), visual_media_service=replacement_provider,
+            max_replacement_attempts=2,
+        )
+
+        qc_result, updated = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        slot_a, slot_b, slot_c = qc_result.sections[0].assets
+        assert slot_a.asset_id == "good-a" and slot_a.dropped is False
+        assert slot_b.dropped is True
+        assert slot_c.dropped is False
+        assert updated.sections[0].assets[0].success is True
+        assert updated.sections[0].assets[1].success is False
+        assert updated.sections[0].assets[2].success is True
+        assert qc_result.sections[0].disposition == "recovered"
+
+    @pytest.mark.asyncio
+    async def test_one_unrecoverable_optional_asset_does_not_fail_whole_video(self, tmp_path) -> None:
+        """7. A single dropped asset in one section of a multi-section
+        video must never, by itself, mark the overall run CRITICAL -
+        other sections (and the surviving assets in the affected section)
+        are enough."""
+        script = _script(
+            [ScriptSection(heading="A", narration="A."), ScriptSection(heading="B", narration="B.")]
+        )
+        bad = _asset(tmp_path, "bad0", 0)
+        good = _asset(tmp_path, "good0", 0)
+        other_section_good = _asset(tmp_path, "s1-good", 1)
+        visual_result = _visual_result([_mapping(0, [bad, good]), _mapping(1, [other_section_good])])
+        verdicts = {
+            "bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1),
+            "good0": RawAssetVerdict(asset_id="good0", relevance_score=0.9),
+            "s1-good": RawAssetVerdict(asset_id="s1-good", relevance_score=0.9),
+        }
+        evaluator = MockVisualRelevanceEvaluator(verdicts_by_asset_id=verdicts)
+        # No replacement service configured at all - "bad0" is dropped
+        # immediately (bounded replacement is simply unavailable).
+        service = VisualQCService(evaluator=evaluator, assembler=FakeAssembler())
+
+        qc_result, _ = await service.run_qc(
+            "topic", script, _plan(_section_plan(0), _section_plan(1)), visual_result
+        )
+
+        assert qc_result.sections[0].assets[0].dropped is True
+        assert qc_result.disposition == "recovered"
+        assert qc_result.critical_section_indices == []
+
+    @pytest.mark.asyncio
+    async def test_genuinely_unrepresentable_section_still_produces_critical(self, tmp_path) -> None:
+        """8. A single-asset section whose only asset is dropped, with NO
+        neutral_visual_generator configured, has no remaining recovery
+        strategy - this is the one case that must still be CRITICAL."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        bad = _asset(tmp_path, "bad0", 0)
+        visual_result = _visual_result([_mapping(0, [bad])])
+        evaluator = MockVisualRelevanceEvaluator(
+            verdicts_by_asset_id={"bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1)}
+        )
+        service = VisualQCService(evaluator=evaluator, assembler=FakeAssembler())  # no generator configured
+
+        qc_result, updated = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        assert qc_result.sections[0].disposition == "critical"
+        assert qc_result.disposition == "critical"
+        assert qc_result.critical_section_indices == [0]
+        assert updated.sections[0].assets[0].success is False
+
+    @pytest.mark.asyncio
+    async def test_neutral_fallback_generation_failure_still_produces_critical(self, tmp_path) -> None:
+        """A generator that itself fails must never crash QC or fabricate
+        a substitute - the section correctly stays CRITICAL."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        bad = _asset(tmp_path, "bad0", 0)
+        visual_result = _visual_result([_mapping(0, [bad])])
+        evaluator = MockVisualRelevanceEvaluator(
+            verdicts_by_asset_id={"bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1)}
+        )
+        failing_generator = FakeNeutralVisualGenerator(fail=True)
+        service = VisualQCService(
+            evaluator=evaluator, assembler=FakeAssembler(), neutral_visual_generator=failing_generator,
+            neutral_fallback_output_dir=str(tmp_path / "fallback"),
+        )
+
+        qc_result, _ = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        assert len(failing_generator.calls) == 1
+        assert qc_result.sections[0].disposition == "critical"
+
+    @pytest.mark.asyncio
+    async def test_qc_approved_assets_never_silently_converted_to_rejected(self, tmp_path) -> None:
+        """9. Recovery logic for a BAD sibling slot must never touch a
+        GOOD slot's own verdict/decision/approval in the same section."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        bad = _asset(tmp_path, "bad0", 0)
+        good = _asset(tmp_path, "good0", 0)
+        visual_result = _visual_result([_mapping(0, [bad, good])])
+        evaluator = MockVisualRelevanceEvaluator(
+            verdicts_by_asset_id={
+                "bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1),
+                "good0": RawAssetVerdict(asset_id="good0", relevance_score=0.95, reason="great match"),
+            }
+        )
+        service = VisualQCService(evaluator=evaluator, assembler=FakeAssembler())
+
+        qc_result, updated = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        good_result = qc_result.sections[0].assets[1]
+        assert good_result.decision == "approved"
+        assert good_result.approved is True
+        assert good_result.dropped is False
+        assert good_result.reason == "great match"
+        assert updated.sections[0].assets[1].provider_asset_id == "good0"
+        assert updated.sections[0].assets[1].success is True
+
+    @pytest.mark.asyncio
+    async def test_recovery_is_bounded_never_loops_indefinitely(self, tmp_path) -> None:
+        """10. Even with far more replacement candidates available than
+        the bound, the loop stops after exactly max_replacement_attempts
+        and the asset is dropped, not endlessly retried."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        original = _asset(tmp_path, "bad0", 0)
+        many_replacements = [_asset(tmp_path, f"bad{i}", 0) for i in range(1, 50)]
+        visual_result = _visual_result([_mapping(0, [original])])
+        verdicts = {f"bad{i}": RawAssetVerdict(asset_id=f"bad{i}", relevance_score=0.1) for i in range(0, 50)}
+        evaluator = MockVisualRelevanceEvaluator(verdicts_by_asset_id=verdicts)
+        replacement_provider = FakeReplacementProvider({(0, 0): many_replacements})
+        service = VisualQCService(
+            evaluator=evaluator, assembler=FakeAssembler(), visual_media_service=replacement_provider,
+            max_replacement_attempts=2,
+        )
+
+        qc_result, _ = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        assert len(replacement_provider.calls) == 2  # bounded, not 49
+        assert qc_result.sections[0].assets[0].dropped is True
+
+    @pytest.mark.asyncio
+    async def test_only_smallest_affected_scope_is_re_qcd(self, tmp_path) -> None:
+        """11. Replacing ONE bad slot must never re-evaluate its
+        already-approved siblings in the same section - exactly one
+        additional vision call per replacement attempt, scoped to that
+        one asset only."""
+        script = _script([ScriptSection(heading="A", narration="Some narration.")])
+        bad = _asset(tmp_path, "bad0", 0)
+        good1 = _asset(tmp_path, "good1", 0)
+        good2 = _asset(tmp_path, "good2", 0)
+        replacement = _asset(tmp_path, "good0", 0)
+        visual_result = _visual_result([_mapping(0, [bad, good1, good2])])
+        verdicts = {
+            "bad0": RawAssetVerdict(asset_id="bad0", relevance_score=0.1),
+            "good0": RawAssetVerdict(asset_id="good0", relevance_score=0.9),
+            "good1": RawAssetVerdict(asset_id="good1", relevance_score=0.9),
+            "good2": RawAssetVerdict(asset_id="good2", relevance_score=0.9),
+        }
+        evaluator = MockVisualRelevanceEvaluator(verdicts_by_asset_id=verdicts)
+        replacement_provider = FakeReplacementProvider({(0, 0): [replacement]})
+        service = VisualQCService(evaluator=evaluator, assembler=FakeAssembler(), visual_media_service=replacement_provider)
+
+        qc_result, _ = await service.run_qc("topic", script, _plan(_section_plan(0)), visual_result)
+
+        # 1 initial batched call (all 3 assets) + 1 replacement re-check
+        # (the ONE replaced asset only) = 2, never a full-section re-check.
+        assert qc_result.vision_calls_made == 2
 
 
 class TestFrameSampling:

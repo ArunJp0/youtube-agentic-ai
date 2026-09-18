@@ -10,11 +10,22 @@
 # policy (score thresholds -> decision), bounded replacement, repetition
 # checking, and safe fallback when the evaluator is unavailable.
 #
-# Standalone component for this milestone: not wired into the main
-# LangGraph pipeline yet (see src/visual_qc_demo.py).
+# Failure/recovery policy (PASS / REPLACEABLE / CRITICAL - see
+# src.models.visual_qc's module docstring and docs/DECISIONS.md): an
+# individual weak/misleading asset is never, by itself, a whole-video
+# failure. A REPLACEABLE asset that survives bounded replacement is kept;
+# one that doesn't is DROPPED (never kept as a known-bad "last resort").
+# After dropping, section coverage is recomputed from what remains; a
+# section that would end up with zero usable visual coverage gets one
+# locally-generated neutral fallback visual (no external service, never a
+# claim-specific stock clip - see src.tools.neutral_visual_generator)
+# before being marked CRITICAL. Only a genuinely CRITICAL section halts
+# the pipeline (see pipeline_graph.py's visual_qc_node).
 from __future__ import annotations
 
+import os
 import tempfile
+import uuid
 from typing import Dict, List, Optional, Set, Tuple
 
 from src.models.media import MediaAsset, SectionMediaMapping, VisualResult
@@ -29,6 +40,7 @@ from src.services.visual_media_service import (
     reconstruct_global_asset_state,
 )
 from src.tools.ffmpeg_video_assembler import VideoAssembler, VideoAssemblerError
+from src.tools.neutral_visual_generator import NeutralVisualGenerator, NeutralVisualGeneratorError
 from src.tools.visual_relevance_evaluator import (
     AssetFrames,
     SectionQCContext,
@@ -45,14 +57,29 @@ APPROVE_SCORE_THRESHOLD = 0.70
 NEUTRAL_SCORE_THRESHOLD = 0.50
 
 # Bounded replacement: a slot is retried at most this many times before
-# the best-available asset is kept and explicitly flagged, rather than
-# searching indefinitely.
+# it is DROPPED (never kept as a known-bad last resort) and section
+# coverage is recomputed, rather than searching indefinitely.
 DEFAULT_MAX_REPLACEMENT_ATTEMPTS = 2
 
 # A best-effort assumed clip duration used only if a video asset's own
 # duration is unknown AND ffprobe fails - keeps frame sampling from
 # crashing QC over a single bad probe.
 FALLBACK_ASSUMED_DURATION_SECONDS = 4.0
+
+# A section needs at least this many usable (kept or neutral-fallback)
+# assets to be considered safely covered - VideoAssemblyService already
+# redistributes a section's planned duration evenly across however many
+# assets it actually receives (see docs/DECISIONS.md), so "sufficient
+# coverage" reduces to "at least one usable asset remains".
+MIN_SECTION_COVERAGE_ASSETS = 1
+
+# Target duration for a generated neutral fallback clip when a section's
+# own planned duration is unknown/zero - VideoAssemblyService's existing
+# build_section_clip already loops/trims any input to the real required
+# duration, so this only needs to be a valid, non-zero starting point.
+DEFAULT_NEUTRAL_FALLBACK_SECONDS = 6.0
+
+DEFAULT_NEUTRAL_FALLBACK_OUTPUT_DIR = os.path.join("output", "media")
 
 
 class VisualQCServiceError(Exception):
@@ -79,6 +106,11 @@ class VisualQCService:
         max_replacement_attempts: int = DEFAULT_MAX_REPLACEMENT_ATTEMPTS,
         approve_threshold: float = APPROVE_SCORE_THRESHOLD,
         neutral_threshold: float = NEUTRAL_SCORE_THRESHOLD,
+        neutral_visual_generator: Optional[NeutralVisualGenerator] = None,
+        neutral_fallback_output_dir: str = DEFAULT_NEUTRAL_FALLBACK_OUTPUT_DIR,
+        video_width: int = 1920,
+        video_height: int = 1080,
+        video_fps: int = 30,
     ) -> None:
         """Initialize the Visual QC Service.
 
@@ -88,12 +120,29 @@ class VisualQCService:
                 extracting representative frames - no semantic decisions
                 are ever delegated to it
             visual_media_service: Optional VisualMediaService to request
-                replacement assets from when a slot is rejected. If None,
-                rejected assets are kept as the best-available option
-                (bounded replacement is skipped entirely, not attempted).
+                replacement assets from when a slot is weak/misleading. If
+                None, bounded replacement is skipped entirely (not
+                attempted) and a weak/misleading asset is dropped
+                immediately.
             max_replacement_attempts: Maximum replacement tries per slot
+                before it is dropped (never kept as a known-bad asset)
             approve_threshold: Minimum score for an outright "approved" decision
             neutral_threshold: Minimum score for a "neutral" (acceptable) decision
+            neutral_visual_generator: Optional NeutralVisualGenerator used
+                as the absolute last resort when a section would otherwise
+                end up with zero usable visual coverage after every
+                replace/drop attempt. If None, such a section is reported
+                CRITICAL instead (a safe, honest default - never silently
+                degrades by inventing an unrelated substitute).
+            neutral_fallback_output_dir: Directory a generated neutral
+                fallback clip is written into - the same directory
+                downloaded stock media already lives in, so it is
+                discoverable/cleanable the same way.
+            video_width/video_height/video_fps: Target video parameters a
+                generated neutral fallback clip is produced at - mirrors
+                VideoAssemblyService's own configured output parameters so
+                the fallback slots directly into assembly with no further
+                processing.
         """
         self.evaluator = evaluator
         self.assembler = assembler
@@ -101,6 +150,11 @@ class VisualQCService:
         self.max_replacement_attempts = max_replacement_attempts
         self.approve_threshold = approve_threshold
         self.neutral_threshold = neutral_threshold
+        self.neutral_visual_generator = neutral_visual_generator
+        self.neutral_fallback_output_dir = neutral_fallback_output_dir
+        self.video_width = video_width
+        self.video_height = video_height
+        self.video_fps = video_fps
         self._vision_calls = 0
 
     async def run_qc(
@@ -172,6 +226,15 @@ class VisualQCService:
         all_asset_results = [asset for section in section_results for asset in section.assets]
         updated_visual_result = visual_result.model_copy(update={"sections": updated_mappings})
 
+        critical_indices = [s.section_index for s in section_results if s.disposition == "critical"]
+        overall_disposition = (
+            "critical"
+            if critical_indices
+            else "recovered"
+            if any(s.disposition == "recovered" for s in section_results)
+            else "pass"
+        )
+
         return (
             VisualQCResult(
                 topic=topic,
@@ -190,6 +253,10 @@ class VisualQCService:
                 fallback_used=bool(fallback_reasons),
                 fallback_reason="; ".join(fallback_reasons) or None,
                 repetition_warnings=repetition_warnings,
+                disposition=overall_disposition,
+                dropped_count=sum(s.dropped_count for s in section_results),
+                neutral_fallback_count=sum(1 for s in section_results if s.neutral_fallback_used),
+                critical_section_indices=critical_indices,
             ),
             updated_visual_result,
         )
@@ -207,44 +274,159 @@ class VisualQCService:
         tmp_dir: str,
     ) -> Tuple[SectionQCResult, List[MediaAsset], Optional[str]]:
         usable_indices = [i for i, a in enumerate(mapping.assets) if a.success and a.local_file_path]
-        if not usable_indices:
-            return SectionQCResult(section_index=mapping.section_index, assets=[]), list(mapping.assets), None
-
-        verdicts_by_id, fallback_reason = await self._evaluate_section_assets(
-            topic, mapping, section_plan, narration, usable_indices, tmp_dir
-        )
-
-        asset_results: List[AssetQCResult] = []
         final_assets: List[MediaAsset] = list(mapping.assets)
+        asset_results: List[AssetQCResult] = []
+        fallback_reason: Optional[str] = None
 
-        for slot_index in usable_indices:
-            asset = mapping.assets[slot_index]
-            asset_id = self._asset_key(asset)
-
-            if fallback_reason is not None:
-                result = _metadata_fallback_result(asset_id, mapping.section_index, slot_index, fallback_reason)
-                asset_results.append(result)
-                continue
-
-            result, final_asset = await self._resolve_slot(
-                topic=topic,
-                mapping=mapping,
-                slot_index=slot_index,
-                asset=asset,
-                section_plan=section_plan,
-                narration=narration,
-                initial_verdict=verdicts_by_id.get(asset_id),
-                downloaded_by_id=downloaded_by_id,
-                used_ids_in_order=used_ids_in_order,
-                tmp_dir=tmp_dir,
+        if usable_indices:
+            verdicts_by_id, fallback_reason = await self._evaluate_section_assets(
+                topic, mapping, section_plan, narration, usable_indices, tmp_dir
             )
-            asset_results.append(result)
-            final_assets[slot_index] = final_asset
+
+            for slot_index in usable_indices:
+                asset = mapping.assets[slot_index]
+                asset_id = self._asset_key(asset)
+
+                if fallback_reason is not None:
+                    result = _metadata_fallback_result(asset_id, mapping.section_index, slot_index, fallback_reason)
+                    asset_results.append(result)
+                    continue
+
+                result, final_asset = await self._resolve_slot(
+                    topic=topic,
+                    mapping=mapping,
+                    slot_index=slot_index,
+                    asset=asset,
+                    section_plan=section_plan,
+                    narration=narration,
+                    initial_verdict=verdicts_by_id.get(asset_id),
+                    downloaded_by_id=downloaded_by_id,
+                    used_ids_in_order=used_ids_in_order,
+                    tmp_dir=tmp_dir,
+                )
+                if result.disposition == "replaceable":
+                    # Bounded replacement never resolved this slot - DROP
+                    # it (never keep a known weak/misleading asset as a
+                    # "last resort") and let section-coverage recovery
+                    # below decide what happens next. A single dropped
+                    # optional asset is never, by itself, a whole-section
+                    # or whole-video failure.
+                    result = result.model_copy(update={"dropped": True, "approved": False})
+                    final_assets[slot_index] = _dropped_placeholder(final_asset)
+                else:
+                    final_assets[slot_index] = final_asset
+                asset_results.append(result)
+
+        section_result, final_assets = self._recover_section_coverage(mapping, section_plan, asset_results, final_assets)
+        return section_result, final_assets, fallback_reason
+
+    def _recover_section_coverage(
+        self,
+        mapping: SectionMediaMapping,
+        section_plan: Optional[SectionVisualPlan],
+        asset_results: List[AssetQCResult],
+        final_assets: List[MediaAsset],
+    ) -> Tuple[SectionQCResult, List[MediaAsset]]:
+        """Recompute this section's usable visual coverage from what
+        remains after any drops, and recover it with a locally-generated
+        neutral fallback visual if it would otherwise be zero - the ONLY
+        condition that may still mark a section (and therefore the whole
+        run) CRITICAL. See module docstring for the full PASS/REPLACEABLE/
+        CRITICAL policy this implements."""
+        dropped_count = sum(1 for a in asset_results if a.dropped)
+        usable_count = sum(1 for a in final_assets if a.success and a.local_file_path)
+        neutral_fallback_used = False
+
+        if usable_count < MIN_SECTION_COVERAGE_ASSETS:
+            fallback_asset = self._try_generate_neutral_fallback(mapping)
+            if fallback_asset is not None:
+                if final_assets:
+                    final_assets = list(final_assets)
+                    final_assets[0] = fallback_asset
+                else:
+                    final_assets = [fallback_asset]
+                usable_count = 1
+                neutral_fallback_used = True
+
+                fallback_result = AssetQCResult(
+                    asset_id=self._asset_key(fallback_asset),
+                    section_index=mapping.section_index,
+                    slot_index=0,
+                    approved=True,
+                    decision="neutral_fallback",
+                    reason="No safe visual asset was available for this section - substituted a locally "
+                    "generated neutral fallback visual rather than an unrelated or misleading clip.",
+                    evaluation_source="neutral_fallback",
+                    dropped=False,
+                    used_as_neutral_fallback=True,
+                    disposition="pass",
+                )
+                if asset_results:
+                    asset_results = list(asset_results)
+                    asset_results[0] = fallback_result
+                else:
+                    asset_results = [fallback_result]
+
+        sufficient = usable_count >= MIN_SECTION_COVERAGE_ASSETS
+        disposition: str
+        if not sufficient:
+            disposition = "critical"
+        elif dropped_count or neutral_fallback_used:
+            disposition = "recovered"
+        else:
+            disposition = "pass"
 
         return (
-            SectionQCResult(section_index=mapping.section_index, assets=asset_results),
+            SectionQCResult(
+                section_index=mapping.section_index,
+                assets=asset_results,
+                dropped_count=dropped_count,
+                usable_asset_count=usable_count,
+                neutral_fallback_used=neutral_fallback_used,
+                disposition=disposition,
+            ),
             final_assets,
-            fallback_reason,
+        )
+
+    def _try_generate_neutral_fallback(self, mapping: SectionMediaMapping) -> Optional[MediaAsset]:
+        """Generate a safe, generic, non-claim-specific fallback clip for
+        this section, or return None if no generator is configured or
+        generation fails - callers must treat None as "no fallback
+        available", never invent a substitute of their own."""
+        if self.neutral_visual_generator is None:
+            return None
+
+        duration = (
+            mapping.planned_duration_seconds
+            if mapping.planned_duration_seconds and mapping.planned_duration_seconds > 0
+            else DEFAULT_NEUTRAL_FALLBACK_SECONDS
+        )
+        os.makedirs(self.neutral_fallback_output_dir, exist_ok=True)
+        output_path = os.path.join(
+            self.neutral_fallback_output_dir,
+            f"neutral-fallback-{mapping.section_index + 1:02d}-{uuid.uuid4().hex[:8]}.mp4",
+        )
+        try:
+            self.neutral_visual_generator.generate(
+                output_path=output_path,
+                duration_seconds=duration,
+                width=self.video_width,
+                height=self.video_height,
+                fps=self.video_fps,
+                label=mapping.section_heading,
+            )
+        except NeutralVisualGeneratorError:
+            return None
+
+        return MediaAsset(
+            provider="neutral_fallback",
+            asset_type="video",
+            local_file_path=output_path,
+            search_query="neutral_fallback",
+            section_index=mapping.section_index,
+            duration_seconds=duration,
+            success=True,
+            relevance_tier="neutral_fallback",
         )
 
     async def _evaluate_section_assets(
@@ -408,6 +590,7 @@ class VisualQCService:
                 evaluation_source="error",
                 replaced=replaced,
                 replacement_attempts=attempts,
+                disposition="pass",
             )
 
         if verdict.misleading_or_conflicting:
@@ -433,6 +616,7 @@ class VisualQCService:
             evaluation_source="vision",
             replaced=replaced,
             replacement_attempts=attempts,
+            disposition="replaceable" if retry_recommended else "pass",
         )
 
     # ---- frame extraction -----------------------------------------------------
@@ -495,4 +679,19 @@ def _metadata_fallback_result(
         evaluation_source="metadata_fallback",
         replaced=False,
         replacement_attempts=0,
+        disposition="pass",
+    )
+
+
+def _dropped_placeholder(asset: MediaAsset) -> MediaAsset:
+    """A DROPPED slot's replacement in the final asset list: marks the
+    asset unsuccessful (so VideoAssemblyService's existing usable-asset
+    filter excludes it automatically, exactly like a genuine download
+    failure) while preserving its original provenance fields for
+    diagnostics - never silently deleted, never kept as a known-bad clip."""
+    return asset.model_copy(
+        update={
+            "success": False,
+            "error": "Dropped after Visual QC bounded replacement was exhausted",
+        }
     )
