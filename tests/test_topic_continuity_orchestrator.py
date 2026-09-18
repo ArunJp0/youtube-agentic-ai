@@ -151,6 +151,25 @@ class TestTier1PrimaryCandidates:
 
         assert research.calls == titles[:3]  # never tries beyond the configured bound
 
+    @pytest.mark.asyncio
+    async def test_tier1_success_never_calls_tier2(self, tmp_path) -> None:
+        """A. TIER 1 succeeding must never even consult a configured TIER 2
+        evergreen planner - proven with a REAL evergreen planner present
+        (not omitted), so "never called" is a meaningful assertion."""
+        primary = StubTopicPlanner(result=make_plan_result(["Topic A"]))
+        evergreen = StubTopicPlanner(result=make_plan_result(["Would Never Be Tried"]))
+        research = StubResearchAgent(passing_topics=["Topic A"])
+        orchestrator = TopicContinuityOrchestrator(
+            primary_topic_planner=primary, research_agent=research, evergreen_topic_planner=evergreen
+        )
+
+        outcome = await orchestrator.select_researchable_topic()
+
+        assert outcome.status == "selected"
+        assert outcome.tier == "primary"
+        assert evergreen.calls == 0
+        assert "Would Never Be Tried" not in research.calls
+
 
 # ---------------------------------------------------------------------------
 # TIER 2: evergreen fallback discovery
@@ -158,6 +177,25 @@ class TestTier1PrimaryCandidates:
 
 
 class TestTier2EvergreenFallback:
+    @pytest.mark.asyncio
+    async def test_evergreen_candidate_one_fails_research_next_candidate_succeeds(self, tmp_path) -> None:
+        """F. TIER 2's own bounded candidate retry mirrors TIER 1's: the
+        first evergreen candidate failing Research must not end the
+        search - the next ranked evergreen candidate is tried."""
+        primary = StubTopicPlanner(result=make_empty_plan_result())
+        evergreen = StubTopicPlanner(result=make_plan_result(["Evergreen A", "Evergreen B", "Evergreen C"], source="youtube"))
+        research = StubResearchAgent(passing_topics=["Evergreen B"])
+        orchestrator = TopicContinuityOrchestrator(
+            primary_topic_planner=primary, research_agent=research, evergreen_topic_planner=evergreen
+        )
+
+        outcome = await orchestrator.select_researchable_topic()
+
+        assert outcome.status == "selected"
+        assert outcome.topic == "Evergreen B"
+        assert outcome.tier == "evergreen"
+        assert research.calls == ["Evergreen A", "Evergreen B"]  # never retries "Evergreen A"
+
     @pytest.mark.asyncio
     async def test_all_bounded_primary_candidates_fail_evergreen_fallback_succeeds(self, tmp_path) -> None:
         """Requirement 2: every bounded TIER 1 candidate fails -> a

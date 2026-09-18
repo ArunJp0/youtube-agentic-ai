@@ -1,7 +1,7 @@
 # Provider selection: builds LLM/search providers from Settings
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 from src.config.settings import Settings
 from src.llm.provider import LLMProvider
@@ -195,6 +195,57 @@ def get_topic_source_provider(settings: Optional[Settings] = None) -> TopicSourc
     raise ProviderConfigError(
         f"Unknown TOPIC_PLANNER_SOURCE: '{settings.topic_planner_source}'. Expected 'mock' or 'youtube'."
     )
+
+
+def get_resilient_evergreen_topic_source_provider(settings: Optional[Settings] = None) -> TopicSourceProvider:
+    """Build the evergreen discovery source used specifically by TIER 2 of
+    the multi-tier content-continuity strategy (see
+    src.orchestration.topic_continuity_orchestrator) - deliberately
+    SEPARATE from ``get_topic_source_provider``/``get_topic_planner_source``
+    (the PRIMARY/normal evergreen path, unchanged by this function).
+
+    A real controlled autonomous run proved TIER 2 was structurally
+    unusable whenever ``YOUTUBE_API_KEY`` was absent: YouTube was its only
+    real discovery source, a single point of failure. This composes
+    YouTube (if ``TOPIC_PLANNER_SOURCE=youtube``, reused unchanged - still
+    tried first, still fully capable of succeeding on its own) with a new
+    ``WikipediaTopicSourceProvider`` (free, no API key, reuses the same
+    public Wikipedia search API Research already trusts) via the existing
+    ``CompositeTopicSourceProvider`` - which already implements exactly
+    the required semantics: one component's failure/unavailability is
+    recorded and skipped, and only if EVERY component fails does the whole
+    call raise ``TopicSourceProviderError`` (surfacing as
+    ``TopicSelectionResult.status == "source_unavailable"``, unchanged).
+    In "mock" configuration, returns the existing ``MockTopicSourceProvider``
+    unchanged - no network in tests.
+    """
+    settings = settings or Settings()
+    from src.tools.wikipedia_topic_source_provider import (
+        DEFAULT_EVERGREEN_CATEGORY_SEEDS,
+        WikipediaTopicSourceProvider,
+    )
+
+    if (settings.topic_planner_source or "mock").strip().lower() == "mock":
+        return get_topic_source_provider(settings)
+
+    seeds = _parse_topic_evergreen_seeds(settings)
+    wikipedia_evergreen = WikipediaTopicSourceProvider(category_seeds=seeds)
+
+    providers: List[TopicSourceProvider] = []
+    try:
+        providers.append(get_topic_source_provider(settings))
+    except ProviderConfigError:
+        pass
+    providers.append(wikipedia_evergreen)
+
+    return CompositeTopicSourceProvider(providers)
+
+
+def _parse_topic_evergreen_seeds(settings: Settings) -> Optional[List[str]]:
+    raw = (settings.topic_evergreen_category_seeds or "").strip()
+    if not raw:
+        return None
+    return [seed.strip() for seed in raw.split(",") if seed.strip()]
 
 
 def get_current_news_topic_source_provider(settings: Optional[Settings] = None) -> TopicSourceProvider:

@@ -129,6 +129,15 @@ class Settings:
     topic_freshness_hours: float = field(
         default_factory=lambda: float(os.environ.get("TOPIC_FRESHNESS_HOURS", "48"))
     )
+    # Generic evergreen CATEGORY seed queries (never final video topics)
+    # driving WikipediaTopicSourceProvider - the free, no-API-key-required
+    # evergreen discovery path used to keep TIER 2 of the multi-tier
+    # content-continuity strategy genuinely usable even when
+    # YOUTUBE_API_KEY is absent (see src.tools.wikipedia_topic_source_provider).
+    # Empty means "use the built-in DEFAULT_EVERGREEN_CATEGORY_SEEDS".
+    topic_evergreen_category_seeds: str = field(
+        default_factory=lambda: os.environ.get("TOPIC_EVERGREEN_CATEGORY_SEEDS", "")
+    )
 
     # Target video duration for the Script Agent's content/word budget (see
     # src.services.script_duration) - "short"|"standard"|"long", or a

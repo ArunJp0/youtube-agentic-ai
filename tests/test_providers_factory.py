@@ -10,6 +10,7 @@ from src.config.providers import (
     get_current_news_topic_source_provider,
     get_llm_provider,
     get_media_provider,
+    get_resilient_evergreen_topic_source_provider,
     get_search_provider,
     get_topic_planner_source,
     get_topic_source_provider,
@@ -217,6 +218,54 @@ class TestGetTopicSourceProvider:
         settings = Settings(topic_planner_source="not-a-real-source")
         with pytest.raises(ProviderConfigError):
             get_topic_source_provider(settings)
+
+
+class TestGetResilientEvergreenTopicSourceProvider:
+    """Tests for TIER 2's own evergreen discovery factory - the fix for the
+    real production gap where YouTube was the ONLY evergreen discovery
+    source, leaving TIER 2 structurally unusable without YOUTUBE_API_KEY."""
+
+    def test_mock_configuration_returns_plain_mock_no_network(self) -> None:
+        settings = Settings(topic_planner_source="mock")
+        provider = get_resilient_evergreen_topic_source_provider(settings)
+        assert isinstance(provider, MockTopicSourceProvider)
+
+    def test_youtube_configuration_composes_youtube_and_wikipedia(self) -> None:
+        from src.tools.wikipedia_topic_source_provider import WikipediaTopicSourceProvider
+        from src.tools.youtube_topic_source_provider import YouTubeTopicSourceProvider
+
+        settings = Settings(topic_planner_source="youtube", youtube_api_key="fake-key")
+        provider = get_resilient_evergreen_topic_source_provider(settings)
+
+        assert isinstance(provider, CompositeTopicSourceProvider)
+        component_types = [type(p) for p in provider.providers]
+        assert YouTubeTopicSourceProvider in component_types
+        assert WikipediaTopicSourceProvider in component_types
+
+    def test_youtube_configuration_without_api_key_still_composes_wikipedia(self) -> None:
+        """C. YOUTUBE_API_KEY absent must not prevent construction of a
+        usable evergreen discovery path - Wikipedia is still composed in,
+        even though YouTube's own discover_candidates() will fail later."""
+        from src.tools.wikipedia_topic_source_provider import WikipediaTopicSourceProvider
+
+        settings = Settings(topic_planner_source="youtube", youtube_api_key=None)
+        provider = get_resilient_evergreen_topic_source_provider(settings)
+
+        assert isinstance(provider, CompositeTopicSourceProvider)
+        assert any(isinstance(p, WikipediaTopicSourceProvider) for p in provider.providers)
+
+    def test_custom_category_seeds_pass_through(self) -> None:
+        settings = Settings(
+            topic_planner_source="youtube",
+            youtube_api_key="fake-key",
+            topic_evergreen_category_seeds="space exploration, ocean life",
+        )
+        provider = get_resilient_evergreen_topic_source_provider(settings)
+
+        from src.tools.wikipedia_topic_source_provider import WikipediaTopicSourceProvider
+
+        wikipedia_component = next(p for p in provider.providers if isinstance(p, WikipediaTopicSourceProvider))
+        assert wikipedia_component.category_seeds == ["space exploration", "ocean life"]
 
 
 class TestGetCurrentNewsTopicSourceProvider:

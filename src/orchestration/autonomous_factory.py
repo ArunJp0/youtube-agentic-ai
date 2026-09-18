@@ -18,9 +18,9 @@ from src.config.providers import (
     get_current_news_search_provider,
     get_llm_provider,
     get_media_provider,
+    get_resilient_evergreen_topic_source_provider,
     get_search_provider,
     get_topic_planner_source,
-    get_topic_source_provider,
     get_transcription_provider,
     get_visual_relevance_evaluator,
     get_voice_provider,
@@ -86,13 +86,18 @@ def build_topic_planner_agent(settings: Settings) -> TopicPlannerAgent:
 def build_evergreen_topic_planner_agent(settings: Settings) -> TopicPlannerAgent:
     """Construct a SEPARATE, dedicated evergreen-only ``TopicPlannerAgent``
     for TIER 2 of the content-continuity strategy - mirrors
-    ``build_topic_planner_agent`` exactly except it always uses
-    ``get_topic_source_provider`` (the plain evergreen source, bypassing
-    ``TOPIC_MODE``'s mixed/trending composition) and forces
-    ``mode="evergreen"``, so it is never affected by whatever ``TOPIC_MODE``
-    the PRIMARY planner is configured with.
+    ``build_topic_planner_agent`` except it forces ``mode="evergreen"``
+    (never affected by whatever ``TOPIC_MODE`` the PRIMARY planner is
+    configured with) and uses
+    ``get_resilient_evergreen_topic_source_provider`` rather than the plain
+    ``get_topic_source_provider`` - a real controlled autonomous run proved
+    the latter left TIER 2 structurally unusable whenever
+    ``YOUTUBE_API_KEY`` was absent (YouTube was its only real discovery
+    source). The resilient variant composes YouTube (still tried, still
+    fully capable of succeeding alone) with a free, no-API-key Wikipedia-
+    based evergreen source, so TIER 2 remains genuinely usable either way.
     """
-    topic_source_provider = get_topic_source_provider(settings)
+    topic_source_provider = get_resilient_evergreen_topic_source_provider(settings)
     llm_provider = get_llm_provider(settings)
     ranking_planner = TopicRankingPlanner(llm_provider) if settings.llm_provider != "mock" else None
 
