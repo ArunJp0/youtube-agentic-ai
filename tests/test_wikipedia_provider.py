@@ -146,3 +146,24 @@ class TestWikipediaSearchProvider:
 
         with pytest.raises(WikipediaSearchError):
             asyncio.run(provider.search("dream"))
+
+    def test_hang_is_bounded_by_outer_timeout(self) -> None:
+        """A search call that never returns (an established connection
+        producing no response - the exact shape of a real production hang)
+        must still terminate within the configured outer bound, as a
+        typed, observable WikipediaSearchError - never wait forever."""
+
+        class HangingClient:
+            async def get(self, url, params=None, headers=None):
+                await asyncio.sleep(3600)
+                raise AssertionError("should never be reached - the outer timeout must fire first")
+
+        provider = WikipediaSearchProvider(client=HangingClient(), outer_timeout_seconds=0.05)
+
+        with pytest.raises(WikipediaSearchError) as exc_info:
+            asyncio.run(provider.search("dream"))
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "wikipedia" in message.lower()
+        assert "timeout" in message.lower()

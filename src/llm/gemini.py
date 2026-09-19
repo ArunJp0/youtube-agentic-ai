@@ -1,6 +1,7 @@
 # Gemini LLM provider (Google Generative Language API)
 from __future__ import annotations
 
+import concurrent.futures
 import random
 import time
 from typing import Optional
@@ -25,6 +26,21 @@ RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BASE_DELAY_SECONDS = 1.0
 DEFAULT_MAX_JITTER_SECONDS = 0.5
+
+# Hard OUTER ceiling wrapped around the ENTIRE generate_text() call (every
+# retry attempt, on both the primary and fallback model) - defense in
+# depth on top of, never a replacement for, the per-attempt httpx
+# ``timeout_seconds`` above. A real controlled autonomous run proved that a
+# blocking external call elsewhere in this pipeline did not reliably
+# terminate on its own client-level timeout alone; this closes the same
+# gap for every one of this provider's callers (Research, Script, Visual
+# Context Planning, BGM mood planning, Metadata, Thumbnail planning,
+# Compliance review) in one place, with no change required at any call
+# site. Set comfortably above the worst-case fully-retried duration on
+# both models (max_attempts x timeout_seconds x 2 models, plus backoff -
+# ~330s at the defaults below) so it only ever engages as a genuine last-
+# resort safety net, never cutting off a legitimate (if slow) retry cycle.
+DEFAULT_OUTER_TIMEOUT_SECONDS = 360.0
 
 
 class GeminiProviderError(Exception):
@@ -62,6 +78,7 @@ class GeminiLLMProvider(LLMProvider):
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         base_delay_seconds: float = DEFAULT_BASE_DELAY_SECONDS,
         max_jitter_seconds: float = DEFAULT_MAX_JITTER_SECONDS,
+        outer_timeout_seconds: float = DEFAULT_OUTER_TIMEOUT_SECONDS,
     ) -> None:
         if not api_key:
             raise GeminiProviderError(
@@ -75,6 +92,7 @@ class GeminiLLMProvider(LLMProvider):
         self.max_attempts = max_attempts
         self.base_delay_seconds = base_delay_seconds
         self.max_jitter_seconds = max_jitter_seconds
+        self.outer_timeout_seconds = outer_timeout_seconds
 
         # Diagnostics from the most recent generate_text() call.
         self.last_model_used: Optional[str] = None
@@ -90,10 +108,43 @@ class GeminiLLMProvider(LLMProvider):
         fallback model is configured, the same retry policy is applied to
         the fallback model.
 
+        The entire call (every attempt, both models) additionally runs
+        under a hard outer ceiling (``outer_timeout_seconds``) in a
+        background thread - defense in depth on top of, never a
+        replacement for, the per-attempt ``timeout_seconds`` above. See
+        ``DEFAULT_OUTER_TIMEOUT_SECONDS`` for why this exists and how it's
+        sized never to cut off a legitimate retry cycle early.
+
         Raises:
-            GeminiProviderError: On a non-retryable error, or if all
-                configured models fail after retries.
+            GeminiProviderError: On a non-retryable error, all configured
+                models failing after retries, or the outer ceiling being
+                reached (category=timeout).
         """
+        # Deliberately NOT a `with ThreadPoolExecutor(...) as executor:` block -
+        # its __exit__ calls shutdown(wait=True), which would block here
+        # until the background call finishes even after we've already
+        # timed out, defeating the entire point of an outer bound. On a
+        # genuine timeout we let the orphaned worker thread finish (or
+        # not) in the background and return control to the caller
+        # immediately; on success we shut down promptly since the work is
+        # already done.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._generate_text_inner, prompt)
+        try:
+            result = future.result(timeout=self.outer_timeout_seconds)
+        except concurrent.futures.TimeoutError as e:
+            executor.shutdown(wait=False)
+            raise GeminiProviderError(
+                f"Gemini request timed out after {self.outer_timeout_seconds:.0f}s "
+                "(provider=gemini, operation=generate_text, category=timeout) - "
+                "the underlying request did not complete even though its own "
+                "per-attempt timeout/retry policy should have"
+            ) from e
+        else:
+            executor.shutdown(wait=False)
+            return result
+
+    def _generate_text_inner(self, prompt: str) -> str:
         models_to_try = [self.model]
         if self.fallback_model and self.fallback_model != self.model:
             models_to_try.append(self.fallback_model)

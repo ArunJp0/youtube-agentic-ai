@@ -15,6 +15,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, List, Optional, Tuple
 
+import google_auth_httplib2
+import httplib2
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
@@ -28,6 +30,21 @@ from src.services.youtube_upload_validation import format_publish_at
 _RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 _MAX_UPLOAD_RETRIES = 5
 _RETRY_BACKOFF_SECONDS = 2.0
+
+# Hard bound on the underlying httplib2 transport googleapiclient uses -
+# without this, googleapiclient.discovery.build(credentials=...) wraps a
+# plain httplib2.Http() with NO timeout at all (httplib2's own default is
+# timeout=None), meaning a stalled connection to any YouTube Data API call
+# (channel verification, video upload, thumbnail upload) could wait
+# indefinitely with no bound whatsoever - a real controlled autonomous run
+# proved exactly this class of gap elsewhere in this pipeline. Generous
+# (matching FFmpegVideoAssembler's own 600s precedent for large media
+# operations) since insert_video uploads the full video file in one
+# request (MediaFileUpload(..., chunksize=-1)) and a real large file over a
+# realistically slow connection can legitimately take several minutes -
+# this bounds the worst case without breaking a genuinely slow-but-working
+# upload.
+DEFAULT_HTTP_TIMEOUT_SECONDS = 600.0
 
 
 class YouTubeClientError(Exception):
@@ -79,22 +96,45 @@ class GoogleYouTubeClient(YouTubeClient):
     googleapiclient library. Never re-implements OAuth itself - callers
     supply already-obtained credentials (see src.tools.youtube_oauth)."""
 
-    def __init__(self, credentials: Any, youtube_service: Optional[Resource] = None) -> None:
+    def __init__(
+        self,
+        credentials: Any,
+        youtube_service: Optional[Resource] = None,
+        http_timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
+    ) -> None:
         """Initialize the client.
 
         Args:
             credentials: Valid google.oauth2.credentials.Credentials
             youtube_service: Optional pre-built API resource (dependency
                 injection point for tests) - if omitted, built for real via
-                ``googleapiclient.discovery.build``.
+                ``googleapiclient.discovery.build``, with an explicit
+                bounded ``httplib2.Http(timeout=...)`` transport (see
+                ``DEFAULT_HTTP_TIMEOUT_SECONDS`` for why this is required -
+                ``build(credentials=...)`` alone would otherwise use an
+                unbounded transport).
+            http_timeout_seconds: Hard bound on every underlying HTTP
+                request this client makes (channel verification, video
+                upload chunks, thumbnail upload) - only used when
+                ``youtube_service`` is omitted.
         """
-        self._youtube = youtube_service or build("youtube", "v3", credentials=credentials, cache_discovery=False)
+        if youtube_service is not None:
+            self._youtube = youtube_service
+        else:
+            authed_http = google_auth_httplib2.AuthorizedHttp(
+                credentials, http=httplib2.Http(timeout=http_timeout_seconds)
+            )
+            self._youtube = build("youtube", "v3", http=authed_http, cache_discovery=False)
 
     def get_authenticated_channel(self) -> YouTubeChannelInfo:
         try:
             response = self._youtube.channels().list(part="snippet", mine=True).execute()
         except HttpError as e:
             raise YouTubeClientError(f"Failed to verify the authenticated YouTube channel: {e}") from e
+        except (TimeoutError, ConnectionError, OSError) as e:
+            raise YouTubeClientError(
+                f"Failed to verify the authenticated YouTube channel (network/timeout): {e}"
+            ) from e
 
         items = response.get("items") or []
         if not items:
@@ -136,6 +176,16 @@ class GoogleYouTubeClient(YouTubeClient):
                     time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
                     continue
                 raise YouTubeClientError(f"Video upload failed: {e}") from e
+            except (TimeoutError, ConnectionError, OSError) as e:
+                # A stalled/dropped connection mid-chunk is exactly as
+                # transient as a 5xx response above - reuse the identical
+                # bounded retry/backoff policy rather than a second one,
+                # and only raise (never hang) once it's genuinely exhausted.
+                if attempt < _MAX_UPLOAD_RETRIES:
+                    attempt += 1
+                    time.sleep(_RETRY_BACKOFF_SECONDS * attempt)
+                    continue
+                raise YouTubeClientError(f"Video upload failed (network/timeout): {e}") from e
 
         return response["id"]
 
@@ -146,6 +196,8 @@ class GoogleYouTubeClient(YouTubeClient):
             self._youtube.thumbnails().set(videoId=video_id, media_body=MediaFileUpload(thumbnail_path)).execute()
         except HttpError as e:
             raise YouTubeClientError(f"Setting thumbnail failed: {e}") from e
+        except (TimeoutError, ConnectionError, OSError) as e:
+            raise YouTubeClientError(f"Setting thumbnail failed (network/timeout): {e}") from e
 
 
 class MockYouTubeClient(YouTubeClient):

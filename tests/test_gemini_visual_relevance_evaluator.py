@@ -223,3 +223,41 @@ class TestGeminiVisualRelevanceEvaluatorEvaluate:
         evaluator = GeminiVisualRelevanceEvaluator(api_key="test-key")
         with pytest.raises(VisualRelevanceEvaluatorError):
             await evaluator.evaluate_section(_context(["a"], str(frame_path)))
+
+    @pytest.mark.asyncio
+    async def test_hang_is_bounded_by_outer_timeout(self, monkeypatch, tmp_path) -> None:
+        """A vision evaluation call that never returns (an established
+        connection producing no response - the exact shape of a real
+        production hang) must still terminate within the configured outer
+        bound, as a typed, observable VisualRelevanceEvaluatorError - never
+        wait forever."""
+        frame_path = tmp_path / "frame.jpg"
+        frame_path.write_bytes(b"X")
+
+        class HangingAsyncClient:
+            def __call__(self, *args, **kwargs):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc_info):
+                return False
+
+            async def post(self, url, params=None, json=None):
+                import asyncio
+
+                await asyncio.sleep(3600)
+                raise AssertionError("should never be reached - the outer timeout must fire first")
+
+        monkeypatch.setattr(httpx, "AsyncClient", HangingAsyncClient())
+        evaluator = GeminiVisualRelevanceEvaluator(api_key="test-key", outer_timeout_seconds=0.05)
+
+        with pytest.raises(VisualRelevanceEvaluatorError) as exc_info:
+            await evaluator.evaluate_section(_context(["a"], str(frame_path)))
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "gemini" in message.lower()
+        assert "timeout" in message.lower()
+        assert "test-key" not in message

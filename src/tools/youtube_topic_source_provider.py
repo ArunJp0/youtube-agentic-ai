@@ -6,6 +6,7 @@
 # never touches the authenticated channel or any upload/scheduling action.
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -17,6 +18,13 @@ from src.tools.topic_source_provider import TopicSourceProvider, TopicSourceProv
 YOUTUBE_VIDEOS_API_URL = "https://www.googleapis.com/youtube/v3/videos"
 
 DEFAULT_REGION_CODE = "US"
+
+# Hard OUTER ceiling wrapped around the actual network call, on top of -
+# never instead of - the per-request httpx client timeout. See
+# src.tools.pexels_media_provider's identical pattern (added after a real
+# controlled autonomous run proved a client-level timeout alone did not
+# reliably bound a network call in this pipeline).
+DEFAULT_OUTER_TIMEOUT_SECONDS = 20.0
 
 # view counts at/above this are treated as maximally "popular" (signal=1.0)
 # for the bounded 0-1 popularity_signal - a fixed, documented reference
@@ -39,6 +47,7 @@ class YouTubeTopicSourceProvider(TopicSourceProvider):
         api_key: Optional[str],
         timeout_seconds: float = 10.0,
         client: Optional[httpx.AsyncClient] = None,
+        outer_timeout_seconds: float = DEFAULT_OUTER_TIMEOUT_SECONDS,
     ) -> None:
         """Initialize the provider.
 
@@ -49,6 +58,8 @@ class YouTubeTopicSourceProvider(TopicSourceProvider):
             client: Optional pre-configured httpx.AsyncClient (mainly for
                 tests). When omitted, a short-lived client is created per
                 request.
+            outer_timeout_seconds: Hard outer ceiling on top of
+                ``timeout_seconds`` - see ``DEFAULT_OUTER_TIMEOUT_SECONDS``.
 
         Raises:
             TopicSourceProviderError: If no api_key is configured - caught
@@ -59,6 +70,7 @@ class YouTubeTopicSourceProvider(TopicSourceProvider):
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
         self._client = client
+        self.outer_timeout_seconds = outer_timeout_seconds
 
     @property
     def name(self) -> str:
@@ -82,12 +94,13 @@ class YouTubeTopicSourceProvider(TopicSourceProvider):
         if category:
             params["videoCategoryId"] = category
 
-        owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=self.timeout_seconds)
         try:
-            response = await client.get(YOUTUBE_VIDEOS_API_URL, params=params)
-            response.raise_for_status()
-            data = response.json()
+            data = await asyncio.wait_for(self._do_get(params), timeout=self.outer_timeout_seconds)
+        except asyncio.TimeoutError as e:
+            raise TopicSourceProviderError(
+                f"YouTube topic discovery timed out after {self.outer_timeout_seconds:.0f}s "
+                "(provider=youtube, operation=discover_candidates, category=timeout)"
+            ) from e
         except httpx.TimeoutException as e:
             raise TopicSourceProviderError(f"YouTube topic discovery timed out: {e}") from e
         except httpx.HTTPStatusError as e:
@@ -96,9 +109,6 @@ class YouTubeTopicSourceProvider(TopicSourceProvider):
             ) from e
         except httpx.HTTPError as e:
             raise TopicSourceProviderError(f"YouTube topic discovery request failed: {e}") from e
-        finally:
-            if owns_client:
-                await client.aclose()
 
         items = data.get("items")
         if not isinstance(items, list):
@@ -110,6 +120,17 @@ class YouTubeTopicSourceProvider(TopicSourceProvider):
             if candidate is not None:
                 candidates.append(candidate)
         return candidates[:limit]
+
+    async def _do_get(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        owns_client = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=self.timeout_seconds)
+        try:
+            response = await client.get(YOUTUBE_VIDEOS_API_URL, params=params)
+            response.raise_for_status()
+            return response.json()
+        finally:
+            if owns_client:
+                await client.aclose()
 
 
 def _candidate_from_item(item: Dict[str, Any], requested_category: Optional[str]) -> Optional[TopicCandidate]:

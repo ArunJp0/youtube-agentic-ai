@@ -116,3 +116,32 @@ class TestEdgeVoiceProviderSynthesize:
             await provider.synthesize("Text", "en-US-AriaNeural", output_path)
 
         assert not os.path.exists(output_path)
+
+    @pytest.mark.asyncio
+    async def test_hang_is_bounded_by_outer_timeout(self, monkeypatch, tmp_path) -> None:
+        """A stream() that never yields and never raises (an established
+        websocket connection producing no data - the exact shape of a real
+        production hang) must still terminate within the configured outer
+        bound, as a typed, observable EdgeVoiceProviderError - never wait
+        forever - and never leave a partial output file behind."""
+        import asyncio
+
+        class _HangingCommunicate(_FakeCommunicate):
+            async def stream(self):
+                await asyncio.sleep(3600)
+                yield {"type": "audio", "data": b"UNREACHABLE"}
+
+        fake = _HangingCommunicate(chunks=[])
+        monkeypatch.setattr(edge_tts, "Communicate", fake)
+
+        provider = EdgeVoiceProvider(outer_timeout_seconds=0.05)
+        output_path = str(tmp_path / "narration.mp3")
+
+        with pytest.raises(EdgeVoiceProviderError) as exc_info:
+            await provider.synthesize("Text", "en-US-AriaNeural", output_path)
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "edge" in message.lower()
+        assert "timeout" in message.lower()
+        assert not os.path.exists(output_path)

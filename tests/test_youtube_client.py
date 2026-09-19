@@ -50,11 +50,19 @@ class FakeInsertRequest:
     next_chunk() call either raises (to test retry) or returns a final
     response after ``fail_times`` retryable failures."""
 
-    def __init__(self, video_id: str, fail_times: int = 0, error_status: int = 503, permanent_error: HttpError | None = None):
+    def __init__(
+        self,
+        video_id: str,
+        fail_times: int = 0,
+        error_status: int = 503,
+        permanent_error: HttpError | None = None,
+        transient_error: Exception | None = None,
+    ):
         self.video_id = video_id
         self.fail_times = fail_times
         self.error_status = error_status
         self.permanent_error = permanent_error
+        self.transient_error = transient_error
         self.calls = 0
 
     def next_chunk(self):
@@ -62,6 +70,8 @@ class FakeInsertRequest:
         if self.permanent_error is not None:
             raise self.permanent_error
         if self.calls <= self.fail_times:
+            if self.transient_error is not None:
+                raise self.transient_error
             raise _http_error(self.error_status)
         return (None, {"id": self.video_id})
 
@@ -144,6 +154,16 @@ class TestChannelVerification:
         with pytest.raises(YouTubeClientError):
             client.get_authenticated_channel()
 
+    def test_transport_timeout_raises_client_error(self) -> None:
+        """A stalled connection (the exact shape of a real production
+        hang, if it escaped the bounded httplib2 transport timeout) must
+        surface as the same typed YouTubeClientError, never an uncaught
+        low-level exception."""
+        service = FakeYouTubeService(channels=FakeChannelsResourceRaising(TimeoutError("timed out")))
+        client = GoogleYouTubeClient(credentials=None, youtube_service=service)
+        with pytest.raises(YouTubeClientError, match="timed out"):
+            client.get_authenticated_channel()
+
 
 class TestVideoInsertRequestMapping:
     def test_request_body_mapping(self, tmp_path) -> None:
@@ -201,6 +221,33 @@ class TestTransientRetry:
         with pytest.raises(YouTubeClientError):
             client.insert_video(_request(_video_file(tmp_path)))
 
+    def test_transient_timeout_mid_upload_is_retried_then_succeeds(self, tmp_path, monkeypatch) -> None:
+        """A dropped/stalled connection mid-chunk-upload (TimeoutError/
+        ConnectionError/OSError) must be retried through the exact same
+        bounded policy as a 5xx HttpError - not a second retry mechanism,
+        never an uncaught crash."""
+        monkeypatch.setattr("src.tools.youtube_client.time.sleep", lambda _: None)
+        insert_request = FakeInsertRequest(
+            video_id="vid123", fail_times=2, transient_error=TimeoutError("stalled connection")
+        )
+        service = FakeYouTubeService(videos=FakeVideosResource(insert_request, {}))
+        client = GoogleYouTubeClient(credentials=None, youtube_service=service)
+
+        video_id = client.insert_video(_request(_video_file(tmp_path)))
+        assert video_id == "vid123"
+        assert insert_request.calls == 3
+
+    def test_transient_timeout_exhausted_raises_client_error(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr("src.tools.youtube_client.time.sleep", lambda _: None)
+        insert_request = FakeInsertRequest(
+            video_id="vid123", fail_times=999, transient_error=ConnectionError("connection reset")
+        )
+        service = FakeYouTubeService(videos=FakeVideosResource(insert_request, {}))
+        client = GoogleYouTubeClient(credentials=None, youtube_service=service)
+
+        with pytest.raises(YouTubeClientError, match="network/timeout"):
+            client.insert_video(_request(_video_file(tmp_path)))
+
 
 class TestPermanentErrorNoRetry:
     def test_auth_permission_error_not_retried(self, tmp_path, monkeypatch) -> None:
@@ -240,6 +287,86 @@ class TestThumbnailSet:
         client = GoogleYouTubeClient(credentials=None, youtube_service=service)
         with pytest.raises(YouTubeClientError):
             client.set_thumbnail("vid123", str(thumb_path))
+
+    def test_transport_timeout_raises_client_error(self, tmp_path) -> None:
+        thumb_path = tmp_path / "thumb.jpg"
+        thumb_path.write_bytes(b"FAKE JPEG BYTES")
+        service = FakeYouTubeService(thumbnails=FakeThumbnailsResource({}, error=TimeoutError("timed out")))
+        client = GoogleYouTubeClient(credentials=None, youtube_service=service)
+        with pytest.raises(YouTubeClientError, match="timed out"):
+            client.set_thumbnail("vid123", str(thumb_path))
+
+
+class TestGoogleYouTubeClientTransportConstruction:
+    """The one genuinely severe gap this audit found: googleapiclient's
+    build(credentials=...) wraps a plain httplib2.Http() with NO timeout
+    at all by default - a stalled connection to any YouTube Data API call
+    could otherwise wait indefinitely with no bound whatsoever."""
+
+    def test_real_construction_wires_a_bounded_httplib2_transport(self, monkeypatch) -> None:
+        captured: dict = {}
+
+        class _FakeHttp:
+            def __init__(self, timeout=None):
+                captured["http_timeout"] = timeout
+
+        class _FakeAuthorizedHttp:
+            def __init__(self, credentials, http=None):
+                captured["credentials"] = credentials
+                captured["http"] = http
+
+        def _fake_build(service, version, http=None, cache_discovery=None):
+            captured["build_http"] = http
+            return "fake-service"
+
+        monkeypatch.setattr("src.tools.youtube_client.httplib2.Http", _FakeHttp)
+        monkeypatch.setattr("src.tools.youtube_client.google_auth_httplib2.AuthorizedHttp", _FakeAuthorizedHttp)
+        monkeypatch.setattr("src.tools.youtube_client.build", _fake_build)
+
+        client = GoogleYouTubeClient(credentials="creds", http_timeout_seconds=123.0)
+
+        assert captured["http_timeout"] == 123.0
+        assert captured["credentials"] == "creds"
+        assert isinstance(captured["http"], _FakeHttp)  # the bounded httplib2.Http passed into AuthorizedHttp
+        assert isinstance(captured["build_http"], _FakeAuthorizedHttp)  # build() receives the AUTHORIZED wrapper
+        assert captured["build_http"] is not None
+        assert client._youtube == "fake-service"
+
+    def test_real_construction_uses_default_timeout_when_not_overridden(self, monkeypatch) -> None:
+        from src.tools.youtube_client import DEFAULT_HTTP_TIMEOUT_SECONDS
+
+        captured: dict = {}
+
+        class _FakeHttp:
+            def __init__(self, timeout=None):
+                captured["http_timeout"] = timeout
+
+        monkeypatch.setattr("src.tools.youtube_client.httplib2.Http", _FakeHttp)
+        monkeypatch.setattr(
+            "src.tools.youtube_client.google_auth_httplib2.AuthorizedHttp",
+            lambda credentials, http=None: http,
+        )
+        monkeypatch.setattr(
+            "src.tools.youtube_client.build", lambda service, version, http=None, cache_discovery=None: "svc"
+        )
+
+        GoogleYouTubeClient(credentials="creds")
+
+        assert captured["http_timeout"] == DEFAULT_HTTP_TIMEOUT_SECONDS
+        assert DEFAULT_HTTP_TIMEOUT_SECONDS > 0
+
+    def test_injected_youtube_service_skips_transport_construction_entirely(self, monkeypatch) -> None:
+        """Tests (and dry-run/mocked paths) must never trigger a real
+        httplib2/build() call at all when a service is injected."""
+
+        def _should_not_be_called(*args, **kwargs):
+            raise AssertionError("real transport construction must be skipped when youtube_service is injected")
+
+        monkeypatch.setattr("src.tools.youtube_client.build", _should_not_be_called)
+        monkeypatch.setattr("src.tools.youtube_client.httplib2.Http", _should_not_be_called)
+
+        client = GoogleYouTubeClient(credentials=None, youtube_service="already-built-service")
+        assert client._youtube == "already-built-service"
 
 
 class TestMockYouTubeClient:

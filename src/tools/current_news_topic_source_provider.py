@@ -11,6 +11,7 @@
 # short excerpt any search engine already displays, not the article itself.
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 import xml.etree.ElementTree as ET
@@ -31,6 +32,13 @@ GOOGLE_NEWS_WORLD_URL = "https://news.google.com/rss/headlines/section/topic/WOR
 
 USER_AGENT = "YoutubeAgenticAI/0.1 (contact: local-development)"
 
+# Hard OUTER ceiling wrapped around the actual network call, on top of -
+# never instead of - the per-request httpx client timeout each caller
+# configures. See src.tools.pexels_media_provider's identical pattern
+# (added after a real controlled autonomous run proved a client-level
+# timeout alone did not reliably bound a network call in this pipeline).
+DEFAULT_OUTER_TIMEOUT_SECONDS = 20.0
+
 
 class CurrentNewsSearchError(Exception):
     """Raised when CurrentNewsSearchProvider fails to retrieve results."""
@@ -47,10 +55,12 @@ class CurrentNewsTopicSourceProvider(TopicSourceProvider):
         language: str = "en",
         timeout_seconds: float = 10.0,
         client: Optional[httpx.AsyncClient] = None,
+        outer_timeout_seconds: float = DEFAULT_OUTER_TIMEOUT_SECONDS,
     ) -> None:
         self.language = language or "en"
         self.timeout_seconds = timeout_seconds
         self._client = client
+        self.outer_timeout_seconds = outer_timeout_seconds
 
     @property
     def name(self) -> str:
@@ -62,7 +72,7 @@ class CurrentNewsTopicSourceProvider(TopicSourceProvider):
         url = self._build_feed_url(category=category, region=region)
 
         try:
-            raw_xml = await _fetch_rss_xml(url, self._client, self.timeout_seconds)
+            raw_xml = await _fetch_rss_xml(url, self._client, self.timeout_seconds, self.outer_timeout_seconds)
         except _RssFetchError as e:
             raise TopicSourceProviderError(str(e)) from e
 
@@ -186,11 +196,40 @@ class _RssFetchError(Exception):
     CurrentNewsSearchError) - the HTTP fetch itself is identical either way."""
 
 
-async def _fetch_rss_xml(url: str, client: Optional[httpx.AsyncClient], timeout_seconds: float) -> str:
+async def _fetch_rss_xml(
+    url: str,
+    client: Optional[httpx.AsyncClient],
+    timeout_seconds: float,
+    outer_timeout_seconds: float = DEFAULT_OUTER_TIMEOUT_SECONDS,
+) -> str:
     """Fetch raw RSS XML from a Google News URL - the one place the actual
     HTTP request/redirect/error handling lives, shared by
     CurrentNewsTopicSourceProvider.discover_candidates and
-    CurrentNewsSearchProvider.search so neither duplicates it."""
+    CurrentNewsSearchProvider.search so neither duplicates it.
+
+    Raises:
+        _RssFetchError: On network failure, an HTTP error, or a timeout
+            (either the inner per-request client timeout, or the outer
+            hard ceiling - this never waits indefinitely either way).
+    """
+    try:
+        return await asyncio.wait_for(
+            _do_fetch_rss_xml(url, client, timeout_seconds), timeout=outer_timeout_seconds
+        )
+    except asyncio.TimeoutError as e:
+        raise _RssFetchError(
+            f"Google News request timed out after {outer_timeout_seconds:.0f}s "
+            "(provider=current_news, operation=fetch_rss, category=timeout)"
+        ) from e
+    except httpx.TimeoutException as e:
+        raise _RssFetchError(f"Google News request timed out: {e}") from e
+    except httpx.HTTPStatusError as e:
+        raise _RssFetchError(f"Google News request returned an error: {e.response.status_code}") from e
+    except httpx.HTTPError as e:
+        raise _RssFetchError(f"Google News request failed: {e}") from e
+
+
+async def _do_fetch_rss_xml(url: str, client: Optional[httpx.AsyncClient], timeout_seconds: float) -> str:
     owns_client = client is None
     # Google News RSS URLs (both the WORLD section feed and search
     # results) respond with a 302 redirect to the actual feed content -
@@ -202,12 +241,6 @@ async def _fetch_rss_xml(url: str, client: Optional[httpx.AsyncClient], timeout_
         response = await active_client.get(url, headers={"User-Agent": USER_AGENT})
         response.raise_for_status()
         return response.text
-    except httpx.TimeoutException as e:
-        raise _RssFetchError(f"Google News request timed out: {e}") from e
-    except httpx.HTTPStatusError as e:
-        raise _RssFetchError(f"Google News request returned an error: {e.response.status_code}") from e
-    except httpx.HTTPError as e:
-        raise _RssFetchError(f"Google News request failed: {e}") from e
     finally:
         if owns_client:
             await active_client.aclose()
@@ -263,10 +296,12 @@ class CurrentNewsSearchProvider(SearchProvider):
         language: str = "en",
         timeout_seconds: float = 10.0,
         client: Optional[httpx.AsyncClient] = None,
+        outer_timeout_seconds: float = DEFAULT_OUTER_TIMEOUT_SECONDS,
     ) -> None:
         self.language = language or "en"
         self.timeout_seconds = timeout_seconds
         self._client = client
+        self.outer_timeout_seconds = outer_timeout_seconds
 
     @property
     def name(self) -> str:
@@ -277,7 +312,7 @@ class CurrentNewsSearchProvider(SearchProvider):
 
         Raises:
             CurrentNewsSearchError: On network failure, a malformed feed,
-                or an empty/whitespace-only query.
+                a timeout, or an empty/whitespace-only query.
         """
         if not query or not query.strip():
             return []
@@ -286,7 +321,7 @@ class CurrentNewsSearchProvider(SearchProvider):
         url = f"{GOOGLE_NEWS_SEARCH_URL}?q={quote(query)}&hl={hl}&gl=US&ceid=US:{self.language}"
 
         try:
-            raw_xml = await _fetch_rss_xml(url, self._client, self.timeout_seconds)
+            raw_xml = await _fetch_rss_xml(url, self._client, self.timeout_seconds, self.outer_timeout_seconds)
         except _RssFetchError as e:
             raise CurrentNewsSearchError(str(e)) from e
 

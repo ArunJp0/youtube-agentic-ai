@@ -10,6 +10,7 @@
 # images, and Research/Script's use of it is intentionally left untouched.
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any, Dict, List, Optional
@@ -32,6 +33,13 @@ from src.tools.visual_relevance_evaluator import (
 # src/gemini_health_check.py and src/llm/gemini.py's DEFAULT_GEMINI_MODEL).
 DEFAULT_VISION_MODEL = DEFAULT_GEMINI_MODEL
 
+# Hard OUTER ceiling wrapped around the actual network call, on top of -
+# never instead of - the per-request httpx client timeout. See
+# src.tools.pexels_media_provider's identical pattern (added after a real
+# controlled autonomous run proved a client-level timeout alone did not
+# reliably bound a network call in this pipeline).
+DEFAULT_OUTER_TIMEOUT_SECONDS = 45.0
+
 
 class GeminiVisualRelevanceEvaluator(VisualRelevanceEvaluator):
     """Vision-capable relevance evaluator backed by the Gemini API.
@@ -42,7 +50,11 @@ class GeminiVisualRelevanceEvaluator(VisualRelevanceEvaluator):
     """
 
     def __init__(
-        self, api_key: Optional[str], model: str = DEFAULT_VISION_MODEL, timeout_seconds: float = 30.0
+        self,
+        api_key: Optional[str],
+        model: str = DEFAULT_VISION_MODEL,
+        timeout_seconds: float = 30.0,
+        outer_timeout_seconds: float = DEFAULT_OUTER_TIMEOUT_SECONDS,
     ) -> None:
         if not api_key:
             raise VisualRelevanceEvaluatorError(
@@ -52,6 +64,7 @@ class GeminiVisualRelevanceEvaluator(VisualRelevanceEvaluator):
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.outer_timeout_seconds = outer_timeout_seconds
 
     @property
     def name(self) -> str:
@@ -62,10 +75,12 @@ class GeminiVisualRelevanceEvaluator(VisualRelevanceEvaluator):
         url = f"{GEMINI_API_BASE}/{self.model}:generateContent"
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(url, params={"key": self.api_key}, json=payload)
-                response.raise_for_status()
-                data = response.json()
+            data = await asyncio.wait_for(self._do_post(url, payload), timeout=self.outer_timeout_seconds)
+        except asyncio.TimeoutError as e:
+            raise VisualRelevanceEvaluatorError(
+                f"Gemini vision request timed out after {self.outer_timeout_seconds:.0f}s "
+                "(provider=gemini, operation=evaluate_section, category=timeout)"
+            ) from e
         except httpx.HTTPStatusError as e:
             raise VisualRelevanceEvaluatorError(
                 f"Gemini vision API returned an error: {e.response.status_code}"
@@ -75,6 +90,12 @@ class GeminiVisualRelevanceEvaluator(VisualRelevanceEvaluator):
 
         raw_text = self._extract_text(data)
         return self._parse_verdicts(raw_text)
+
+    async def _do_post(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.post(url, params={"key": self.api_key}, json=payload)
+            response.raise_for_status()
+            return response.json()
 
     # ---- request building --------------------------------------------------
 

@@ -212,6 +212,78 @@ class TestGeminiRetryBehavior:
         assert provider.generate_text("prompt") == "ok"
         assert call_count["n"] == 2
 
+
+class TestGeminiOuterTimeout:
+    """Defense-in-depth: a stalled underlying httpx.post() call - one that
+    never returns and never raises, the exact shape of a real production
+    hang where a client-level timeout did not fire - must still be bounded
+    by the outer ceiling, independent of and in addition to the per-
+    attempt retry policy above."""
+
+    def test_normal_call_succeeds_within_outer_timeout(self, monkeypatch) -> None:
+        """A. A normal (fast) call must succeed exactly as before - the
+        outer timeout must never interfere with a genuinely successful
+        call."""
+        def fake_post(url, params=None, json=None, timeout=None):
+            return FakeResponse(_success_payload("ok"))
+
+        monkeypatch.setattr(httpx, "post", fake_post)
+        provider = GeminiLLMProvider(api_key="test-key", fallback_model=None, outer_timeout_seconds=5.0)
+
+        assert provider.generate_text("prompt") == "ok"
+
+    def test_stalled_post_call_is_bounded_by_outer_timeout(self, monkeypatch) -> None:
+        """B/C: httpx.post() that never returns and never raises (unlike
+        every other test in this file, which simulates a real exception or
+        response) must still be terminated within the configured outer
+        bound, as a typed, observable GeminiProviderError - never wait
+        forever, regardless of what the per-attempt client timeout does."""
+        import threading
+        import time as walltime
+
+        def fake_post(url, params=None, json=None, timeout=None):
+            # A background thread blocking on a real synchronization
+            # primitive cannot be cancelled (unlike an awaited coroutine) -
+            # kept short (not e.g. 3600s) so an orphaned worker thread
+            # never meaningfully delays pytest's own process exit, while
+            # still comfortably exceeding the tiny outer timeout configured
+            # below.
+            threading.Event().wait(2)
+            raise AssertionError("should never be reached - the outer timeout must fire first")
+
+        monkeypatch.setattr(httpx, "post", fake_post)
+        provider = GeminiLLMProvider(api_key="test-key", fallback_model=None, outer_timeout_seconds=0.05)
+
+        started = walltime.monotonic()
+        with pytest.raises(GeminiProviderError) as exc_info:
+            provider.generate_text("prompt")
+        elapsed = walltime.monotonic() - started
+
+        assert elapsed < 1.0  # bounded by the 0.05s outer timeout, not the stalled call's 2s
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "gemini" in message.lower()
+        assert "timeout" in message.lower()  # category, per observability requirement
+        assert "test-key" not in message  # never leaks the API key
+
+    def test_outer_timeout_does_not_cut_off_a_slower_but_genuine_retry_cycle(self, monkeypatch, no_real_sleep) -> None:
+        """H/I: bounded, not trigger-happy - a call that takes a few real
+        retries (each fast) must still succeed normally; the outer timeout
+        is sized to never interfere with the existing retry policy."""
+        call_count = {"n": 0}
+
+        def fake_post(url, params=None, json=None, timeout=None):
+            call_count["n"] += 1
+            if call_count["n"] < 3:
+                return FakeResponse({}, status_code=503)
+            return FakeResponse(_success_payload("ok"))
+
+        monkeypatch.setattr(httpx, "post", fake_post)
+        provider = GeminiLLMProvider(api_key="test-key", fallback_model=None, outer_timeout_seconds=5.0)
+
+        assert provider.generate_text("prompt") == "ok"
+        assert call_count["n"] == 3
+
     def test_network_error_is_retried(self, monkeypatch, no_real_sleep) -> None:
         call_count = {"n": 0}
 

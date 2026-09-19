@@ -204,6 +204,27 @@ class TestYouTubeTopicSourceProvider:
         with pytest.raises(TopicSourceProviderError):
             asyncio.run(provider.discover_candidates())
 
+    def test_hang_is_bounded_by_outer_timeout(self) -> None:
+        """A discovery call that never returns (an established connection
+        producing no response - the exact shape of a real production hang)
+        must still terminate within the configured outer bound, as a
+        typed, observable TopicSourceProviderError - never wait forever."""
+
+        class HangingClient:
+            async def get(self, url, params=None):
+                await asyncio.sleep(3600)
+                raise AssertionError("should never be reached - the outer timeout must fire first")
+
+        provider = YouTubeTopicSourceProvider(api_key="key", client=HangingClient(), outer_timeout_seconds=0.05)
+
+        with pytest.raises(TopicSourceProviderError) as exc_info:
+            asyncio.run(provider.discover_candidates())
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "youtube" in message.lower()
+        assert "timeout" in message.lower()
+
 
 # ---- CompositeTopicSourceProvider -------------------------------------------
 
@@ -515,6 +536,26 @@ class TestCurrentNewsTopicSourceProvider:
         dumped = candidates[0].model_dump()
         assert "Full copyrighted article text" not in str(dumped)
 
+    def test_hang_is_bounded_by_outer_timeout(self) -> None:
+        """A discovery call that never returns (an established connection
+        producing no response - the exact shape of a real production hang)
+        must still terminate within the configured outer bound, as a
+        typed, observable TopicSourceProviderError - never wait forever."""
+
+        class HangingTextClient:
+            async def get(self, url, headers=None):
+                await asyncio.sleep(3600)
+                raise AssertionError("should never be reached - the outer timeout must fire first")
+
+        provider = CurrentNewsTopicSourceProvider(client=HangingTextClient(), outer_timeout_seconds=0.05)
+
+        with pytest.raises(TopicSourceProviderError) as exc_info:
+            asyncio.run(provider.discover_candidates())
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "timeout" in message.lower()
+
 
 # ---- CurrentNewsSearchProvider (Research's use of the same RSS infra) ----
 
@@ -633,3 +674,23 @@ class TestCurrentNewsSearchProvider:
 
         assert len(results) == 1
         assert results[0]["title"] == "Real Story"
+
+    def test_hang_is_bounded_by_outer_timeout(self) -> None:
+        """A search call that never returns (an established connection
+        producing no response - the exact shape of a real production hang)
+        must still terminate within the configured outer bound, as a
+        typed, observable CurrentNewsSearchError - never wait forever."""
+
+        class HangingTextClient:
+            async def get(self, url, headers=None):
+                await asyncio.sleep(3600)
+                raise AssertionError("should never be reached - the outer timeout must fire first")
+
+        provider = CurrentNewsSearchProvider(client=HangingTextClient(), outer_timeout_seconds=0.05)
+
+        with pytest.raises(CurrentNewsSearchError) as exc_info:
+            asyncio.run(provider.search("story"))
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "timeout" in message.lower()
