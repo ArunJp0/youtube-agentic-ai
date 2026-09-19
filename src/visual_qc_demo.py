@@ -60,7 +60,7 @@ async def run_visual_qc_demo(topic: str) -> tuple[VisualQCResult, VisualResult, 
     print("\n[2/4] Building visual context plan (one Gemini call for the whole script)...")
     visual_planner = VisualContextPlanner(llm_provider=get_llm_provider(settings))
     visual_service = VisualMediaService(media_provider=get_media_provider(settings), visual_planner=visual_planner)
-    plan = visual_service.build_plan(script_result)
+    plan = await visual_service.build_plan(script_result)
     print(f"      Visual planning: {'LLM semantic plan' if plan.used_semantic_planning else 'deterministic fallback'}")
 
     print(f"\n[3/4] Selecting/downloading visuals for {len(script_result.sections)} section(s) via Pexels...")

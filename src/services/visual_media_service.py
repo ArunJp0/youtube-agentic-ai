@@ -15,6 +15,7 @@
 # (see calculate_slot_count), never a fixed count per section or per video.
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import uuid
@@ -46,6 +47,19 @@ RECENT_REUSE_LOOKBACK = 2
 # math - prevents pathologically short sections from being sliced into
 # many sub-clips that FFmpeg would barely show.
 MIN_SLOT_SECONDS = 3.0
+
+# Hard outer ceiling on VisualContextPlanner's single whole-script Gemini
+# call - defense in depth on top of GeminiLLMProvider's own internal
+# per-attempt timeout/bounded-retry/fallback-model policy (max_attempts=5,
+# 30s/attempt, primary then fallback model - worst case ~330s), never a
+# replacement for it. A real controlled autonomous run proved that policy
+# alone did not reliably bound a synchronous, blocking LLM call made
+# directly inside this async service - this ensures the pipeline can never
+# again wait indefinitely on it, regardless of why the inner timeout did
+# not fire. Deliberately well above the inner worst case so it only ever
+# engages as a genuine last-resort safety net, never cutting off a
+# legitimate (if slow) retry+fallback cycle early.
+DEFAULT_VISUAL_CONTEXT_PLANNER_TIMEOUT_SECONDS = 360.0
 
 
 @dataclass(frozen=True)
@@ -127,6 +141,7 @@ class VisualMediaService:
         ai_video_provider: Optional[AIVideoProvider] = None,
         ai_video_max_retries: int = 2,
         stock_fallback_enabled: bool = True,
+        visual_context_planner_timeout_seconds: float = DEFAULT_VISUAL_CONTEXT_PLANNER_TIMEOUT_SECONDS,
     ) -> None:
         """Initialize the Visual Media Service.
 
@@ -158,6 +173,9 @@ class VisualMediaService:
                 ``media_provider`` if True (default); if False, that slot
                 fails cleanly instead of silently fetching stock footage -
                 for a demo deliberately meant to show AI visuals only.
+            visual_context_planner_timeout_seconds: Hard outer ceiling on
+                ``build_plan``'s call into ``visual_planner`` - see
+                ``DEFAULT_VISUAL_CONTEXT_PLANNER_TIMEOUT_SECONDS``.
         """
         self.media_provider = media_provider
         self.visual_planner = visual_planner
@@ -167,6 +185,7 @@ class VisualMediaService:
         self.ai_video_provider = ai_video_provider
         self.ai_video_max_retries = ai_video_max_retries
         self.stock_fallback_enabled = stock_fallback_enabled
+        self.visual_context_planner_timeout_seconds = visual_context_planner_timeout_seconds
 
     async def generate_visuals(
         self,
@@ -233,7 +252,7 @@ class VisualMediaService:
 
         os.makedirs(self.output_dir, exist_ok=True)
 
-        plan = visual_plan if visual_plan is not None else self.build_plan(script)
+        plan = visual_plan if visual_plan is not None else await self.build_plan(script)
         section_durations = calculate_section_durations(
             script.sections, total_narration_duration_seconds
         )
@@ -307,7 +326,7 @@ class VisualMediaService:
             semantic_planning_fallback_reason=plan.fallback_reason,
         )
 
-    def build_plan(self, script: ScriptResult) -> VisualPlan:
+    async def build_plan(self, script: ScriptResult) -> VisualPlan:
         """Get the per-section visual plan: from the configured planner (one
         LLM call for the whole script, with its own internal deterministic
         fallback) if one is set, otherwise directly from the deterministic
@@ -317,9 +336,32 @@ class VisualMediaService:
         Visual QC re-selecting a replacement asset) can build it once and
         pass it into ``generate_visuals`` via ``visual_plan=``, rather than
         triggering a second LLM planning call.
+
+        ``visual_planner.plan_visuals`` is synchronous (it wraps a plain
+        blocking ``LLMProvider.generate_text`` call) and is run off the
+        event loop via ``asyncio.to_thread`` with a hard outer bound
+        (``visual_context_planner_timeout_seconds``) - a real controlled
+        autonomous run proved that a blocking Gemini call made directly
+        here could wait indefinitely even though the underlying HTTP
+        client is itself configured with its own timeout. A timeout here
+        is treated exactly like any other planning failure - it degrades
+        to the same deterministic fallback plan ``plan_visuals`` already
+        uses internally, never raised to the caller.
         """
         if self.visual_planner is not None:
-            return self.visual_planner.plan_visuals(script)
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self.visual_planner.plan_visuals, script),
+                    timeout=self.visual_context_planner_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                fallback = build_deterministic_visual_plan(script)
+                fallback.fallback_reason = (
+                    "Semantic visual planning timed out after "
+                    f"{self.visual_context_planner_timeout_seconds:.0f}s (visual_context_planner, timeout), "
+                    "used deterministic fallback"
+                )
+                return fallback
         return build_deterministic_visual_plan(script)
 
     # ---- duration-aware slot planning ---------------------------------------

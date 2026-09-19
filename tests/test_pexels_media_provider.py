@@ -56,6 +56,28 @@ class FakeAsyncClient:
         return self.response
 
 
+class HangingAsyncClient:
+    """Stand-in for httpx.AsyncClient whose get() never returns on its own -
+    simulates the exact real production failure mode (an established
+    connection producing no response, with the client-level timeout not
+    firing) - only the OUTER asyncio.wait_for bound can ever terminate it."""
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def get(self, url, params=None, headers=None):
+        import asyncio
+
+        await asyncio.sleep(3600)  # effectively forever, relative to any test's outer bound
+        raise AssertionError("should never be reached - the outer timeout must fire first")
+
+
 def _video_payload(videos):
     return {"videos": videos}
 
@@ -295,6 +317,27 @@ class TestPexelsMediaProviderSearch:
         with pytest.raises(MediaProviderError):
             await provider.search("ocean")
 
+    @pytest.mark.asyncio
+    async def test_search_hang_is_bounded_by_outer_timeout(self, monkeypatch) -> None:
+        """D/E/H/I/J: a search call that never returns (the exact shape of
+        the real production hang - an established connection producing no
+        response) must still terminate within the configured outer bound,
+        as a typed, observable MediaProviderError - never wait forever."""
+        fake_client = HangingAsyncClient()
+        monkeypatch.setattr(httpx, "AsyncClient", fake_client)
+
+        provider = PexelsMediaProvider(api_key="test-key", outer_timeout_seconds=0.05)
+
+        with pytest.raises(MediaProviderError) as exc_info:
+            await provider.search("ocean")
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "pexels" in message.lower()
+        assert "search" in message.lower()
+        assert "timeout" in message.lower()  # category, per observability requirement
+        assert "test-key" not in message  # never leaks the API key
+
 
 class TestPexelsMediaProviderDownload:
     @pytest.mark.asyncio
@@ -327,3 +370,30 @@ class TestPexelsMediaProviderDownload:
         )
         with pytest.raises(MediaProviderError, match="404"):
             await provider.download(candidate, str(tmp_path / "gone.jpg"))
+
+    @pytest.mark.asyncio
+    async def test_download_hang_is_bounded_by_outer_timeout(self, monkeypatch, tmp_path) -> None:
+        """G/H/I/J: a download that never returns must still terminate
+        within the configured outer bound, as a typed, observable
+        MediaProviderError, and never write a partial/placeholder file."""
+        fake_client = HangingAsyncClient()
+        monkeypatch.setattr(httpx, "AsyncClient", fake_client)
+
+        provider = PexelsMediaProvider(api_key="test-key", outer_timeout_seconds=0.05)
+        from src.tools.media_provider import MediaCandidate
+
+        candidate = MediaCandidate(
+            asset_type="image", download_url="https://cdn.pexels.com/x.jpg", source_url="https://pexels.com/x"
+        )
+        output_path = str(tmp_path / "x.jpg")
+
+        with pytest.raises(MediaProviderError) as exc_info:
+            await provider.download(candidate, output_path)
+
+        message = str(exc_info.value)
+        assert "timed out" in message.lower()
+        assert "download" in message.lower()
+        assert "timeout" in message.lower()
+        import os
+
+        assert not os.path.exists(output_path)  # never a partial/placeholder file on timeout

@@ -66,7 +66,11 @@ from src.services.visual_media_service import (
     VisualMediaService,
     VisualMediaServiceError,
 )
-from src.services.visual_qc_service import VisualQCService, VisualQCServiceError
+from src.services.visual_qc_service import (
+    DEFAULT_NEUTRAL_FALLBACK_OUTPUT_DIR,
+    VisualQCService,
+    VisualQCServiceError,
+)
 from src.services.voice_service import DEFAULT_OUTPUT_DIR, VoiceService, VoiceServiceError
 from src.tools.ffmpeg_video_assembler import VideoAssembler
 from src.tools.media_provider import MediaProvider
@@ -208,6 +212,7 @@ def build_pipeline_graph(
     topic_source: Optional[str] = None,
     current_news_search_provider: Optional[SearchProvider] = None,
     neutral_visual_generator: Optional[NeutralVisualGenerator] = None,
+    neutral_fallback_output_dir: str = DEFAULT_NEUTRAL_FALLBACK_OUTPUT_DIR,
 ) -> StateGraph:
     """Build the LangGraph state machine chaining Research -> Script -> Voice
     -> Visual Media -> Visual QC -> Video Assembly -> Subtitle/Caption ->
@@ -357,6 +362,14 @@ def build_pipeline_graph(
             background clip, never an external service or claim-specific
             stock footage. ``None`` (default) means such a section is
             reported CRITICAL instead of being recovered.
+        neutral_fallback_output_dir: Directory a generated neutral fallback
+            clip is written into - defaults to the same directory
+            downloaded stock media already lives in (``media_output_dir``'s
+            own default), matching production behavior exactly. Tests that
+            inject a ``neutral_visual_generator`` test double MUST override
+            this to a temporary/isolated directory - never the real
+            project ``output/media`` - so fake placeholder artifacts are
+            never written there.
 
     Returns:
         StateGraph ready to be ``.compile()``d
@@ -392,6 +405,7 @@ def build_pipeline_graph(
         assembler=assembler,
         visual_media_service=visual_service,
         neutral_visual_generator=neutral_visual_generator,
+        neutral_fallback_output_dir=neutral_fallback_output_dir,
     )
     video_service = VideoAssemblyService(assembler=assembler, output_dir=video_output_dir)
     # Shares the same VideoAssembler as Visual QC/Video Assembly (subtitle
@@ -504,7 +518,7 @@ def build_pipeline_graph(
             # Built once and threaded through (via visual_plan=) so Visual
             # QC can reuse the exact same plan later - one Gemini planning
             # call per run, never a second one for QC.
-            plan = visual_service.build_plan(state.script_result)
+            plan = await visual_service.build_plan(state.script_result)
             changed_indices = _changed_section_indices(state)
             prior_result = state.qc_approved_visual_result or state.visual_result
             result = await visual_service.generate_visuals(
@@ -1291,6 +1305,7 @@ async def run_pipeline(
     topic_source: Optional[str] = None,
     current_news_search_provider: Optional[SearchProvider] = None,
     neutral_visual_generator: Optional[NeutralVisualGenerator] = None,
+    neutral_fallback_output_dir: str = DEFAULT_NEUTRAL_FALLBACK_OUTPUT_DIR,
 ) -> PipelineState:
     """Run the full Research -> Script -> Voice -> Visual Media -> Visual QC
     -> Video Assembly -> Subtitle/Caption -> BGM/Audio Mixing -> Metadata ->
@@ -1428,6 +1443,7 @@ async def run_pipeline(
         topic_source,
         current_news_search_provider,
         neutral_visual_generator,
+        neutral_fallback_output_dir,
     ).compile()
     initial_state = PipelineState(topic=topic, status="researching")
 

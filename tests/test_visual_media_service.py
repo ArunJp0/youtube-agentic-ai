@@ -535,7 +535,7 @@ class TestBuildPlanAndPreBuiltPlanReuse:
         provider = MockMediaProvider(results_per_query=3)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
 
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
 
         assert plan.used_semantic_planning is False
         assert len(plan.sections) == 1
@@ -564,6 +564,102 @@ class TestBuildPlanAndPreBuiltPlanReuse:
 
         assert planner.calls == 1
 
+    @pytest.mark.asyncio
+    async def test_normal_semantic_planning_call_succeeds_within_timeout(self, tmp_path) -> None:
+        """A. A normal (fast) real VisualContextPlanner call must succeed
+        exactly as before - the new outer timeout must never interfere
+        with a genuinely successful call."""
+        from src.agents.visual_context_planner import VisualContextPlanner
+        from src.llm.provider import LLMProvider
+
+        class FastLLM(LLMProvider):
+            def generate_text(self, prompt: str) -> str:
+                section = (
+                    '{{"section_index": {i}, "semantic_summary": "s", '
+                    '"visual_intents": ["i"], "search_queries": ["q"], '
+                    '"avoid_concepts": [], "neutral_fallback_queries": ["n"]}}'
+                )
+                sections = ", ".join(section.format(i=i) for i in range(len(_sample_script().sections)))
+                return f'{{"sections": [{sections}]}}'
+
+        planner = VisualContextPlanner(llm_provider=FastLLM())
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(
+            media_provider=provider, visual_planner=planner, output_dir=str(tmp_path),
+            visual_context_planner_timeout_seconds=5.0,
+        )
+
+        plan = await service.build_plan(_sample_script())
+
+        assert plan.used_semantic_planning is True
+
+    @pytest.mark.asyncio
+    async def test_hanging_semantic_planning_call_times_out_and_falls_back(self, tmp_path) -> None:
+        """B/C. A VisualContextPlanner call that never returns - the exact
+        shape of the real production hang - must still be bounded by the
+        outer timeout and degrade to the same deterministic fallback plan
+        used for any other planning failure, never block indefinitely."""
+        import time
+
+        from src.agents.visual_context_planner import VisualContextPlanner
+        from src.llm.provider import LLMProvider
+
+        class HangingLLM(LLMProvider):
+            def generate_text(self, prompt: str) -> str:
+                # A background thread running time.sleep() cannot be
+                # cancelled (unlike an awaited coroutine) - kept short
+                # (not e.g. 3600s) so an orphaned worker thread never
+                # blocks pytest's own process exit/thread-pool shutdown,
+                # while still comfortably exceeding the tiny outer
+                # timeout configured below.
+                time.sleep(2)
+                raise AssertionError("should never be reached - the outer timeout must fire first")
+
+        planner = VisualContextPlanner(llm_provider=HangingLLM())
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(
+            media_provider=provider, visual_planner=planner, output_dir=str(tmp_path),
+            visual_context_planner_timeout_seconds=0.05,
+        )
+
+        started = time.monotonic()
+        plan = await service.build_plan(_sample_script())
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0  # bounded by the 0.05s outer timeout, not the LLM's own 2s "hang"
+        assert plan.used_semantic_planning is False
+        assert "timed out" in plan.fallback_reason.lower()
+        assert "visual_context_planner" in plan.fallback_reason.lower()
+        assert "timeout" in plan.fallback_reason.lower()  # category, per observability requirement
+
+    @pytest.mark.asyncio
+    async def test_hanging_semantic_planning_call_never_raises_to_caller(self, tmp_path) -> None:
+        """A timeout must degrade exactly like any other planning failure -
+        generate_visuals() must still succeed end to end, never propagate
+        the timeout as an exception."""
+        import time
+
+        from src.agents.visual_context_planner import VisualContextPlanner
+        from src.llm.provider import LLMProvider
+
+        class HangingLLM(LLMProvider):
+            def generate_text(self, prompt: str) -> str:
+                time.sleep(2)  # see the sibling test above for why not 3600s
+                raise AssertionError("should never be reached")
+
+        planner = VisualContextPlanner(llm_provider=HangingLLM())
+        provider = MockMediaProvider(results_per_query=3)
+        service = VisualMediaService(
+            media_provider=provider, visual_planner=planner, output_dir=str(tmp_path),
+            visual_context_planner_timeout_seconds=0.05,
+        )
+
+        result = await service.generate_visuals(_sample_script(), 20.0)
+
+        assert result.success is True
+        assert result.semantic_planning_used is False
+        assert "timed out" in (result.semantic_planning_fallback_reason or "").lower()
+
 
 class TestAcquireReplacementAsset:
     """Public entry point Visual QC uses for bounded replacement - reuses
@@ -579,7 +675,7 @@ class TestAcquireReplacementAsset:
         script = _sample_script(sections=[section])
         provider = MockMediaProvider(results_per_query=5, pool_size=3)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
         section_plan = plan.sections[0]
 
         downloaded_by_id: dict = {}
@@ -604,7 +700,7 @@ class TestAcquireReplacementAsset:
         script = _sample_script(sections=[section])
         provider = MockMediaProvider(results_per_query=5, pool_size=5)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
         section_plan = plan.sections[0]
 
         downloaded_by_id: dict = {}
@@ -636,7 +732,7 @@ class TestAcquireReplacementAsset:
         script = _sample_script(sections=[section])
         provider = MockMediaProvider(results_per_query=3, pool_size=1)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
         section_plan = plan.sections[0]
 
         downloaded_by_id: dict = {}
@@ -739,7 +835,7 @@ class TestRemediationScopedVisualReuse:
         script = _sample_script()
         provider = MockMediaProvider(results_per_query=5)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
 
         first = await service.generate_visuals(script, 60.0, visual_plan=plan)
         assert first.success is True
@@ -763,7 +859,7 @@ class TestRemediationScopedVisualReuse:
         script = _sample_script()
         provider = MockMediaProvider(results_per_query=5)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
 
         first = await service.generate_visuals(script, 60.0, visual_plan=plan)
         provider.calls.clear()
@@ -789,7 +885,7 @@ class TestRemediationScopedVisualReuse:
         # is what actually caps candidates considered per search call.
         provider = MockMediaProvider(results_per_query=20, pool_size=20)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path), max_results_per_query=20)
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
 
         first = await service.generate_visuals(script, 30.0, visual_plan=plan)
         prior_ids = {a.provider_asset_id for m in first.sections for a in m.assets if a.success}
@@ -810,7 +906,7 @@ class TestRemediationScopedVisualReuse:
         script = _sample_script()
         provider = MockMediaProvider(results_per_query=5)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
 
         result = await service.generate_visuals(script, 60.0, visual_plan=plan)
 
@@ -825,7 +921,7 @@ class TestRemediationScopedVisualReuse:
         script = _sample_script()
         provider = MockMediaProvider(results_per_query=5)
         service = VisualMediaService(media_provider=provider, output_dir=str(tmp_path))
-        plan = service.build_plan(script)
+        plan = await service.build_plan(script)
         first = await service.generate_visuals(script, 60.0, visual_plan=plan)
 
         # Simulate a stale prior mapping whose slot count no longer matches

@@ -1,6 +1,7 @@
 # Pexels stock media provider (free tier, API key required)
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -11,6 +12,22 @@ from src.tools.media_provider import MediaCandidate, MediaProvider, MediaProvide
 
 PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/videos/search"
 PEXELS_PHOTO_SEARCH_URL = "https://api.pexels.com/v1/search"
+
+# Per-request httpx client timeout (connect/read/write/pool) - the normal,
+# expected bound for a Pexels call.
+DEFAULT_TIMEOUT_SECONDS = 15.0
+
+# Hard OUTER ceiling wrapped around every actual network call
+# (asyncio.wait_for), on top of - never instead of - the httpx client
+# timeout above. A real controlled autonomous run proved a blocking
+# network call elsewhere in this pipeline did not reliably terminate on
+# its own client-level timeout; this is the same defense-in-depth applied
+# here so a Pexels search/download can never again wait indefinitely
+# regardless of why the inner timeout might fail to fire. Deliberately
+# just a bit larger than the inner timeout so the inner one gets the first
+# real chance to fire (the normal path); this is a last-resort net, not
+# the primary bound.
+DEFAULT_OUTER_TIMEOUT_SECONDS = 25.0
 
 
 class PexelsMediaProvider(MediaProvider):
@@ -25,7 +42,12 @@ class PexelsMediaProvider(MediaProvider):
     MediaProvider interface.
     """
 
-    def __init__(self, api_key: Optional[str], timeout_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        api_key: Optional[str],
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        outer_timeout_seconds: float = DEFAULT_OUTER_TIMEOUT_SECONDS,
+    ) -> None:
         if not api_key:
             raise MediaProviderError(
                 "PEXELS_API_KEY is not set. Get a free key at https://www.pexels.com/api/ "
@@ -33,6 +55,7 @@ class PexelsMediaProvider(MediaProvider):
             )
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
+        self.outer_timeout_seconds = outer_timeout_seconds
 
     @property
     def name(self) -> str:
@@ -57,12 +80,20 @@ class PexelsMediaProvider(MediaProvider):
         """Download ``candidate`` to ``output_path``.
 
         Raises:
-            MediaProviderError: On network failure or an HTTP error.
+            MediaProviderError: On network failure, an HTTP error, or a
+                timeout (either the inner per-request client timeout, or
+                the outer hard ceiling - see ``outer_timeout_seconds``;
+                either way this never waits indefinitely).
         """
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.get(candidate.download_url)
-                response.raise_for_status()
+            response = await asyncio.wait_for(
+                self._do_download(candidate.download_url), timeout=self.outer_timeout_seconds
+            )
+        except asyncio.TimeoutError as e:
+            raise MediaProviderError(
+                f"Pexels download timed out after {self.outer_timeout_seconds:.0f}s (provider=pexels, "
+                "operation=download, category=timeout)"
+            ) from e
         except httpx.HTTPStatusError as e:
             raise MediaProviderError(
                 f"Pexels download returned an error: {e.response.status_code}"
@@ -72,6 +103,12 @@ class PexelsMediaProvider(MediaProvider):
 
         with open(output_path, "wb") as f:
             f.write(response.content)
+
+    async def _do_download(self, download_url: str) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.get(download_url)
+            response.raise_for_status()
+            return response
 
     # ---- internal --------------------------------------------------------
 
@@ -126,18 +163,26 @@ class PexelsMediaProvider(MediaProvider):
         return candidates
 
     async def _get(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        headers = {"Authorization": self.api_key}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.get(url, headers=headers, params=params)
-                response.raise_for_status()
-                return response.json()
+            return await asyncio.wait_for(self._do_get(url, params), timeout=self.outer_timeout_seconds)
+        except asyncio.TimeoutError as e:
+            raise MediaProviderError(
+                f"Pexels search timed out after {self.outer_timeout_seconds:.0f}s (provider=pexels, "
+                "operation=search, category=timeout)"
+            ) from e
         except httpx.HTTPStatusError as e:
             raise MediaProviderError(
                 f"Pexels API returned an error: {e.response.status_code}"
             ) from e
         except httpx.HTTPError as e:
             raise MediaProviderError(f"Pexels request failed: {e}") from e
+
+    async def _do_get(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        headers = {"Authorization": self.api_key}
+        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
 
 
 def _slug_from_url(url: str) -> Optional[str]:

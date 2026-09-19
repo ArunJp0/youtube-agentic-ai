@@ -722,6 +722,12 @@ class TestPipelineWorkflow:
             overrides.get("compliance_output_dir", compliance_dir),
             overrides.get("max_remediation_attempts", 2),
             neutral_visual_generator=overrides.get("neutral_visual_generator"),
+            # Always tmp_path-scoped (defaults to the same isolated media_dir
+            # every other artifact in this helper already uses) - a fake
+            # neutral_visual_generator test double must never be able to
+            # write its placeholder output into the real project
+            # output/media directory (see docs/DECISIONS.md).
+            neutral_fallback_output_dir=overrides.get("neutral_fallback_output_dir", media_dir),
         )
 
     @pytest.mark.asyncio
@@ -909,6 +915,40 @@ class TestPipelineWorkflow:
         assert state.compliance_result is not None
         assert state.compliance_result.success is True
         assert state.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_fake_neutral_generator_writes_only_under_tmp_path_never_real_output_media(
+        self, providers, tmp_path
+    ) -> None:
+        """K/L (test-isolation regression): a FakeNeutralVisualGenerator
+        used by this suite must never write into the real project
+        ``output/media`` directory - only under this test's own isolated
+        tmp_path. Guards against the exact real incident where leftover
+        literal b"NEUTRAL" placeholder files were found polluting the real
+        project directory because VisualQCService's neutral_fallback_output_dir
+        silently defaulted away from the pipeline's own configured,
+        isolated media_output_dir."""
+        import os as _os
+
+        real_output_media = _os.path.join("output", "media")
+        before = set(_os.listdir(real_output_media)) if _os.path.isdir(real_output_media) else set()
+
+        neutral_generator = FakeNeutralVisualGenerator()
+        await self._run(
+            providers,
+            visual_relevance_evaluator=AlwaysMisleadingFirstSectionEvaluator(),
+            neutral_visual_generator=neutral_generator,
+        )
+
+        assert len(neutral_generator.calls) == 1
+        written_path = neutral_generator.calls[0]["output_path"]
+        # The fake generator's own output path must live under THIS
+        # test's tmp_path - never the real project output/media directory.
+        assert str(tmp_path) in written_path
+        assert _os.path.abspath(real_output_media) not in _os.path.abspath(written_path)
+
+        after = set(_os.listdir(real_output_media)) if _os.path.isdir(real_output_media) else set()
+        assert after == before  # the real project directory is byte-for-byte untouched
 
     # ---- E. Visual QC not called on earlier-stage failure ------------------
 
